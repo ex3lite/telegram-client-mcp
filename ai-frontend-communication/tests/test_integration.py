@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import asyncio
+import os
+from collections.abc import AsyncIterator
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+from argon2 import PasswordHasher
+from httpx import ASGITransport, AsyncClient
+from itsdangerous import URLSafeTimedSerializer
+from pydantic import SecretStr
+from sqlalchemy import func, select, text, update
+from sqlalchemy.engine import make_url
+
+from dca.app import create_app, queue_telegram_update, reserve_telegram_update
+from dca.config import Settings
+from dca.db import (
+    AuditEvent,
+    Clarification,
+    Database,
+    Job,
+    Project,
+    ProjectMembership,
+    Repository,
+    ServiceAccount,
+    ServiceAccountProject,
+    TelegramIdentity,
+    TelegramUpdate,
+    User,
+)
+from dca.domain import AskUserInput, ClarificationStatus, JobStatus, utcnow
+from dca.service import (
+    ServiceError,
+    answer_clarification_from_telegram,
+    cancel_clarification,
+    create_clarification,
+    require_service_scope,
+)
+from dca.telegram import TelegramAdapter
+
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+async def database() -> AsyncIterator[Database]:
+    database_url = os.environ.get("DCA_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("DCA_TEST_DATABASE_URL is not set")
+    parsed = make_url(database_url)
+    if parsed.host not in {"127.0.0.1", "localhost"} or parsed.port != 55432:
+        pytest.fail("integration tests only accept the dedicated local PostgreSQL on port 55432")
+    database = Database(Settings(database_url=database_url))
+    yield database
+    async with database.session() as session:
+        await session.execute(
+            text(
+                "TRUNCATE audit_events, interactions, telegram_identities, telegram_chats, "
+                "service_account_projects, repositories, project_memberships, clarifications, "
+                "change_requests, telegram_updates, users, service_accounts, projects, jobs "
+                "RESTART IDENTITY CASCADE"
+            )
+        )
+    await database.close()
+
+
+async def seed_scope(database: Database) -> dict[str, Any]:
+    async with database.session() as session:
+        project = Project(slug=f"project-{uuid4().hex[:8]}", name="Backend")
+        other_project = Project(slug=f"other-{uuid4().hex[:8]}", name="Other")
+        user = User(display_name="Developer")
+        account = ServiceAccount(
+            name=f"agent-{uuid4().hex[:8]}",
+            token_prefix=uuid4().hex[:8],
+            token_hash=PasswordHasher().hash("x" * 40),
+            tool_scopes=[
+                "telegram.ask_user",
+                "telegram.get_clarification",
+                "telegram.cancel_clarification",
+            ],
+        )
+        session.add_all([project, other_project, user, account])
+        await session.flush()
+        session.add_all(
+            [
+                ProjectMembership(project_id=project.id, user_id=user.id, role="developer"),
+                TelegramIdentity(
+                    user_id=user.id,
+                    telegram_user_id=9001,
+                    private_chat_id=9001,
+                    verified_at=utcnow(),
+                    reachable=True,
+                ),
+                ServiceAccountProject(
+                    service_account_id=account.id,
+                    project_id=project.id,
+                ),
+            ]
+        )
+    return {
+        "project_id": project.id,
+        "other_project_id": other_project.id,
+        "user_id": user.id,
+        "account_id": account.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_clarification_idempotency_and_first_reply_wins(database: Database) -> None:
+    ids = await seed_scope(database)
+    request = AskUserInput(
+        project_id=ids["project_id"],
+        agent_run_id="run-1",
+        correlation_id="corr-1",
+        idempotency_key="idem-key-123",
+        recipient_user_id=ids["user_id"],
+        context="Need a default TTL",
+        question="Should the default be 24h or 7d?",
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+    async with database.session() as session:
+        first, first_created = await create_clarification(
+            session, service_account_id=ids["account_id"], request=request
+        )
+        second, second_created = await create_clarification(
+            session, service_account_id=ids["account_id"], request=request
+        )
+        assert first.id == second.id
+        assert first_created is True
+        assert second_created is False
+        with pytest.raises(ServiceError) as payload_conflict:
+            await create_clarification(
+                session,
+                service_account_id=ids["account_id"],
+                request=request.model_copy(update={"question": "A different question"}),
+            )
+        assert payload_conflict.value.code == "idempotency_conflict"
+        session.add_all(
+            [
+                ProjectMembership(
+                    project_id=ids["other_project_id"],
+                    user_id=ids["user_id"],
+                    role="developer",
+                ),
+                ServiceAccountProject(
+                    service_account_id=ids["account_id"],
+                    project_id=ids["other_project_id"],
+                ),
+            ]
+        )
+        with pytest.raises(ServiceError) as project_conflict:
+            await create_clarification(
+                session,
+                service_account_id=ids["account_id"],
+                request=request.model_copy(update={"project_id": ids["other_project_id"]}),
+            )
+        assert project_conflict.value.code == "idempotency_conflict"
+        first.telegram_chat_id = 9001
+        first.telegram_message_id = 44
+    async with database.session() as session:
+        assert await session.scalar(select(func.count()).select_from(Job)) == 1
+
+    async def reply(value: str) -> str:
+        try:
+            async with database.session() as session:
+                await answer_clarification_from_telegram(
+                    session,
+                    telegram_user_id=9001,
+                    telegram_chat_id=9001,
+                    reply_to_message_id=44,
+                    answer=value,
+                )
+            return "won"
+        except ServiceError:
+            return "lost"
+
+    outcomes = await asyncio.gather(reply("24h"), reply("7d"))
+    assert sorted(outcomes) == ["lost", "won"]
+    async with database.session() as session:
+        stored, _ = await create_clarification(
+            session, service_account_id=ids["account_id"], request=request
+        )
+        assert stored.status == ClarificationStatus.ANSWERED.value
+        assert stored.answer_raw in {"24h", "7d"}
+
+
+@pytest.mark.asyncio
+async def test_clarification_reply_is_scoped_to_telegram_chat(database: Database) -> None:
+    ids = await seed_scope(database)
+    request = AskUserInput(
+        project_id=ids["project_id"],
+        agent_run_id="run-chat-scope",
+        correlation_id="corr-chat-scope",
+        idempotency_key="idem-chat-scope",
+        recipient_user_id=ids["user_id"],
+        context="Need a scoped reply",
+        question="Which chat is this?",
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+    async with database.session() as session:
+        clarification, _ = await create_clarification(
+            session,
+            service_account_id=ids["account_id"],
+            request=request,
+        )
+        clarification.telegram_chat_id = 9001
+        clarification.telegram_message_id = 44
+
+    async with database.session() as session:
+        with pytest.raises(ServiceError) as error:
+            await answer_clarification_from_telegram(
+                session,
+                telegram_user_id=9001,
+                telegram_chat_id=8001,
+                reply_to_message_id=44,
+                answer="wrong chat",
+            )
+    assert error.value.code == "request_not_found"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_expired_clarifications_are_not_delivered(
+    database: Database,
+) -> None:
+    ids = await seed_scope(database)
+    base = AskUserInput(
+        project_id=ids["project_id"],
+        agent_run_id="run-delivery-state",
+        correlation_id="corr-delivery-state",
+        idempotency_key="idem-delivery-cancelled",
+        recipient_user_id=ids["user_id"],
+        context="Delivery state",
+        question="Should this be sent?",
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+    async with database.session() as session:
+        cancelled, _ = await create_clarification(
+            session,
+            service_account_id=ids["account_id"],
+            request=base,
+        )
+        expired, _ = await create_clarification(
+            session,
+            service_account_id=ids["account_id"],
+            request=base.model_copy(
+                update={
+                    "idempotency_key": "idem-delivery-expired",
+                    "correlation_id": "corr-delivery-expired",
+                }
+            ),
+        )
+    async with database.session() as session:
+        await cancel_clarification(
+            session,
+            service_account_id=ids["account_id"],
+            request_id=cancelled.id,
+            reason="No longer needed",
+        )
+        await session.execute(
+            update(Clarification)
+            .where(Clarification.id == expired.id)
+            .values(expires_at=utcnow() - timedelta(seconds=1))
+        )
+
+    adapter = TelegramAdapter(
+        Settings(database_url=os.environ["DCA_TEST_DATABASE_URL"]),
+        database,
+    )
+    adapter.bot.send_message = AsyncMock()  # type: ignore[method-assign]
+    try:
+        assert await adapter.deliver_clarification(cancelled.id) is False
+        assert await adapter.deliver_clarification(expired.id) is False
+        adapter.bot.send_message.assert_not_awaited()
+    finally:
+        await adapter.close()
+
+    async with database.session() as session:
+        stored_expired = await session.get(Clarification, expired.id)
+        assert stored_expired is not None
+        assert stored_expired.status == ClarificationStatus.EXPIRED.value
+
+
+@pytest.mark.asyncio
+async def test_delivery_serializes_with_cancel_and_preserves_notification(
+    database: Database,
+) -> None:
+    ids = await seed_scope(database)
+    request = AskUserInput(
+        project_id=ids["project_id"],
+        agent_run_id="run-delivery-race",
+        correlation_id="corr-delivery-race",
+        idempotency_key="idem-delivery-race",
+        recipient_user_id=ids["user_id"],
+        context="Delivery race",
+        question="Can this race with cancel?",
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+    async with database.session() as session:
+        clarification, _ = await create_clarification(
+            session,
+            service_account_id=ids["account_id"],
+            request=request,
+        )
+
+    entered_send = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def delayed_send(**_: Any) -> SimpleNamespace:
+        entered_send.set()
+        await release_send.wait()
+        return SimpleNamespace(chat=SimpleNamespace(id=9001), message_id=55)
+
+    async def cancel() -> Clarification:
+        async with database.session() as session:
+            return await cancel_clarification(
+                session,
+                service_account_id=ids["account_id"],
+                request_id=clarification.id,
+                reason="Concurrent cancel",
+            )
+
+    adapter = TelegramAdapter(
+        Settings(database_url=os.environ["DCA_TEST_DATABASE_URL"]),
+        database,
+    )
+    adapter.bot.send_message = AsyncMock(side_effect=delayed_send)  # type: ignore[method-assign]
+    delivery_task = asyncio.create_task(adapter.deliver_clarification(clarification.id))
+    await asyncio.wait_for(entered_send.wait(), timeout=2)
+    cancel_task = asyncio.create_task(cancel())
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(cancel_task), timeout=0.1)
+        release_send.set()
+        assert await asyncio.wait_for(delivery_task, timeout=2) is True
+        cancelled = await asyncio.wait_for(cancel_task, timeout=2)
+        assert cancelled.status == ClarificationStatus.CANCELLED.value
+    finally:
+        release_send.set()
+        await adapter.close()
+
+    async with database.session() as session:
+        stored = await session.get(Clarification, clarification.id)
+        assert stored is not None
+        assert stored.telegram_message_id == 55
+        assert stored.status == ClarificationStatus.CANCELLED.value
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Job)
+                .where(Job.kind == "telegram.notify_clarification_cancelled")
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_cross_project_scope_is_denied(database: Database) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        with pytest.raises(ServiceError) as error:
+            await require_service_scope(
+                session,
+                service_account_id=ids["account_id"],
+                project_id=ids["other_project_id"],
+                tool="telegram.ask_user",
+            )
+    assert error.value.code == "forbidden"
+
+
+@pytest.mark.asyncio
+async def test_telegram_update_is_queued_once(database: Database) -> None:
+    payload = {"update_id": 777, "message": {"message_id": 1}}
+    async with database.session() as session:
+        assert await reserve_telegram_update(session, 777, payload) is True
+        await queue_telegram_update(session, 777, payload)
+    async with database.session() as session:
+        assert await reserve_telegram_update(session, 777, payload) is False
+        assert await session.scalar(select(func.count()).select_from(Job)) == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_update_reservation_rolls_back_when_enqueue_fails(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fail_enqueue(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("synthetic enqueue failure")
+
+    monkeypatch.setattr("dca.app.enqueue_job", fail_enqueue)
+    payload = {"update_id": 778, "message": {"message_id": 1}}
+
+    with pytest.raises(RuntimeError, match="synthetic enqueue failure"):
+        async with database.session() as session:
+            assert await reserve_telegram_update(session, 778, payload) is True
+            await queue_telegram_update(session, 778, payload)
+
+    async with database.session() as session:
+        assert await session.get(TelegramUpdate, 778) is None
+        assert await session.scalar(select(func.count()).select_from(Job)) == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repository_sync_reuses_active_job(
+    database: Database, tmp_path: Path
+) -> None:
+    async with database.session() as session:
+        project = Project(slug=f"sync-{uuid4().hex[:8]}", name="Sync")
+        session.add(project)
+        await session.flush()
+        repository = Repository(
+            project_id=project.id,
+            name="backend",
+            ssh_url="git@example.invalid:backend.git",
+        )
+        session.add(repository)
+        await session.flush()
+        repository_id = repository.id
+
+    secret = "integration-session-secret-32-bytes"  # noqa: S105 - synthetic credential
+    admin_hash = PasswordHasher().hash("integration-test-password")
+    app = create_app(
+        Settings(
+            public_url="http://testserver",
+            database_url=os.environ["DCA_TEST_DATABASE_URL"],
+            session_secret=SecretStr(secret),
+            admin_password_hash=SecretStr(admin_hash),
+            cookie_secure=False,
+            repository_root=tmp_path / "repositories",
+            snapshot_root=tmp_path / "snapshots",
+        )
+    )
+    cookie = URLSafeTimedSerializer(secret, salt="dca-admin-session-v1").dumps(
+        {"email": "admin@example.com"}
+    )
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            cookies={"dca_admin": cookie},
+        ) as client:
+            responses = await asyncio.gather(
+                client.post(
+                    f"/api/v1/repositories/{repository_id}/sync",
+                    headers={"Origin": "http://testserver"},
+                ),
+                client.post(
+                    f"/api/v1/repositories/{repository_id}/sync",
+                    headers={"Origin": "http://testserver"},
+                ),
+            )
+        assert [response.status_code for response in responses] == [202, 202]
+        assert responses[0].json()["job_id"] == responses[1].json()["job_id"]
+        async with database.session() as session:
+            active_jobs = list(
+                await session.scalars(
+                    select(Job).where(
+                        Job.kind == "repository.sync",
+                        Job.status.in_(
+                            (
+                                JobStatus.QUEUED.value,
+                                JobStatus.RUNNING.value,
+                                JobStatus.RETRY.value,
+                            )
+                        ),
+                        Job.payload["repository_id"].as_string() == str(repository_id),
+                    )
+                )
+            )
+            audit_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.event_type == "repository.sync_requested",
+                    AuditEvent.subject_id == str(repository_id),
+                )
+            )
+        assert len(active_jobs) == 1
+        assert audit_count == 1
+    finally:
+        await app.state.telegram.close()
+        await app.state.redis.aclose()
+        await app.state.database.close()

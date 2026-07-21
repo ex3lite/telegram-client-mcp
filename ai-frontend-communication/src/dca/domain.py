@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path, PurePosixPath
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class ClarificationStatus(StrEnum):
+    PENDING = "pending"
+    ANSWERED = "answered"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class ChangeRequestStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+    REJECTED = "rejected"
+
+
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    RETRY = "retry"
+    SUCCEEDED = "succeeded"
+    DELIVERY_UNCERTAIN = "delivery_uncertain"
+    FAILED = "failed"
+
+
+class RepositoryStatus(StrEnum):
+    NEVER_SYNCED = "never_synced"
+    SYNCING = "syncing"
+    READY = "ready"
+    STALE = "stale"
+    FAILED = "failed"
+    DISABLED = "disabled"
+
+
+ALLOWED_CLARIFICATION_TRANSITIONS: dict[ClarificationStatus, set[ClarificationStatus]] = {
+    ClarificationStatus.PENDING: {
+        ClarificationStatus.ANSWERED,
+        ClarificationStatus.EXPIRED,
+        ClarificationStatus.CANCELLED,
+    },
+    ClarificationStatus.ANSWERED: set(),
+    ClarificationStatus.EXPIRED: set(),
+    ClarificationStatus.CANCELLED: set(),
+}
+
+ALLOWED_CHANGE_REQUEST_TRANSITIONS: dict[ChangeRequestStatus, set[ChangeRequestStatus]] = {
+    ChangeRequestStatus.OPEN: {
+        ChangeRequestStatus.IN_PROGRESS,
+        ChangeRequestStatus.REJECTED,
+    },
+    ChangeRequestStatus.IN_PROGRESS: {
+        ChangeRequestStatus.DONE,
+        ChangeRequestStatus.REJECTED,
+    },
+    ChangeRequestStatus.DONE: set(),
+    ChangeRequestStatus.REJECTED: set(),
+}
+
+
+class InvalidStateTransition(ValueError):
+    pass
+
+
+def ensure_transition(current: StrEnum, target: StrEnum) -> None:
+    if isinstance(current, ClarificationStatus) and isinstance(target, ClarificationStatus):
+        allowed: set[StrEnum] = set(ALLOWED_CLARIFICATION_TRANSITIONS[current])
+    elif isinstance(current, ChangeRequestStatus) and isinstance(target, ChangeRequestStatus):
+        allowed = set(ALLOWED_CHANGE_REQUEST_TRANSITIONS[current])
+    else:
+        raise InvalidStateTransition(f"incompatible states: {current} -> {target}")
+    if target not in allowed:
+        raise InvalidStateTransition(f"invalid transition: {current} -> {target}")
+
+
+class Citation(BaseModel):
+    path: str = Field(min_length=1, max_length=1_024)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str) -> str:
+        normalized = value.replace("\\", "/").strip()
+        candidate = PurePosixPath(normalized)
+        if (
+            candidate.is_absolute()
+            or re.match(r"^[A-Za-z]:/", normalized)
+            or ".." in candidate.parts
+            or not candidate.parts
+        ):
+            raise ValueError("citation path must stay inside the repository")
+        return candidate.as_posix()
+
+    @model_validator(mode="after")
+    def line_range_is_ordered(self) -> Citation:
+        if self.end_line < self.start_line:
+            raise ValueError("end_line must be greater than or equal to start_line")
+        return self
+
+
+class CitationCheck(BaseModel):
+    citation: Citation
+    accepted: bool
+    reason: str | None = None
+
+
+def validate_citation(snapshot_root: Path, citation: Citation) -> CitationCheck:
+    root = snapshot_root.resolve()
+    candidate = (root / citation.path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return CitationCheck(citation=citation, accepted=False, reason="path_outside_snapshot")
+    if not candidate.is_file():
+        return CitationCheck(citation=citation, accepted=False, reason="source_not_found")
+    try:
+        with candidate.open("r", encoding="utf-8", errors="replace") as source:
+            line_count = sum(1 for _ in source)
+    except OSError:
+        return CitationCheck(citation=citation, accepted=False, reason="source_unreadable")
+    if citation.end_line > line_count:
+        return CitationCheck(citation=citation, accepted=False, reason="line_out_of_range")
+    return CitationCheck(citation=citation, accepted=True)
+
+
+class KnowledgeAnswer(BaseModel):
+    answer_markdown: str = Field(min_length=1, max_length=200_000)
+    citations: list[Citation] = Field(default_factory=list, max_length=100)
+    uncertainty: list[str] = Field(default_factory=list, max_length=50)
+
+
+class AskUserInput(BaseModel):
+    project_id: UUID
+    agent_run_id: str = Field(min_length=1, max_length=255)
+    correlation_id: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=8, max_length=255)
+    recipient_user_id: UUID
+    context: str = Field(min_length=1, max_length=8_000)
+    question: str = Field(min_length=1, max_length=4_000)
+    expected_answer: dict[str, Any] | None = None
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def expiry_must_be_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("expires_at must include a timezone")
+        return value.astimezone(UTC)
+
+
+class ClarificationResult(BaseModel):
+    request_id: UUID
+    status: ClarificationStatus
+    answer: str | None = None
+    answered_at: datetime | None = None
+    expires_at: datetime
+
+
+class ChangeRequestCreate(BaseModel):
+    project_id: UUID
+    kind: str = Field(default="task", pattern=r"^(bug|task|feature)$")
+    title: str = Field(min_length=3, max_length=200)
+    description: str = Field(default="", max_length=16_000)
+    priority: str = Field(default="normal", pattern=r"^(low|normal|high|urgent)$")
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceCredential:
+    prefix: str
+    secret: str
+
+
+SERVICE_TOKEN_RE = re.compile(r"^dca_([a-z0-9]{8})_([A-Za-z0-9_-]{32,})$")
+
+
+def parse_service_token(token: str) -> ServiceCredential | None:
+    match = SERVICE_TOKEN_RE.fullmatch(token)
+    if not match:
+        return None
+    return ServiceCredential(prefix=match.group(1), secret=match.group(2))
+
+
+def utcnow() -> datetime:
+    return datetime.now(UTC)

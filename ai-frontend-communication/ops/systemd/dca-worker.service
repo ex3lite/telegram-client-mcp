@@ -1,0 +1,37 @@
+[Unit]
+Description=Developer Communication Agent Worker
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsExecutable=/opt/dca/current/.venv/bin/dca-worker
+
+[Service]
+Type=simple
+User=dca
+Group=dca
+WorkingDirectory=/opt/dca/current
+EnvironmentFile=/etc/dca/dca.env
+Environment=HOME=/var/lib/dca
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/dca/current/.venv/bin/dca-worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/dca
+
+[Install]
+WantedBy=multi-user.target
