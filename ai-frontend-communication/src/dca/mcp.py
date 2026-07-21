@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import anyio
@@ -11,6 +12,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select, update
 
@@ -128,6 +130,7 @@ def current_service_account_id() -> UUID:
 
 def build_mcp(settings: Settings, database: Database) -> FastMCP[None]:
     resource_url = f"{str(settings.public_url).rstrip('/')}/mcp"
+    public_url = urlsplit(str(settings.public_url))
     server = FastMCP(
         "Developer Communication Agent",
         instructions=(
@@ -143,6 +146,10 @@ def build_mcp(settings: Settings, database: Database) -> FastMCP[None]:
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
+        transport_security=TransportSecuritySettings(
+            allowed_hosts=[public_url.netloc],
+            allowed_origins=[f"{public_url.scheme}://{public_url.netloc}"],
+        ),
     )
 
     @server.tool(name="identity_resolve_user")

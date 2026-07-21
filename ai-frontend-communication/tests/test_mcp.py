@@ -7,7 +7,7 @@ from dca.mcp import build_mcp
 
 @pytest.mark.asyncio
 async def test_mcp_tool_contracts_are_stable() -> None:
-    settings = Settings()
+    settings = Settings(public_url="https://agent.example.com")
     database = Database(settings)
     try:
         server = build_mcp(settings, database)
@@ -28,3 +28,5 @@ async def test_mcp_tool_contracts_are_stable() -> None:
     assert request_schema["properties"]["project_id"]["format"] == "uuid"
     assert request_schema["properties"]["expires_at"]["format"] == "date-time"
     assert "idempotency_key" in request_schema["required"]
+    assert server.settings.transport_security.allowed_hosts == ["agent.example.com"]
+    assert server.settings.transport_security.allowed_origins == ["https://agent.example.com"]
