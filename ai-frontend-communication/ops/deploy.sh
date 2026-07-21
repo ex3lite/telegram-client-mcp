@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+shopt -s inherit_errexit
 
 umask 027
 
@@ -23,6 +24,7 @@ RECOVERY_REVISION=
 RECOVERY_COMMAND=
 RECOVERY_CURRENT=
 LAST_BACKUP=
+PREPARED_RELEASE=
 
 die() {
   echo "dca-deploy: $*" >&2
@@ -151,21 +153,27 @@ prepare_release() {
     HOME="$STATE_DIR" UV_CACHE_DIR="$STATE_DIR/.cache/uv" \
     "$uv_bin" --directory "$release" sync \
     --frozen --no-dev --no-editable --python 3.14 >&2
+  # Positional parameters are intentionally expanded by the child shell after it changes cwd.
+  # shellcheck disable=SC2016
   runuser -u "$SERVICE_USER" -- env \
     HOME="$STATE_DIR" XDG_CACHE_HOME="$STATE_DIR/.cache" \
     XDG_DATA_HOME="$STATE_DIR/.local/share" \
-    corepack pnpm --dir "$release/web" install --frozen-lockfile >&2
+    /bin/bash -c 'cd "$1/web" && exec corepack pnpm install --frozen-lockfile' \
+    _ "$release" >&2
+  # shellcheck disable=SC2016
   runuser -u "$SERVICE_USER" -- env \
     HOME="$STATE_DIR" XDG_CACHE_HOME="$STATE_DIR/.cache" \
     XDG_DATA_HOME="$STATE_DIR/.local/share" \
-    corepack pnpm --dir "$release/web" build >&2
+    /bin/bash -c 'cd "$1/web" && exec corepack pnpm build' \
+    _ "$release" >&2
+  [[ -s $release/web/dist/index.html ]] || die "frontend build produced no index.html"
 
   run_with_env "$release" "$release/.venv/bin/python" -c \
     'from dca.config import Settings; Settings()'
   alembic_head "$release" >/dev/null
   chown -R root:"$SERVICE_USER" "$release"
   chmod -R a-w "$release"
-  echo "$release"
+  PREPARED_RELEASE=$release
 }
 
 backup_database() {
@@ -280,7 +288,8 @@ recover() {
 
 deploy() {
   local release old_release old_revision
-  release=$(prepare_release)
+  prepare_release
+  release=$PREPARED_RELEASE
   old_release=$(current_target "$CURRENT_LINK")
   old_revision=$(alembic_current "$release")
   old_revision=${old_revision:-base}
