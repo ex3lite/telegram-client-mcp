@@ -15,6 +15,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/dca/current/.venv/bin/dca-worker
 Restart=on-failure
 RestartSec=3
+KillSignal=SIGINT
 TimeoutStopSec=30
 UMask=0027
 NoNewPrivileges=true

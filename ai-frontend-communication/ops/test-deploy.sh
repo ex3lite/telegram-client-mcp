@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=deploy.sh
 source "$SCRIPT_DIR/deploy.sh"
 bash -n "$SCRIPT_DIR/certbot/agency-nginx-reload.sh"
+grep -Fxq 'KillSignal=SIGINT' "$SCRIPT_DIR/systemd/dca-worker.service"
 
 sandbox=$(mktemp -d)
 trap 'rm -rf -- "$sandbox"' EXIT

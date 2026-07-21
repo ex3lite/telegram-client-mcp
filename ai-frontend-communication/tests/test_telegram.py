@@ -21,6 +21,7 @@ from dca.telegram import (
     TelegramAdapter,
     extract_bot_mention,
     extract_project_prefix,
+    ingest_telegram_update,
     new_draft_id,
     split_rich_answer,
 )
@@ -214,6 +215,31 @@ async def test_guest_placeholder_uses_answer_guest_query(adapter: TelegramAdapte
     call = adapter.bot.answer_guest_query.await_args
     assert call.kwargs["guest_query_id"] == "guest-9"
     assert call.kwargs["result"].input_message_content.rich_message.markdown is not None
+
+
+@pytest.mark.asyncio
+async def test_shared_ingest_keeps_guest_uncertain_semantics(monkeypatch) -> None:
+    reserve = AsyncMock(return_value=True)
+    queue = AsyncMock()
+    uncertain = AsyncMock()
+    monkeypatch.setattr(telegram_module, "reserve_telegram_update", reserve)
+    monkeypatch.setattr(telegram_module, "queue_telegram_update", queue)
+    monkeypatch.setattr(telegram_module, "mark_guest_uncertain", uncertain)
+    telegram = SimpleNamespace(
+        answer_guest_placeholder=AsyncMock(side_effect=RuntimeError("delivery unknown"))
+    )
+    session = object()
+    payload = {"update_id": 19, "guest_message": {"guest_query_id": "guest-19"}}
+
+    assert await ingest_telegram_update(
+        session,
+        telegram,
+        payload,
+        actor_id="polling-worker",  # type: ignore[arg-type]
+    )
+
+    uncertain.assert_awaited_once_with(session, 19, "RuntimeError", actor_id="polling-worker")
+    queue.assert_not_awaited()
 
 
 @pytest.mark.asyncio

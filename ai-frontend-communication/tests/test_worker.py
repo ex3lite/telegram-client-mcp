@@ -1,15 +1,224 @@
+import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.methods import SendMessage
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
+from aiogram.methods import GetUpdates, SendMessage
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
+import dca.worker as worker_module
 from dca.claude import ClaudeError
+from dca.config import Settings
 from dca.db import Interaction, Job
 from dca.worker import TELEGRAM_EXTERNAL_ACTIONS, Worker, trusted_requester_profile
+
+
+def test_telegram_mode_is_strict_and_webhook_compatible() -> None:
+    assert Settings(telegram_mode="polling").telegram_mode == "polling"
+    assert Settings(telegram_mode="webhook").telegram_mode == "webhook"
+    with pytest.raises(ValidationError):
+        Settings(telegram_mode="updates")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_poll_batch_ingests_each_update_before_advancing_offset(monkeypatch) -> None:
+    worker = Worker.__new__(Worker)
+    payloads = [
+        {"update_id": 41, "message": {"message_id": 1}},
+        {"update_id": 42, "message": {"message_id": 2}},
+    ]
+
+    class FakeUpdate:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.update_id = int(payload["update_id"])
+            self.payload = payload
+
+        def model_dump(self, **_: Any) -> dict[str, Any]:
+            return dict(self.payload)
+
+    bot = SimpleNamespace(get_updates=AsyncMock(return_value=list(map(FakeUpdate, payloads))))
+    worker.telegram = SimpleNamespace(bot=bot, allowed_updates=lambda: ["message"])
+
+    @asynccontextmanager
+    async def session():
+        yield object()
+
+    worker.database = SimpleNamespace(session=session)
+    ingest = AsyncMock()
+    monkeypatch.setattr(worker_module, "ingest_telegram_update", ingest)
+
+    assert await worker._poll_telegram_batch(None) == 43
+    bot.get_updates.assert_awaited_once_with(
+        offset=None,
+        timeout=worker_module.TELEGRAM_POLL_TIMEOUT_SECONDS,
+        allowed_updates=["message"],
+        request_timeout=worker_module.TELEGRAM_POLL_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert [call.args[2]["update_id"] for call in ingest.await_args_list] == [41, 42]
+    assert all(call.kwargs["actor_id"] == "polling-worker" for call in ingest.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_worker_runs_polling_and_jobs_concurrently() -> None:
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace(telegram_mode="polling")
+    worker.recover_stale_jobs = AsyncMock()
+    worker._run_job_loop = AsyncMock()
+    worker._poll_telegram_forever = AsyncMock()
+    worker.telegram = SimpleNamespace(close=AsyncMock())
+    worker.database = SimpleNamespace(close=AsyncMock())
+    worker.worker_id = "test-worker"
+
+    await worker.run_forever()
+
+    worker._run_job_loop.assert_awaited_once_with()
+    worker._poll_telegram_forever.assert_awaited_once_with()
+    worker.telegram.close.assert_awaited_once_with()
+    worker.database.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_polling_retries_network_errors_with_backoff(monkeypatch) -> None:
+    worker = Worker.__new__(Worker)
+    network_error = TelegramNetworkError(method=GetUpdates(), message="proxy unavailable")
+    worker._poll_telegram_batch = AsyncMock(
+        side_effect=[network_error, None, network_error, asyncio.CancelledError()]
+    )
+    sleep = AsyncMock()
+    jitter = iter([0.2, 0.3])
+    monkeypatch.setattr(worker_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker_module.random, "uniform", lambda *_: next(jitter))
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._poll_telegram_loop()
+
+    assert [call.args for call in sleep.await_args_list] == [(1.2,), (1.3,)]
+    assert all(call.args == (None,) for call in worker._poll_telegram_batch.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_polling_honors_full_telegram_retry_after(monkeypatch) -> None:
+    worker = Worker.__new__(Worker)
+    rate_limit = TelegramRetryAfter(
+        method=GetUpdates(),
+        message="rate limited",
+        retry_after=75,
+    )
+    worker._poll_telegram_batch = AsyncMock(side_effect=[rate_limit, asyncio.CancelledError()])
+    sleep = AsyncMock()
+    monkeypatch.setattr(worker_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._poll_telegram_loop()
+
+    sleep.assert_awaited_once_with(75.0)
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        TelegramConflictError,
+        TelegramUnauthorizedError,
+        TelegramForbiddenError,
+        TelegramBadRequest,
+    ],
+)
+@pytest.mark.asyncio
+async def test_polling_fails_fast_on_non_retryable_telegram_errors(
+    monkeypatch,
+    error_type: type[Exception],
+) -> None:
+    worker = Worker.__new__(Worker)
+    error = error_type(method=GetUpdates(), message="invalid polling configuration")
+    worker._poll_telegram_batch = AsyncMock(side_effect=error)
+    sleep = AsyncMock()
+    monkeypatch.setattr(worker_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(error_type):
+        await worker._poll_telegram_loop()
+
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_polling_fails_fast_on_unexpected_programming_error(monkeypatch) -> None:
+    worker = Worker.__new__(Worker)
+    worker._poll_telegram_batch = AsyncMock(side_effect=TypeError("invalid update contract"))
+    sleep = AsyncMock()
+    monkeypatch.setattr(worker_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(TypeError, match="invalid update contract"):
+        await worker._poll_telegram_loop()
+
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_polling_advisory_lock_is_released() -> None:
+    worker = Worker.__new__(Worker)
+    connection = SimpleNamespace(scalar=AsyncMock(side_effect=[True, True]))
+
+    @asynccontextmanager
+    async def connect():
+        yield connection
+
+    worker.database = SimpleNamespace(engine=SimpleNamespace(connect=connect))
+
+    with pytest.raises(RuntimeError, match="test cancellation"):
+        async with worker._telegram_poll_lock():
+            raise RuntimeError("test cancellation")
+
+    assert connection.scalar.await_count == 2
+    assert "pg_try_advisory_lock" in str(connection.scalar.await_args_list[0].args[0])
+    assert "pg_advisory_unlock" in str(connection.scalar.await_args_list[1].args[0])
+
+
+@pytest.mark.asyncio
+async def test_polling_refuses_second_consumer() -> None:
+    worker = Worker.__new__(Worker)
+    connection = SimpleNamespace(scalar=AsyncMock(return_value=False))
+
+    @asynccontextmanager
+    async def connect():
+        yield connection
+
+    worker.database = SimpleNamespace(engine=SimpleNamespace(connect=connect))
+
+    with pytest.raises(RuntimeError, match="already holds the lock"):
+        async with worker._telegram_poll_lock():
+            pass
+
+
+@pytest.mark.asyncio
+async def test_polling_startup_deletes_webhook_and_keeps_backlog() -> None:
+    worker = Worker.__new__(Worker)
+
+    @asynccontextmanager
+    async def lock():
+        yield
+
+    worker._telegram_poll_lock = lock
+    worker.telegram = SimpleNamespace(
+        bot=SimpleNamespace(delete_webhook=AsyncMock(return_value=True))
+    )
+    worker._poll_telegram_loop = AsyncMock()
+
+    await worker._poll_telegram_forever()
+
+    worker.telegram.bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+    worker._poll_telegram_loop.assert_awaited_once_with()
 
 
 def test_trusted_requester_profile_whitelists_telegram_server_metadata() -> None:

@@ -92,7 +92,7 @@ The production endpoints are:
 
 ```text
 Frontend: https://agency.kakaduai.com/
-Webhook:  https://agency.kakaduai.com/webhooks/telegram
+Webhook compatibility: https://agency.kakaduai.com/webhooks/telegram
 MCP:      https://agency.kakaduai.com/mcp
 Health:   https://agency.kakaduai.com/health/ready?deep=true
 ```
@@ -114,9 +114,10 @@ install -m 0600 \
   /etc/dca/dca.env
 ```
 
-Fill `/etc/dca/dca.env`. Required secrets are the database password, Telegram token and webhook
-secret, a random session/HMAC secret of at least 32 characters, Claude OAuth token and outbound
-proxy URL. Keep the file `root:root 0600`.
+Fill `/etc/dca/dca.env`. Required secrets are the database password, Telegram token, a random
+session/HMAC secret of at least 32 characters, Claude OAuth token and outbound proxy URL. Production
+uses `DCA_TELEGRAM_MODE=polling`; the webhook secret is required only for `webhook` mode. Keep the
+file `root:root 0600`.
 
 Create the `dca` database and least-privilege login, then run the first release:
 
@@ -188,6 +189,11 @@ trap 'rm -f "$env_tmp"' EXIT
 sed 's#^DCA_PUBLIC_URL=.*#DCA_PUBLIC_URL=https://agency.kakaduai.com#' \
   "$env_file" > "$env_tmp"
 test "$(grep -c '^DCA_PUBLIC_URL=' "$env_tmp")" -eq 1
+if grep -q '^DCA_TELEGRAM_MODE=' "$env_tmp"; then
+  sed -i 's/^DCA_TELEGRAM_MODE=.*/DCA_TELEGRAM_MODE=polling/' "$env_tmp"
+else
+  printf '\nDCA_TELEGRAM_MODE=polling\n' >> "$env_tmp"
+fi
 chown root:root "$env_tmp"
 chmod 0600 "$env_tmp"
 mv -f "$env_tmp" "$env_file"
@@ -196,11 +202,13 @@ trap - EXIT
 dca-deploy deploy
 telegram_setup=$(dca-deploy bootstrap telegram-setup)
 printf '%s\n' "$telegram_setup"
-grep -Fxq 'webhook=https://agency.kakaduai.com/webhooks/telegram' <<<"$telegram_setup"
+grep -Fxq 'telegram_mode=polling' <<<"$telegram_setup"
+grep -Fxq 'webhook=deleted' <<<"$telegram_setup"
 ```
 
-`telegram-setup` performs `getMe` and `setWebhook` through `DCA_OUTBOUND_PROXY_URL`; the deep health
-check below repeats the proxy-aware Telegram check. Verify the panel root, webhook-derived health,
+`telegram-setup` performs `getMe` and `deleteWebhook(drop_pending_updates=false)` through
+`DCA_OUTBOUND_PROXY_URL`; the worker then long-polls through the same proxy. The deep health check
+below repeats the proxy-aware Telegram check. Verify the panel root, worker service health,
 authenticated MCP origin and browser same-origin boundary before touching apex. Set the MCP token
 printed by `seed` and an admin UUID printed by `admin-key` in the current shell only:
 
@@ -310,7 +318,8 @@ that returns `chat not found` must not be seeded.
 - Empty-database upgrade and full downgrade through the raw SQL pair.
 - `ops/test-deploy.sh`, native service status, and public `/health/live` and
   `/health/ready?deep=true` on `agency.kakaduai.com`.
-- Telegram `getMe`, webhook state and a real group/private round trip through the configured proxy.
+- Telegram `getMe`, deleted webhook, active polling worker and a real group/private round trip
+  through the configured proxy.
 - Claude answer from an immutable snapshot with a server-verified file/line citation.
 - MCP bearer authentication and audit reconstruction by `correlation_id`.
 - Fresh PostgreSQL dump and a rehearsed manual restore procedure.

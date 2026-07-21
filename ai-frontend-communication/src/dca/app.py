@@ -27,9 +27,7 @@ from fastapi.responses import FileResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, select, text, update
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import func, select, text
 
 from dca.config import Settings, get_settings
 from dca.db import (
@@ -43,7 +41,6 @@ from dca.db import (
     Job,
     Project,
     Repository,
-    TelegramUpdate,
     append_audit,
     enqueue_job,
 )
@@ -60,7 +57,7 @@ from dca.service import (
     update_change_request_status,
     validate_admin_access_key,
 )
-from dca.telegram import TelegramAdapter
+from dca.telegram import TelegramAdapter, ingest_telegram_update
 from dca.worker import configure_logging
 
 log = structlog.get_logger()
@@ -206,6 +203,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 bot = await telegram.bot.get_me()
                 checks["telegram"] = {
                     "ok": True,
+                    "mode": settings.telegram_mode,
                     "has_topics_enabled": bot.has_topics_enabled,
                     "supports_guest_queries": bot.supports_guest_queries,
                 }
@@ -331,23 +329,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "update_too_large")
         try:
             payload = orjson.loads(body)
-            update_id = int(payload["update_id"])
+            payload["update_id"] = int(payload["update_id"])
         except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_update") from exc
 
         async with database.session() as session:
-            inserted = await reserve_telegram_update(session, update_id, payload)
-            if not inserted:
-                return {"ok": True}
-            if payload.get("guest_message") is not None:
-                try:
-                    inline_message_id = await telegram.answer_guest_placeholder(payload)
-                except Exception as exc:
-                    await mark_guest_uncertain(session, update_id, type(exc).__name__)
-                    return {"ok": True}
-                if inline_message_id is not None:
-                    payload["_dca_inline_message_id"] = inline_message_id
-            await queue_telegram_update(session, update_id, payload)
+            await ingest_telegram_update(session, telegram, payload, actor_id="webhook")
         return {"ok": True}
 
     @app.get("/api/v1/projects")
@@ -576,57 +563,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Mount last so API, the admin index and assets retain their exact routes.
     app.mount("/", mcp_application)
     return app
-
-
-async def reserve_telegram_update(
-    session: AsyncSession,
-    update_id: int,
-    payload: dict[str, Any],
-) -> bool:
-    update_type = next((key for key in payload if key != "update_id"), "unknown")
-    result = await session.execute(
-        insert(TelegramUpdate)
-        .values(update_id=update_id, update_type=update_type, payload=payload)
-        .on_conflict_do_nothing(index_elements=[TelegramUpdate.update_id])
-        .returning(TelegramUpdate.update_id)
-    )
-    return result.scalar_one_or_none() is not None
-
-
-async def queue_telegram_update(
-    session: AsyncSession,
-    update_id: int,
-    payload: dict[str, Any],
-) -> None:
-    await session.execute(
-        update(TelegramUpdate).where(TelegramUpdate.update_id == update_id).values(payload=payload)
-    )
-    await enqueue_job(
-        session,
-        kind="telegram.process_update",
-        payload={"update_id": update_id},
-        deduplication_key=f"telegram-update:{update_id}",
-    )
-
-
-async def mark_guest_uncertain(session: AsyncSession, update_id: int, error_code: str) -> None:
-    row = await session.get(TelegramUpdate, update_id)
-    if row is None:
-        return
-    payload = dict(row.payload)
-    payload["_dca_guest_answer_status"] = "uncertain"
-    row.payload = payload
-    await append_audit(
-        session,
-        event_type="telegram.guest_answer_uncertain",
-        correlation_id=f"telegram-update:{update_id}",
-        actor_type="system",
-        actor_id="webhook",
-        outcome="uncertain",
-        subject_type="telegram_update",
-        subject_id=str(update_id),
-        payload={"error_code": error_code},
-    )
 
 
 async def enforce_login_rate_limit(

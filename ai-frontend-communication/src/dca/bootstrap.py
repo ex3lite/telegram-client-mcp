@@ -243,23 +243,33 @@ async def add_repository(args: argparse.Namespace, settings: Settings) -> None:
 async def setup_telegram(settings: Settings) -> None:
     if not settings.telegram_bot_token.get_secret_value():
         raise SystemExit("DCA_TELEGRAM_BOT_TOKEN is required")
-    if not settings.telegram_webhook_secret.get_secret_value():
+    if (
+        settings.telegram_mode == "webhook"
+        and not settings.telegram_webhook_secret.get_secret_value()
+    ):
         raise SystemExit("DCA_TELEGRAM_WEBHOOK_SECRET is required")
     database = Database(settings)
     telegram = TelegramAdapter(settings, database)
     try:
         bot = await telegram.bot.get_me()
         await telegram.setup_commands()
-        await telegram.bot.set_webhook(
-            url=settings.telegram_webhook_url,
-            secret_token=settings.telegram_webhook_secret.get_secret_value(),
-            allowed_updates=telegram.allowed_updates(),
-            drop_pending_updates=False,
-        )
+        if settings.telegram_mode == "polling":
+            await telegram.bot.delete_webhook(drop_pending_updates=False)
+        else:
+            await telegram.bot.set_webhook(
+                url=settings.telegram_webhook_url,
+                secret_token=settings.telegram_webhook_secret.get_secret_value(),
+                allowed_updates=telegram.allowed_updates(),
+                drop_pending_updates=False,
+            )
         print(f"bot=@{bot.username}")
         print(f"has_topics_enabled={bool(bot.has_topics_enabled)}")
         print(f"supports_guest_queries={bool(bot.supports_guest_queries)}")
-        print(f"webhook={settings.telegram_webhook_url}")
+        print(f"telegram_mode={settings.telegram_mode}")
+        if settings.telegram_mode == "polling":
+            print("webhook=deleted")
+        else:
+            print(f"webhook={settings.telegram_webhook_url}")
     finally:
         await telegram.close()
         await database.close()

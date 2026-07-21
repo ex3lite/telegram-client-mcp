@@ -46,7 +46,7 @@ docker compose run --rm --no-deps api uv run --no-sync dca-bootstrap \
   admin-key-revoke --key-id <admin-access-key-id>
 ```
 
-Register the Telegram command menu and webhook after the public HTTPS endpoint is reachable:
+Register the Telegram command menu and configure the selected update transport:
 
 ```bash
 docker compose run --rm --no-deps api \
@@ -61,7 +61,7 @@ sudo dca-deploy rollback
 ```
 
 The admin UI is served at `/`. The API also exposes `/health/live`, `/health/ready`,
-`/api/v1`, the Telegram webhook at `/webhooks/telegram`, and Streamable HTTP MCP at `/mcp`.
+`/api/v1`, an optional Telegram webhook at `/webhooks/telegram`, and Streamable HTTP MCP at `/mcp`.
 Repository-key provisioning, user linking, deployment lifecycle, and release gates are in
 [docs/OPERATIONS.md](docs/OPERATIONS.md). The exact Telegram feature matrix is in
 [docs/TELEGRAM_10_2.md](docs/TELEGRAM_10_2.md).

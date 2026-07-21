@@ -2,15 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import socket
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
 import structlog
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from sqlalchemy import select, update
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from dca.claude import ClaudeCode, ClaudeError, RepositorySnapshots
 from dca.config import Settings, get_settings
@@ -25,7 +37,7 @@ from dca.db import (
 )
 from dca.domain import JobStatus, utcnow
 from dca.service import ServiceError, expire_clarification, list_expired_pending
-from dca.telegram import TelegramAdapter, new_draft_id
+from dca.telegram import TelegramAdapter, ingest_telegram_update, new_draft_id
 
 log = structlog.get_logger()
 TELEGRAM_EXTERNAL_ACTIONS = {
@@ -34,6 +46,20 @@ TELEGRAM_EXTERNAL_ACTIONS = {
     "telegram.publish_interaction",
     "telegram.process_update",
 }
+TELEGRAM_POLL_TIMEOUT_SECONDS = 30
+TELEGRAM_POLL_REQUEST_TIMEOUT_SECONDS = 90
+TELEGRAM_POLL_RETRY_MAX_SECONDS = 30.0
+TELEGRAM_POLL_LOCK_ID = 0x4443415F5447504C
+TELEGRAM_POLL_FATAL_ERRORS = (
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramForbiddenError,
+    TelegramUnauthorizedError,
+)
+
+
+def _poll_retry_delay(base_delay: float) -> float:
+    return base_delay + random.uniform(0, base_delay * 0.2)  # noqa: S311 - retry jitter
 
 
 def trusted_requester_profile(interaction: Interaction) -> dict[str, str] | None:
@@ -60,18 +86,159 @@ class Worker:
 
     async def run_forever(self) -> None:
         await self.recover_stale_jobs()
-        log.info("worker.started", worker_id=self.worker_id)
+        log.info(
+            "worker.started",
+            worker_id=self.worker_id,
+            telegram_mode=self.settings.telegram_mode,
+        )
         try:
-            while True:
-                await self._sweep_expired_if_due()
-                job = await self.claim_job()
-                if job is None:
-                    await asyncio.sleep(self.settings.worker_poll_seconds)
-                    continue
-                await self.process(job)
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self._run_job_loop())
+                if self.settings.telegram_mode == "polling":
+                    tasks.create_task(self._poll_telegram_forever())
         finally:
             await self.telegram.close()
             await self.database.close()
+
+    async def _run_job_loop(self) -> None:
+        while True:
+            await self._sweep_expired_if_due()
+            job = await self.claim_job()
+            if job is None:
+                await asyncio.sleep(self.settings.worker_poll_seconds)
+                continue
+            await self.process(job)
+
+    async def _poll_telegram_batch(self, offset: int | None) -> int | None:
+        updates = await self.telegram.bot.get_updates(
+            offset=offset,
+            timeout=TELEGRAM_POLL_TIMEOUT_SECONDS,
+            allowed_updates=self.telegram.allowed_updates(),
+            request_timeout=TELEGRAM_POLL_REQUEST_TIMEOUT_SECONDS,
+        )
+        for telegram_update in updates:
+            payload = telegram_update.model_dump(mode="json", by_alias=True, exclude_none=True)
+            async with self.database.session() as session:
+                await ingest_telegram_update(
+                    session,
+                    self.telegram,
+                    payload,
+                    actor_id="polling-worker",
+                )
+            offset = telegram_update.update_id + 1
+        return offset
+
+    @asynccontextmanager
+    async def _telegram_poll_lock(self) -> AsyncIterator[None]:
+        async with self.database.engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:lock_id)"),
+                {"lock_id": TELEGRAM_POLL_LOCK_ID},
+            )
+            if acquired is not True:
+                raise RuntimeError("another Telegram polling worker already holds the lock")
+            log.info("telegram.poll_lock_acquired")
+            try:
+                yield
+            finally:
+                try:
+                    released = await connection.scalar(
+                        text("SELECT pg_advisory_unlock(:lock_id)"),
+                        {"lock_id": TELEGRAM_POLL_LOCK_ID},
+                    )
+                    if released is not True:
+                        log.error("telegram.poll_lock_release_failed")
+                except Exception:
+                    log.exception("telegram.poll_lock_release_failed")
+
+    async def _poll_telegram_forever(self) -> None:
+        async with self._telegram_poll_lock():
+            await self._delete_polling_webhook()
+            await self._poll_telegram_loop()
+
+    async def _delete_polling_webhook(self) -> None:
+        retry_delay = 1.0
+        while True:
+            try:
+                await self.telegram.bot.delete_webhook(drop_pending_updates=False)
+            except asyncio.CancelledError:
+                raise
+            except TELEGRAM_POLL_FATAL_ERRORS as exc:
+                log.error("telegram.poll_setup_fatal", error_type=type(exc).__name__)
+                raise
+            except TelegramRetryAfter as exc:
+                delay = float(exc.retry_after)
+                log.warning("telegram.poll_setup_rate_limited", retry_seconds=delay)
+                await asyncio.sleep(delay)
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                delay = _poll_retry_delay(retry_delay)
+                log.warning(
+                    "telegram.poll_setup_failed",
+                    error_type=type(exc).__name__,
+                    retry_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                retry_delay = min(retry_delay * 2, TELEGRAM_POLL_RETRY_MAX_SECONDS)
+            except TelegramAPIError as exc:
+                log.error("telegram.poll_setup_fatal", error_type=type(exc).__name__)
+                raise
+            except Exception:
+                log.exception("telegram.poll_setup_unexpected")
+                raise
+            else:
+                log.info("telegram.poll_webhook_deleted", drop_pending_updates=False)
+                return
+
+    async def _poll_telegram_loop(self) -> None:
+        offset: int | None = None
+        retry_delay = 1.0
+        while True:
+            try:
+                offset = await self._poll_telegram_batch(offset)
+            except asyncio.CancelledError:
+                raise
+            except TELEGRAM_POLL_FATAL_ERRORS as exc:
+                log.error("telegram.poll_fatal", error_type=type(exc).__name__)
+                raise
+            except TelegramRetryAfter as exc:
+                delay = float(exc.retry_after)
+                log.warning("telegram.poll_rate_limited", retry_seconds=delay)
+                await asyncio.sleep(delay)
+            except TelegramNetworkError as exc:
+                delay = _poll_retry_delay(retry_delay)
+                log.warning(
+                    "telegram.poll_network_error",
+                    error_type=type(exc).__name__,
+                    retry_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                retry_delay = min(retry_delay * 2, TELEGRAM_POLL_RETRY_MAX_SECONDS)
+            except TelegramServerError as exc:
+                delay = _poll_retry_delay(retry_delay)
+                log.warning(
+                    "telegram.poll_server_error",
+                    error_type=type(exc).__name__,
+                    retry_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                retry_delay = min(retry_delay * 2, TELEGRAM_POLL_RETRY_MAX_SECONDS)
+            except TelegramAPIError as exc:
+                log.error("telegram.poll_fatal", error_type=type(exc).__name__)
+                raise
+            except SQLAlchemyError as exc:
+                delay = _poll_retry_delay(retry_delay)
+                log.warning(
+                    "telegram.poll_database_error",
+                    error_type=type(exc).__name__,
+                    retry_seconds=delay,
+                )
+                await asyncio.sleep(delay)
+                retry_delay = min(retry_delay * 2, TELEGRAM_POLL_RETRY_MAX_SECONDS)
+            except Exception:
+                log.exception("telegram.poll_unexpected")
+                raise
+            else:
+                retry_delay = 1.0
 
     async def claim_job(self) -> Job | None:
         async with self.database.session() as session:

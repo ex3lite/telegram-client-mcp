@@ -18,7 +18,7 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 
-from dca.app import create_app, queue_telegram_update, reserve_telegram_update
+from dca.app import create_app
 from dca.bootstrap import revoke_admin_key, upsert_admin_key
 from dca.config import Settings
 from dca.db import (
@@ -47,7 +47,7 @@ from dca.service import (
     create_clarification,
     require_service_scope,
 )
-from dca.telegram import TelegramAdapter
+from dca.telegram import TelegramAdapter, queue_telegram_update, reserve_telegram_update
 
 pytestmark = pytest.mark.integration
 
@@ -479,7 +479,7 @@ async def test_telegram_update_reservation_rolls_back_when_enqueue_fails(
     async def fail_enqueue(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("synthetic enqueue failure")
 
-    monkeypatch.setattr("dca.app.enqueue_job", fail_enqueue)
+    monkeypatch.setattr("dca.telegram.enqueue_job", fail_enqueue)
     payload = {"update_id": 778, "message": {"message_id": 1}}
 
     with pytest.raises(RuntimeError, match="synthetic enqueue failure"):

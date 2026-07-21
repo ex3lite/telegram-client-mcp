@@ -20,23 +20,29 @@ placeholder plus one edit; this is not token-by-token group streaming. The appli
 durable interaction/job before background generation, except the Guest Mode placeholder, which
 must be answered immediately so Telegram returns the inline message ID needed for later editing.
 
-## Command and webhook setup
+## Command and update transport setup
 
-`dca-bootstrap telegram-setup` registers these scopes and then calls `setWebhook` with the configured
-secret token:
+`dca-bootstrap telegram-setup` registers these scopes and configures `DCA_TELEGRAM_MODE`:
 
 - private chats: `/ask`, `/request`, `/help`;
 - group chats: `/ask`, ephemeral `/ask_private`, ephemeral `/request`.
 
-The webhook accepts only requests with `X-Telegram-Bot-Api-Secret-Token`, enforces the configured
-body-size limit, and deduplicates `update_id` in PostgreSQL before queueing work. Guest updates are
-included in the dispatcher-derived `allowed_updates` list.
+Production uses `polling`: setup calls `deleteWebhook(drop_pending_updates=false)`, then the native
+worker long-polls through `DCA_OUTBOUND_PROXY_URL` concurrently with its durable job loop. `webhook`
+mode remains available; it requires `DCA_TELEGRAM_WEBHOOK_SECRET`, checks the secret header and body
+limit, and receives updates at `/webhooks/telegram`. Both transports share the same PostgreSQL
+`update_id` reservation and durable job enqueue, including the immediate Guest Mode placeholder and
+its `delivery_uncertain` handling. Guest updates are included in the dispatcher-derived
+`allowed_updates` list. A PostgreSQL advisory lock permits only one polling consumer; conflicting
+consumers and invalid Telegram credentials fail the worker instead of being retried forever.
 
 ## Capability checks and limitations
 
 - Run `telegram-setup` and require the expected `bot=@username` output. `supports_guest_queries`
   must be true before advertising Guest Mode. `has_topics_enabled` reports private threaded mode;
   enable it in BotFather only if the product needs private topics.
+- In production require `telegram_mode=polling` and `webhook=deleted`; retained pending updates are
+  consumed by the worker after it starts.
 - Guest Mode works when Telegram enables the bot profile capability. Telegram documents it for
   non-secret private chats, groups, and supergroups, excluding protected-content groups. The caller
   must already be a verified project member in this application.

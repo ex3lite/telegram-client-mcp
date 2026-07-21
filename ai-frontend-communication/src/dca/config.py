@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AnyHttpUrl, Field, Secret, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     telegram_bot_token: SecretStr = SecretStr("")
+    telegram_mode: Literal["webhook", "polling"] = "webhook"
     telegram_webhook_secret: SecretStr = SecretStr("")
     outbound_proxy_url: Secret[AnyHttpUrl] | None = None
     max_telegram_body_bytes: int = Field(default=1_048_576, ge=1_024, le=10_485_760)

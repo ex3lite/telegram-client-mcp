@@ -27,6 +27,8 @@ from aiogram.types import (
     Update,
 )
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from dca.config import Settings
 from dca.db import (
@@ -38,6 +40,7 @@ from dca.db import (
     Repository,
     TelegramChat,
     TelegramIdentity,
+    TelegramUpdate,
     User,
     append_audit,
     enqueue_job,
@@ -645,6 +648,86 @@ class TelegramAdapter:
             except (TelegramBadRequest, TelegramForbiddenError):
                 pass
         return False
+
+
+async def ingest_telegram_update(
+    session: AsyncSession,
+    telegram: TelegramAdapter,
+    payload: dict[str, Any],
+    *,
+    actor_id: str,
+) -> bool:
+    """Durably reserve and enqueue one update from either Telegram transport."""
+    update_id = int(payload["update_id"])
+    if not await reserve_telegram_update(session, update_id, payload):
+        return False
+    if payload.get("guest_message") is not None:
+        try:
+            inline_message_id = await telegram.answer_guest_placeholder(payload)
+        except Exception as exc:
+            await mark_guest_uncertain(session, update_id, type(exc).__name__, actor_id=actor_id)
+            return True
+        if inline_message_id is not None:
+            payload["_dca_inline_message_id"] = inline_message_id
+    await queue_telegram_update(session, update_id, payload)
+    return True
+
+
+async def reserve_telegram_update(
+    session: AsyncSession,
+    update_id: int,
+    payload: dict[str, Any],
+) -> bool:
+    update_type = next((key for key in payload if key != "update_id"), "unknown")
+    result = await session.execute(
+        insert(TelegramUpdate)
+        .values(update_id=update_id, update_type=update_type, payload=payload)
+        .on_conflict_do_nothing(index_elements=[TelegramUpdate.update_id])
+        .returning(TelegramUpdate.update_id)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def queue_telegram_update(
+    session: AsyncSession,
+    update_id: int,
+    payload: dict[str, Any],
+) -> None:
+    await session.execute(
+        update(TelegramUpdate).where(TelegramUpdate.update_id == update_id).values(payload=payload)
+    )
+    await enqueue_job(
+        session,
+        kind="telegram.process_update",
+        payload={"update_id": update_id},
+        deduplication_key=f"telegram-update:{update_id}",
+    )
+
+
+async def mark_guest_uncertain(
+    session: AsyncSession,
+    update_id: int,
+    error_code: str,
+    *,
+    actor_id: str,
+) -> None:
+    row = await session.get(TelegramUpdate, update_id)
+    if row is None:
+        return
+    payload = dict(row.payload)
+    payload["_dca_guest_answer_status"] = "uncertain"
+    row.payload = payload
+    await append_audit(
+        session,
+        event_type="telegram.guest_answer_uncertain",
+        correlation_id=f"telegram-update:{update_id}",
+        actor_type="system",
+        actor_id=actor_id,
+        outcome="uncertain",
+        subject_type="telegram_update",
+        subject_id=str(update_id),
+        payload={"error_code": error_code},
+    )
 
 
 def extract_project_prefix(value: str) -> tuple[str | None, str]:

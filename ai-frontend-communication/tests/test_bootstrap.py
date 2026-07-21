@@ -1,8 +1,12 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
+import dca.bootstrap as bootstrap_module
 from dca.bootstrap import build_parser
+from dca.config import Settings
 
 
 def test_link_chat_cli_contract() -> None:
@@ -85,3 +89,85 @@ def test_admin_key_revoke_cli_accepts_name_or_internal_key_id() -> None:
     assert by_name.key_id is None
     assert by_key.name is None
     assert by_key.key_id == UUID("11111111-2222-4333-8444-555555555555")
+
+
+@pytest.mark.asyncio
+async def test_telegram_setup_polling_deletes_webhook_without_dropping_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bot = SimpleNamespace(
+        get_me=AsyncMock(
+            return_value=SimpleNamespace(
+                username="dca_bot",
+                has_topics_enabled=True,
+                supports_guest_queries=True,
+            )
+        ),
+        delete_webhook=AsyncMock(return_value=True),
+        set_webhook=AsyncMock(return_value=True),
+    )
+    adapter = SimpleNamespace(
+        bot=bot,
+        setup_commands=AsyncMock(),
+        allowed_updates=lambda: ["message"],
+        close=AsyncMock(),
+    )
+    database = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(bootstrap_module, "Database", lambda _: database)
+    monkeypatch.setattr(bootstrap_module, "TelegramAdapter", lambda *_: adapter)
+
+    await bootstrap_module.setup_telegram(
+        Settings(
+            telegram_bot_token="123456:test",  # noqa: S106 - synthetic credential
+            telegram_mode="polling",
+        )
+    )
+
+    bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+    bot.set_webhook.assert_not_awaited()
+    assert "telegram_mode=polling\nwebhook=deleted" in capsys.readouterr().out
+    adapter.close.assert_awaited_once_with()
+    database.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_telegram_setup_webhook_remains_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = SimpleNamespace(
+        get_me=AsyncMock(
+            return_value=SimpleNamespace(
+                username="dca_bot",
+                has_topics_enabled=False,
+                supports_guest_queries=False,
+            )
+        ),
+        delete_webhook=AsyncMock(return_value=True),
+        set_webhook=AsyncMock(return_value=True),
+    )
+    adapter = SimpleNamespace(
+        bot=bot,
+        setup_commands=AsyncMock(),
+        allowed_updates=lambda: ["message"],
+        close=AsyncMock(),
+    )
+    database = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(bootstrap_module, "Database", lambda _: database)
+    monkeypatch.setattr(bootstrap_module, "TelegramAdapter", lambda *_: adapter)
+    settings = Settings(
+        public_url="https://agency.kakaduai.com",
+        telegram_bot_token="123456:test",  # noqa: S106 - synthetic credential
+        telegram_mode="webhook",
+        telegram_webhook_secret="synthetic-secret",  # noqa: S106
+    )
+
+    await bootstrap_module.setup_telegram(settings)
+
+    bot.set_webhook.assert_awaited_once_with(
+        url="https://agency.kakaduai.com/webhooks/telegram",
+        secret_token="synthetic-secret",  # noqa: S106
+        allowed_updates=["message"],
+        drop_pending_updates=False,
+    )
+    bot.delete_webhook.assert_not_awaited()
