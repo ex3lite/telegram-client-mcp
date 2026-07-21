@@ -38,6 +38,7 @@ from dca.db import (
     Repository,
     TelegramChat,
     TelegramIdentity,
+    User,
     append_audit,
     enqueue_job,
 )
@@ -47,6 +48,7 @@ from dca.service import (
     answer_clarification_from_telegram,
     create_change_request,
     expire_clarification,
+    project_member_profile,
 )
 
 MAX_RICH_MESSAGE_CHARS = 32_768
@@ -58,6 +60,7 @@ PROJECT_PREFIX_RE = re.compile(r"^project:([a-z0-9][a-z0-9-]{0,79})\s+", re.IGNO
 class MessageContext:
     project: Project
     user_id: UUID
+    requester_profile: dict[str, str | None]
 
 
 class BotMention(Filter):
@@ -661,6 +664,27 @@ def extract_bot_mention(value: str, username: str) -> str | None:
     return remainder.strip()
 
 
+async def _message_context(session: Any, project: Project, user_id: UUID) -> MessageContext:
+    row = (
+        await session.execute(
+            select(User, ProjectMembership)
+            .join(ProjectMembership, ProjectMembership.user_id == User.id)
+            .where(
+                User.id == user_id,
+                ProjectMembership.project_id == project.id,
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise ServiceError("project_scope_violation", "Project membership is unavailable")
+    user, membership = row
+    return MessageContext(
+        project=project,
+        user_id=user_id,
+        requester_profile=project_member_profile(user, membership),
+    )
+
+
 async def resolve_context(
     session: Any,
     *,
@@ -694,7 +718,7 @@ async def resolve_context(
         )
         if project is None:
             raise ServiceError("project_scope_violation", "Project is unavailable to this user")
-        return MessageContext(project=project, user_id=identity.user_id)
+        return await _message_context(session, project, identity.user_id)
 
     project = await session.scalar(
         select(Project)
@@ -716,7 +740,7 @@ async def resolve_context(
         .order_by(TelegramChat.message_thread_id.desc().nullslast())
     )
     if project is not None:
-        return MessageContext(project=project, user_id=identity.user_id)
+        return await _message_context(session, project, identity.user_id)
 
     projects = list(
         await session.scalars(
@@ -730,7 +754,7 @@ async def resolve_context(
         )
     )
     if len(projects) == 1:
-        return MessageContext(project=projects[0], user_id=identity.user_id)
+        return await _message_context(session, projects[0], identity.user_id)
     raise ServiceError(
         "project_required",
         "Укажите проект в начале команды: project:slug",
@@ -761,7 +785,7 @@ async def queue_interaction(
         repository_id=repository.id,
         correlation_id=correlation_id,
         source="telegram",
-        source_ref=source_ref,
+        source_ref={**source_ref, "requester_profile": context.requester_profile},
         question=question[:8_000],
         commit_sha=repository.current_commit,
     )

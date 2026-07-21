@@ -24,6 +24,9 @@ RECOVERY_RELEASE=
 RECOVERY_REVISION=
 RECOVERY_COMMAND=
 RECOVERY_CURRENT=
+RECOVERY_CURRENT_PRESENT=0
+RECOVERY_PREVIOUS=
+RECOVERY_PREVIOUS_PRESENT=0
 LAST_BACKUP=
 PREPARED_RELEASE=
 
@@ -50,6 +53,15 @@ atomic_link() {
   local temporary="${link}.new.$$"
   ln -s "$target" "$temporary"
   mv -Tf "$temporary" "$link"
+}
+
+restore_link() {
+  local link=$1 target=$2 present=$3
+  if [[ $present -eq 1 ]]; then
+    atomic_link "$link" "$target"
+  else
+    rm -f "$link"
+  fi
 }
 
 current_target() {
@@ -277,11 +289,14 @@ recover() {
         exit "$exit_code"
       fi
     fi
-    if [[ -n $RECOVERY_CURRENT ]]; then
-      atomic_link "$CURRENT_LINK" "$RECOVERY_CURRENT"
+    if ! restore_link \
+      "$PREVIOUS_LINK" "$RECOVERY_PREVIOUS" "$RECOVERY_PREVIOUS_PRESENT" ||
+      ! restore_link "$CURRENT_LINK" "$RECOVERY_CURRENT" "$RECOVERY_CURRENT_PRESENT"; then
+      echo "dca-deploy: release link recovery failed; services remain stopped" >&2
+      exit "$exit_code"
+    fi
+    if [[ $RECOVERY_CURRENT_PRESENT -eq 1 ]]; then
       start_release "$RECOVERY_CURRENT" || true
-    else
-      rm -f "$CURRENT_LINK"
     fi
   fi
   [[ -n $LAST_BACKUP ]] && echo "dca-deploy: rolled back; backup: $LAST_BACKUP" >&2
@@ -289,10 +304,11 @@ recover() {
 }
 
 deploy() {
-  local release old_release old_revision
+  local release old_release old_previous old_revision
   prepare_release
   release=$PREPARED_RELEASE
   old_release=$(current_target "$CURRENT_LINK")
+  old_previous=$(current_target "$PREVIOUS_LINK")
   old_revision=$(alembic_current "$release")
   old_revision=${old_revision:-base}
 
@@ -300,6 +316,9 @@ deploy() {
   RECOVERY_REVISION=$old_revision
   RECOVERY_COMMAND=downgrade
   RECOVERY_CURRENT=$old_release
+  [[ -L $CURRENT_LINK ]] && RECOVERY_CURRENT_PRESENT=1
+  RECOVERY_PREVIOUS=$old_previous
+  [[ -L $PREVIOUS_LINK ]] && RECOVERY_PREVIOUS_PRESENT=1
   trap recover ERR
 
   stop_services
@@ -334,6 +353,9 @@ rollback() {
   RECOVERY_REVISION=$active_revision
   RECOVERY_COMMAND=upgrade
   RECOVERY_CURRENT=$active
+  RECOVERY_CURRENT_PRESENT=1
+  RECOVERY_PREVIOUS=$target
+  RECOVERY_PREVIOUS_PRESENT=1
   trap recover ERR
 
   stop_services

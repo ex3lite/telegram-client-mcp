@@ -95,13 +95,17 @@ sudo -u dca /opt/dca/current/.venv/bin/dca-bootstrap seed \
 
 sudo -u dca /opt/dca/current/.venv/bin/dca-bootstrap link-user \
   --project-slug backend --name "Developer" --telegram-user-id 123456789 \
-  --role backend --verify
+  --role android --department Mobile --stack "Android / Kotlin" --verify
 
 sudo -u dca /opt/dca/current/.venv/bin/dca-bootstrap link-chat \
   --project-slug backend --telegram-chat-id -1001234567890
 
 sudo -u dca /opt/dca/current/.venv/bin/dca-bootstrap telegram-setup
 ```
+
+`department` and `stack` are project-scoped server metadata exposed to MCP and supplied to Claude
+for Telegram questions. A linked Telegram member is not an admin-panel account: panel access is
+controlled only by the separate `DCA_ADMIN_EMAIL` and `DCA_ADMIN_PASSWORD_HASH` credentials.
 
 The service-account token is printed only when first created; store it immediately. Every person
 must open the bot and run `/start` before private delivery is possible. Validate the group ID with

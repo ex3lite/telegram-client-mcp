@@ -36,6 +36,18 @@ TELEGRAM_EXTERNAL_ACTIONS = {
 }
 
 
+def trusted_requester_profile(interaction: Interaction) -> dict[str, str] | None:
+    raw_profile = interaction.source_ref.get("requester_profile")
+    if interaction.source != "telegram" or not isinstance(raw_profile, dict):
+        return None
+    profile = {
+        key: value
+        for key in ("display_name", "role", "department", "stack")
+        if isinstance((value := raw_profile.get(key)), str)
+    }
+    return profile or None
+
+
 class Worker:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -164,7 +176,11 @@ class Worker:
         snapshot = await self.snapshots.materialize(repository, interaction.commit_sha)
         heartbeat = asyncio.create_task(self._draft_heartbeat(interaction))
         try:
-            result = await self.claude.answer(snapshot=snapshot, question=interaction.question)
+            result = await self.claude.answer(
+                snapshot=snapshot,
+                question=interaction.question,
+                requester_profile=trusted_requester_profile(interaction),
+            )
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):

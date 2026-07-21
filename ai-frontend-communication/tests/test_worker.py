@@ -8,8 +8,31 @@ from aiogram.methods import SendMessage
 from sqlalchemy.exc import SQLAlchemyError
 
 from dca.claude import ClaudeError
-from dca.db import Job
-from dca.worker import TELEGRAM_EXTERNAL_ACTIONS, Worker
+from dca.db import Interaction, Job
+from dca.worker import TELEGRAM_EXTERNAL_ACTIONS, Worker, trusted_requester_profile
+
+
+def test_trusted_requester_profile_whitelists_telegram_server_metadata() -> None:
+    interaction = Interaction(
+        source="telegram",
+        source_ref={
+            "requester_profile": {
+                "display_name": "Бека",
+                "department": "Mobile",
+                "stack": "Android / Kotlin",
+                "unknown": "must not reach Claude",
+                "role": {"invalid": "type"},
+            }
+        },
+    )
+
+    assert trusted_requester_profile(interaction) == {
+        "display_name": "Бека",
+        "department": "Mobile",
+        "stack": "Android / Kotlin",
+    }
+    interaction.source = "api"
+    assert trusted_requester_profile(interaction) is None
 
 
 @pytest.mark.asyncio

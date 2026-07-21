@@ -1,8 +1,23 @@
 import pytest
 
 from dca.config import Settings
-from dca.db import Database
+from dca.db import Database, ProjectMembership, User
 from dca.mcp import build_mcp
+from dca.service import project_member_profile
+
+
+def test_member_profile_exposes_project_department_and_stack() -> None:
+    profile = project_member_profile(
+        User(display_name="Игорь"),
+        ProjectMembership(role="developer", department="Mobile", stack="iOS / Swift"),
+    )
+
+    assert profile == {
+        "display_name": "Игорь",
+        "role": "developer",
+        "department": "Mobile",
+        "stack": "iOS / Swift",
+    }
 
 
 @pytest.mark.asyncio

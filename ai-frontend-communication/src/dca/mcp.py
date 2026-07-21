@@ -32,6 +32,7 @@ from dca.service import (
     clarification_result,
     create_clarification,
     get_clarification,
+    project_member_profile,
     require_service_scope,
 )
 
@@ -184,7 +185,7 @@ def build_mcp(settings: Settings, database: Database) -> FastMCP[None]:
                 except ValueError:
                     pass
                 rows = await session.execute(
-                    select(User, TelegramIdentity)
+                    select(User, ProjectMembership, TelegramIdentity)
                     .join(ProjectMembership, ProjectMembership.user_id == User.id)
                     .outerjoin(TelegramIdentity, TelegramIdentity.user_id == User.id)
                     .where(
@@ -196,12 +197,12 @@ def build_mcp(settings: Settings, database: Database) -> FastMCP[None]:
                 )
                 matches = [
                     {
+                        **project_member_profile(user, membership),
                         "user_id": str(user.id),
-                        "display_name": user.display_name,
                         "telegram_username": identity.username if identity else None,
                         "reachable": bool(identity and identity.reachable),
                     }
-                    for user, identity in rows
+                    for user, membership, identity in rows
                 ]
                 if not matches:
                     raise ServiceError("recipient_not_found", "No matching project member")

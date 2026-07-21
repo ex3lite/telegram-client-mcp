@@ -15,6 +15,7 @@ from dca.db import (
     ServiceAccount,
     ServiceAccountProject,
     TelegramIdentity,
+    User,
     append_audit,
     enqueue_job,
 )
@@ -39,6 +40,15 @@ class ServiceError(RuntimeError):
 
     def as_dict(self) -> dict[str, Any]:
         return {"code": self.code, "message": self.message, "retryable": self.retryable}
+
+
+def project_member_profile(user: User, membership: ProjectMembership) -> dict[str, str | None]:
+    return {
+        "display_name": user.display_name,
+        "role": membership.role,
+        "department": membership.department,
+        "stack": membership.stack,
+    }
 
 
 async def require_service_scope(

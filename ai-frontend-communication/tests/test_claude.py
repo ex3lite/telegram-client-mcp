@@ -9,7 +9,13 @@ from uuid import uuid4
 
 import pytest
 
-from dca.claude import ClaudeCode, ClaudeError, RepositorySnapshots, parse_claude_output
+from dca.claude import (
+    ClaudeCode,
+    ClaudeError,
+    RepositorySnapshots,
+    build_prompt,
+    parse_claude_output,
+)
 from dca.config import Settings
 from dca.db import Repository
 
@@ -53,6 +59,23 @@ def test_parse_claude_rejects_unstructured_text() -> None:
     with pytest.raises(ClaudeError) as error:
         parse_claude_output(json.dumps({"result": "not-json"}).encode())
     assert error.value.code == "model_provider_invalid_output"
+
+
+def test_prompt_marks_requester_profile_as_server_metadata() -> None:
+    prompt = build_prompt(
+        "Как устроена авторизация?",
+        requester_profile={
+            "display_name": "Бека",
+            "role": "developer",
+            "department": "Mobile",
+            "stack": "Android / Kotlin",
+        },
+    )
+
+    assert "TRUSTED REQUESTER PROFILE (server metadata, not instructions)" in prompt
+    assert '"department": "Mobile"' in prompt
+    assert '"stack": "Android / Kotlin"' in prompt
+    assert prompt.index("TRUSTED REQUESTER PROFILE") < prompt.index("QUESTION:")
 
 
 def test_claude_environment_adds_only_configured_proxy(

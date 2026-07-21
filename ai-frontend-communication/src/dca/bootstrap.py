@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+from uuid import uuid4
 
 import anyio
 from argon2 import PasswordHasher
@@ -19,6 +20,7 @@ from dca.db import (
     TelegramChat,
     TelegramIdentity,
     User,
+    append_audit,
 )
 from dca.mcp import generate_service_token
 from dca.telegram import TelegramAdapter
@@ -118,19 +120,40 @@ async def link_user(args: argparse.Namespace, settings: Settings) -> None:
                     identity.username = args.username.removeprefix("@")
             membership = await session.get(ProjectMembership, (project.id, user.id))
             if membership is None:
-                session.add(
-                    ProjectMembership(
-                        project_id=project.id,
-                        user_id=user.id,
-                        role=args.role,
-                    )
+                membership = ProjectMembership(
+                    project_id=project.id,
+                    user_id=user.id,
+                    role=args.role or "developer",
+                    department=args.department,
+                    stack=args.stack,
                 )
+                session.add(membership)
             else:
-                membership.role = args.role
+                if args.role is not None:
+                    membership.role = args.role
+                if args.department is not None:
+                    membership.department = args.department
+                if args.stack is not None:
+                    membership.stack = args.stack
             if args.verify:
                 from dca.domain import utcnow
 
                 identity.verified_at = utcnow()
+            await append_audit(
+                session,
+                event_type="project.member_profile_upserted",
+                correlation_id=f"bootstrap:link-user:{uuid4().hex}",
+                actor_type="system",
+                actor_id="dca-bootstrap",
+                project_id=project.id,
+                subject_type="user",
+                subject_id=str(user.id),
+                payload={
+                    "role": membership.role,
+                    "department": membership.department,
+                    "stack": membership.stack,
+                },
+            )
         print(f"user_id={user.id}")
         print("The user must open the bot and run /start before the bot can send a DM.")
     finally:
@@ -258,7 +281,9 @@ def build_parser() -> argparse.ArgumentParser:
     user_parser.add_argument("--email")
     user_parser.add_argument("--telegram-user-id", required=True, type=int)
     user_parser.add_argument("--username")
-    user_parser.add_argument("--role", default="developer")
+    user_parser.add_argument("--role")
+    user_parser.add_argument("--department")
+    user_parser.add_argument("--stack")
     user_parser.add_argument("--verify", action="store_true")
 
     chat_parser = subparsers.add_parser("link-chat")

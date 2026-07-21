@@ -110,6 +110,8 @@ class ProjectMembership(Base):
         primary_key=True,
     )
     role: Mapped[str] = mapped_column(String(40), nullable=False, default="developer")
+    department: Mapped[str | None] = mapped_column(String(80))
+    stack: Mapped[str | None] = mapped_column(String(160))
 
 
 class TelegramIdentity(Base, TimestampMixin):
