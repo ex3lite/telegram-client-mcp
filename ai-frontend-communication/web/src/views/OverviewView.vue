@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 
@@ -14,17 +14,19 @@ const projectId = computed(() => String(route.query.project ?? ""));
 const overview = useQuery({
   queryKey: computed(() => ["overview", projectId.value]),
   queryFn: () => api<Overview>(`/overview${queryString({ project_id: projectId.value })}`),
-  refetchInterval: 10_000
+  placeholderData: keepPreviousData,
+  refetchInterval: 30_000
 });
 </script>
 
 <template>
   <header class="page-header">
     <div>
-      <h1>Требует внимания</h1>
-      <p>Операционная очередь вместо декоративной аналитики.</p>
+      <span class="eyebrow">Состояние автономной системы</span>
+      <h1>Центр управления</h1>
+      <p>Очередь решений, живые запуски и быстрый доступ к настройкам агента.</p>
     </div>
-    <button class="cds--btn cds--btn--sm cds--btn--tertiary" @click="overview.refetch()">
+    <button class="button button--secondary button--small" @click="overview.refetch()">
       Обновить
     </button>
   </header>
@@ -51,8 +53,25 @@ const overview = useQuery({
         <span>Неопределённые доставки</span>
       </RouterLink>
     </section>
+    <section class="control-links" aria-label="Быстрые действия">
+      <RouterLink :to="{ name: 'runs', query: { project: route.query.project } }">
+        <span class="control-links__index">A</span>
+        <span><strong>Открыть запуски</strong><small>Ответы Claude, артефакты и privacy findings</small></span>
+        <span aria-hidden="true">→</span>
+      </RouterLink>
+      <RouterLink :to="{ name: 'agent', query: { project: route.query.project } }">
+        <span class="control-links__index">B</span>
+        <span><strong>Настроить агента</strong><small>Модель, промпт, бюджет и Telegram</small></span>
+        <span aria-hidden="true">→</span>
+      </RouterLink>
+      <RouterLink :to="{ name: 'mcp', query: { project: route.query.project } }">
+        <span class="control-links__index">C</span>
+        <span><strong>Управлять MCP</strong><small>Токены, scopes и доступ к проектам</small></span>
+        <span aria-hidden="true">→</span>
+      </RouterLink>
+    </section>
     <section class="section-block">
-      <h2>Последние события</h2>
+      <div class="section-heading"><div><span class="eyebrow">Журнал</span><h2>Последние события</h2></div><RouterLink :to="{ name: 'audit', query: { project: route.query.project } }">Весь аудит →</RouterLink></div>
       <div class="table-wrap">
         <table class="data-table">
           <thead>

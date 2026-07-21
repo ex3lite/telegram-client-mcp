@@ -35,6 +35,7 @@ async def test_mcp_tool_contracts_are_stable() -> None:
         "telegram_ask_user",
         "telegram_get_clarification",
         "telegram_cancel_clarification",
+        "telegram_send_message",
     }
     assert tools["identity_resolve_user"].inputSchema["required"] == ["project_id", "query"]
     ask_schema = tools["telegram_ask_user"].inputSchema
@@ -43,5 +44,12 @@ async def test_mcp_tool_contracts_are_stable() -> None:
     assert request_schema["properties"]["project_id"]["format"] == "uuid"
     assert request_schema["properties"]["expires_at"]["format"] == "date-time"
     assert "idempotency_key" in request_schema["required"]
-    assert server.settings.transport_security.allowed_hosts == ["agent.example.com"]
-    assert server.settings.transport_security.allowed_origins == ["https://agent.example.com"]
+    send_schema = tools["telegram_send_message"].inputSchema
+    assert send_schema["required"] == ["request"]
+    send_request = send_schema["$defs"]["TelegramSendMessageInput"]
+    assert send_request["properties"]["project_id"]["format"] == "uuid"
+    assert send_request["properties"]["text_markdown"]["maxLength"] == 4096
+    transport_security = server.settings.transport_security
+    assert transport_security is not None
+    assert transport_security.allowed_hosts == ["agent.example.com"]
+    assert transport_security.allowed_origins == ["https://agent.example.com"]

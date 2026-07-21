@@ -18,7 +18,7 @@ defineEmits<{ retry: [] }>();
   <div v-else-if="error" class="page-state page-state--error" role="alert">
     <strong>Данные не загрузились</strong>
     <span>{{ error.message }}</span>
-    <button class="cds--btn cds--btn--sm cds--btn--tertiary" type="button" @click="$emit('retry')">
+    <button class="button button--secondary button--small" type="button" @click="$emit('retry')">
       Повторить
     </button>
   </div>
@@ -28,4 +28,3 @@ defineEmits<{ retry: [] }>();
   </div>
   <slot v-else></slot>
 </template>
-

@@ -8,6 +8,7 @@ dependencies = [
   "aiogram[proxy]==3.30.0",
   "alembic>=1.16,<2",
   "argon2-cffi>=25,<26",
+  "cryptography>=49,<50",
   "fastapi>=0.116,<1",
   "itsdangerous>=2.2,<3",
   "mcp>=1.27,<2",

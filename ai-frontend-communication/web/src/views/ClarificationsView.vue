@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useQuery } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
@@ -24,7 +24,7 @@ const clarifications = useQuery({
         status: clarificationStatus.value
       })}`
     ),
-  refetchInterval: 10_000
+  placeholderData: keepPreviousData
 });
 const selected = computed(() =>
   clarifications.data.value?.find((row) => row.id === selectedId.value)
@@ -93,4 +93,3 @@ async function filterStatus(event: Event) {
     </div>
   </PageState>
 </template>
-

@@ -1,11 +1,13 @@
 import hashlib
+import os
+import re
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -26,9 +28,11 @@ from fastapi import (
 from fastapi.responses import FileResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 
+from dca.claude import ClaudeCode
 from dca.config import Settings, get_settings
 from dca.db import (
     AdminAccessKey,
@@ -38,9 +42,14 @@ from dca.db import (
     ChangeRequest,
     Clarification,
     Database,
+    Interaction,
     Job,
     Project,
+    ProjectAgentSettings,
     Repository,
+    ServiceAccount,
+    ServiceAccountProject,
+    SystemSecret,
     append_audit,
     enqueue_job,
 )
@@ -50,10 +59,14 @@ from dca.domain import (
     JobStatus,
     utcnow,
 )
-from dca.mcp import build_mcp
+from dca.mcp import MCP_TOOL_SCOPES, build_mcp, generate_service_token
+from dca.privacy import sanitize_text
 from dca.service import (
+    SYSTEM_SECRET_CLAUDE_OAUTH,
     ServiceError,
     admin_key_fingerprint,
+    encrypt_system_secret,
+    load_system_secret,
     update_change_request_status,
     validate_admin_access_key,
 )
@@ -94,6 +107,142 @@ class AdminContext:
 
 class StatusUpdateInput(BaseModel):
     status: ChangeRequestStatus
+    expected_version: int = Field(ge=1)
+
+
+class AgentSettingsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=0)
+    enabled: bool
+    claude_model: str | None = Field(default=None, max_length=120)
+    claude_effort: Literal["low", "medium", "high", "xhigh", "max"]
+    claude_timeout_seconds: int = Field(ge=10, le=900)
+    max_budget_cents: int | None = Field(default=None, gt=0)
+    base_prompt: str = Field(max_length=20_000)
+    answer_style: Literal["brief", "normal", "detailed"]
+    privacy_level: Literal["strict", "balanced"]
+    denied_globs: list[str] = Field(max_length=200)
+    telegram_group_mode: Literal["commands_only", "mentions", "all_messages"]
+    telegram_private_mode: Literal["commands_only", "all_messages"]
+    telegram_attach_markdown: bool
+
+    @field_validator("claude_model")
+    @classmethod
+    def normalize_claude_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("base_prompt")
+    @classmethod
+    def reject_credentials_in_base_prompt(cls, value: str) -> str:
+        result = sanitize_text(value, level="strict", location="agent_settings.base_prompt")
+        if result.findings:
+            raise ValueError("base prompt must not contain credential material")
+        return value
+
+    @field_validator("denied_globs")
+    @classmethod
+    def validate_denied_globs(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(
+            not value
+            or len(value) > 500
+            or not value.isascii()
+            or not value.isprintable()
+            or value.startswith(("/", ":"))
+            or "\\" in value
+            or any(part == ".." for part in value.split("/"))
+            or re.fullmatch(r"[A-Za-z0-9._*/?+ -]+", value) is None
+            for value in normalized
+        ):
+            raise ValueError("denied globs must be safe relative Git glob patterns")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("denied globs must be unique")
+        return normalized
+
+
+class ClaudeIntegrationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    oauth_token: SecretStr = Field(min_length=20, max_length=16_384)
+
+
+class McpAccountCreateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    tool_scopes: list[str] = Field(min_length=1, max_length=len(MCP_TOOL_SCOPES))
+    project_ids: list[UUID] = Field(min_length=1, max_length=100)
+    expires_at: datetime | None = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+    @field_validator("tool_scopes")
+    @classmethod
+    def validate_scopes(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values) or not set(values) <= MCP_TOOL_SCOPES:
+            raise ValueError("tool scopes must be unique and supported")
+        return sorted(values)
+
+    @field_validator("project_ids")
+    @classmethod
+    def validate_projects(cls, values: list[UUID]) -> list[UUID]:
+        if len(set(values)) != len(values):
+            raise ValueError("project IDs must be unique")
+        return values
+
+
+class McpAccountPatchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    active: bool | None = None
+    tool_scopes: list[str] | None = Field(
+        default=None, min_length=1, max_length=len(MCP_TOOL_SCOPES)
+    )
+    project_ids: list[UUID] | None = Field(default=None, min_length=1, max_length=100)
+    expires_at: datetime | None = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+    @field_validator("tool_scopes")
+    @classmethod
+    def validate_scopes(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and (
+            len(set(values)) != len(values) or not set(values) <= MCP_TOOL_SCOPES
+        ):
+            raise ValueError("tool scopes must be unique and supported")
+        return sorted(values) if values is not None else None
+
+    @field_validator("project_ids")
+    @classmethod
+    def validate_projects(cls, values: list[UUID] | None) -> list[UUID] | None:
+        if values is not None and len(set(values)) != len(values):
+            raise ValueError("project IDs must be unique")
+        return values
+
+
+class McpAccountRotateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     expected_version: int = Field(ge=1)
 
 
@@ -353,6 +502,346 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for project in projects
             ]
 
+    @app.get("/api/v1/projects/{project_id}/agent-settings")
+    async def get_agent_settings(
+        project_id: UUID,
+        _: Annotated[AdminContext, Depends(require_admin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            if await session.get(Project, project_id) is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "project_not_found")
+            row = await session.get(ProjectAgentSettings, project_id)
+        return serialize_agent_settings(row, project_id)
+
+    @app.put("/api/v1/projects/{project_id}/agent-settings")
+    async def put_agent_settings(
+        project_id: UUID,
+        payload: AgentSettingsInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            project = await session.scalar(
+                select(Project).where(Project.id == project_id).with_for_update()
+            )
+            if project is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "project_not_found")
+            row = await session.get(ProjectAgentSettings, project_id)
+            if row is None:
+                if payload.expected_version != 0:
+                    raise HTTPException(status.HTTP_409_CONFLICT, "version_conflict")
+                row = ProjectAgentSettings(project_id=project_id, version=1)
+                session.add(row)
+            else:
+                if row.version != payload.expected_version:
+                    raise HTTPException(status.HTTP_409_CONFLICT, "version_conflict")
+                row.version += 1
+            row.enabled = payload.enabled
+            row.claude_model = payload.claude_model
+            row.claude_effort = payload.claude_effort
+            row.claude_timeout_seconds = payload.claude_timeout_seconds
+            row.max_budget_cents = payload.max_budget_cents
+            row.base_prompt = payload.base_prompt
+            row.answer_style = payload.answer_style
+            row.privacy_level = payload.privacy_level
+            row.denied_globs = payload.denied_globs
+            row.telegram_group_mode = payload.telegram_group_mode
+            row.telegram_private_mode = payload.telegram_private_mode
+            row.telegram_attach_markdown = payload.telegram_attach_markdown
+            row.updated_by_admin_id = admin.principal_id
+            row.updated_at = utcnow()
+            await session.flush()
+            await append_audit(
+                session,
+                event_type="project.agent_settings_updated",
+                correlation_id=f"agent-settings:{project_id}:{row.version}:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                project_id=project_id,
+                subject_type="project_agent_settings",
+                subject_id=str(project_id),
+                payload={
+                    "version": row.version,
+                    "enabled": row.enabled,
+                    "privacy_level": row.privacy_level,
+                },
+            )
+            result = serialize_agent_settings(row, project_id)
+        return result
+
+    @app.get("/api/v1/integrations/claude")
+    async def get_claude_integration(
+        _: Annotated[AdminContext, Depends(require_admin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            managed = await session.get(SystemSecret, SYSTEM_SECRET_CLAUDE_OAUTH)
+        return claude_integration_status(settings, panel_configured=managed is not None)
+
+    @app.put("/api/v1/integrations/claude")
+    async def put_claude_integration(
+        payload: ClaudeIntegrationInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        token = payload.oauth_token.get_secret_value().strip()
+        if len(token) < 20:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "oauth_token_too_short")
+        ciphertext = encrypt_system_secret(token, raw_session_secret)
+        async with database.session() as session:
+            managed = await session.get(SystemSecret, SYSTEM_SECRET_CLAUDE_OAUTH)
+            if managed is None:
+                managed = SystemSecret(
+                    name=SYSTEM_SECRET_CLAUDE_OAUTH,
+                    ciphertext=ciphertext,
+                    updated_by=admin.principal_id,
+                )
+                session.add(managed)
+            else:
+                managed.ciphertext = ciphertext
+                managed.updated_by = admin.principal_id
+                managed.updated_at = utcnow()
+            await append_audit(
+                session,
+                event_type="claude.integration_updated",
+                correlation_id=f"claude-integration:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                subject_type="system_secret",
+                subject_id=SYSTEM_SECRET_CLAUDE_OAUTH,
+            )
+        return claude_integration_status(settings, panel_configured=True)
+
+    @app.delete("/api/v1/integrations/claude")
+    async def delete_claude_integration(
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            managed = await session.get(SystemSecret, SYSTEM_SECRET_CLAUDE_OAUTH)
+            if managed is not None:
+                await session.delete(managed)
+            await append_audit(
+                session,
+                event_type="claude.integration_deleted",
+                correlation_id=f"claude-integration:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                subject_type="system_secret",
+                subject_id=SYSTEM_SECRET_CLAUDE_OAUTH,
+                payload={"removed": managed is not None},
+            )
+        return claude_integration_status(settings, panel_configured=False)
+
+    @app.post("/api/v1/integrations/claude/check")
+    async def check_claude_integration(
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        source = "unknown"
+        version: str | None = None
+        try:
+            async with database.session() as session:
+                token = await load_system_secret(
+                    session,
+                    SYSTEM_SECRET_CLAUDE_OAUTH,
+                    raw_session_secret,
+                )
+            if token is not None:
+                source = "panel"
+            elif os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+                source = "environment"
+            else:
+                source = "missing"
+            version = await ClaudeCode(settings).probe(oauth_token=token)
+        except Exception as exc:
+            log.warning("claude.probe_failed", error_type=type(exc).__name__)
+            outcome = "failure"
+        else:
+            outcome = "success"
+        async with database.session() as session:
+            await append_audit(
+                session,
+                event_type="claude.integration_checked",
+                correlation_id=f"claude-integration-check:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                subject_type="system_secret",
+                subject_id=SYSTEM_SECRET_CLAUDE_OAUTH,
+                outcome=outcome,
+                payload={"source": source, "version": version},
+            )
+        return {"ok": outcome == "success", "version": version}
+
+    @app.get("/api/v1/mcp/accounts")
+    async def list_mcp_accounts(
+        _: Annotated[AdminContext, Depends(require_admin)],
+        project_id: UUID | None = None,
+    ) -> list[dict[str, Any]]:
+        query = select(ServiceAccount).order_by(ServiceAccount.name)
+        if project_id is not None:
+            query = query.join(ServiceAccountProject).where(
+                ServiceAccountProject.project_id == project_id
+            )
+        async with database.session() as session:
+            accounts = list(await session.scalars(query))
+            return [await serialize_mcp_account(session, account) for account in accounts]
+
+    @app.post("/api/v1/mcp/accounts", status_code=status.HTTP_201_CREATED)
+    async def create_mcp_account(
+        payload: McpAccountCreateInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        validate_future_expiry(payload.expires_at)
+        token, prefix, token_hash = generate_service_token()
+        try:
+            async with database.session() as session:
+                await require_projects(session, payload.project_ids)
+                account = ServiceAccount(
+                    name=payload.name,
+                    token_prefix=prefix,
+                    token_hash=token_hash,
+                    tool_scopes=payload.tool_scopes,
+                    expires_at=payload.expires_at,
+                    version=1,
+                )
+                session.add(account)
+                await session.flush()
+                session.add_all(
+                    ServiceAccountProject(service_account_id=account.id, project_id=project_id)
+                    for project_id in payload.project_ids
+                )
+                await session.flush()
+                await append_audit(
+                    session,
+                    event_type="mcp.service_account_created",
+                    correlation_id=f"mcp-account:{account.id}:{secrets.token_hex(8)}",
+                    actor_type="admin",
+                    actor_id=str(admin.principal_id),
+                    subject_type="service_account",
+                    subject_id=str(account.id),
+                    payload={
+                        "name": account.name,
+                        "project_ids": sorted(str(value) for value in payload.project_ids),
+                        "tool_scopes": account.tool_scopes,
+                    },
+                )
+                serialized = await serialize_mcp_account(session, account)
+        except IntegrityError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "service_account_conflict") from exc
+        return {"account": serialized, "token": token}
+
+    @app.patch("/api/v1/mcp/accounts/{account_id}")
+    async def patch_mcp_account(
+        account_id: UUID,
+        payload: McpAccountPatchInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        changed = payload.model_fields_set - {"expected_version"}
+        if not changed:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "no_changes")
+        if payload.expires_at is not None:
+            validate_future_expiry(payload.expires_at)
+        for required in ("name", "active", "tool_scopes", "project_ids"):
+            if required in changed and getattr(payload, required) is None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"{required}_cannot_be_null",
+                )
+        try:
+            async with database.session() as session:
+                account = await session.scalar(
+                    select(ServiceAccount).where(ServiceAccount.id == account_id).with_for_update()
+                )
+                if account is None:
+                    raise HTTPException(status.HTTP_404_NOT_FOUND, "service_account_not_found")
+                if account.version != payload.expected_version:
+                    raise HTTPException(status.HTTP_409_CONFLICT, "version_conflict")
+                if "name" in changed:
+                    account.name = payload.name or ""
+                if "active" in changed:
+                    account.active = bool(payload.active)
+                if "tool_scopes" in changed:
+                    account.tool_scopes = payload.tool_scopes or []
+                if "expires_at" in changed:
+                    account.expires_at = payload.expires_at
+                if "project_ids" in changed:
+                    project_ids = payload.project_ids or []
+                    await require_projects(session, project_ids)
+                    current = {
+                        association.project_id: association
+                        for association in await session.scalars(
+                            select(ServiceAccountProject).where(
+                                ServiceAccountProject.service_account_id == account.id
+                            )
+                        )
+                    }
+                    requested = set(project_ids)
+                    for project_id in current.keys() - requested:
+                        await session.delete(current[project_id])
+                    session.add_all(
+                        ServiceAccountProject(
+                            service_account_id=account.id,
+                            project_id=project_id,
+                        )
+                        for project_id in requested - current.keys()
+                    )
+                account.version += 1
+                account.updated_at = utcnow()
+                await session.flush()
+                await append_audit(
+                    session,
+                    event_type="mcp.service_account_updated",
+                    correlation_id=f"mcp-account:{account.id}:{secrets.token_hex(8)}",
+                    actor_type="admin",
+                    actor_id=str(admin.principal_id),
+                    subject_type="service_account",
+                    subject_id=str(account.id),
+                    payload={"changed": sorted(changed), "version": account.version},
+                )
+                serialized = await serialize_mcp_account(session, account)
+        except IntegrityError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "service_account_conflict") from exc
+        return serialized
+
+    @app.post("/api/v1/mcp/accounts/{account_id}/rotate-token")
+    async def rotate_mcp_account_token(
+        account_id: UUID,
+        payload: McpAccountRotateInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        token, prefix, token_hash = generate_service_token()
+        try:
+            async with database.session() as session:
+                account = await session.scalar(
+                    select(ServiceAccount).where(ServiceAccount.id == account_id).with_for_update()
+                )
+                if account is None:
+                    raise HTTPException(status.HTTP_404_NOT_FOUND, "service_account_not_found")
+                if account.version != payload.expected_version:
+                    raise HTTPException(status.HTTP_409_CONFLICT, "version_conflict")
+                account.token_prefix = prefix
+                account.token_hash = token_hash
+                account.version += 1
+                account.updated_at = utcnow()
+                await session.flush()
+                await append_audit(
+                    session,
+                    event_type="mcp.service_account_token_rotated",
+                    correlation_id=f"mcp-account:{account.id}:{secrets.token_hex(8)}",
+                    actor_type="admin",
+                    actor_id=str(admin.principal_id),
+                    subject_type="service_account",
+                    subject_id=str(account.id),
+                    payload={"version": account.version},
+                )
+                serialized = await serialize_mcp_account(session, account)
+        except IntegrityError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, "service_account_conflict") from exc
+        return {"account": serialized, "token": token}
+
     @app.get("/api/v1/overview")
     async def overview(
         _: Annotated[AdminContext, Depends(require_admin)],
@@ -399,6 +888,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             "recent_events": [serialize_audit(event) for event in recent],
         }
+
+    @app.get("/api/v1/interactions")
+    async def list_interactions(
+        _: Annotated[AdminContext, Depends(require_admin)],
+        project_id: UUID | None = None,
+        interaction_status: Annotated[str | None, Query(alias="status", max_length=32)] = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> list[dict[str, Any]]:
+        query = select(Interaction).order_by(Interaction.created_at.desc())
+        if project_id is not None:
+            query = query.where(Interaction.project_id == project_id)
+        if interaction_status is not None:
+            query = query.where(Interaction.status == interaction_status)
+        async with database.session() as session:
+            rows = list(await session.scalars(query.limit(limit).offset(offset)))
+        return [serialize_interaction_summary(row) for row in rows]
+
+    @app.get("/api/v1/interactions/{interaction_id}")
+    async def interaction_detail(
+        interaction_id: UUID,
+        _: Annotated[AdminContext, Depends(require_admin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            row = await session.get(Interaction, interaction_id)
+            if row is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "interaction_not_found")
+        return serialize_interaction(row)
 
     @app.get("/api/v1/clarifications")
     async def list_clarifications(
@@ -583,6 +1100,159 @@ async def enforce_login_rate_limit(
         return
     if count > 10:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited")
+
+
+def serialize_agent_settings(
+    row: ProjectAgentSettings | None,
+    project_id: UUID,
+) -> dict[str, Any]:
+    if row is None:
+        return {
+            "project_id": str(project_id),
+            "enabled": True,
+            "claude_model": None,
+            "claude_effort": "medium",
+            "claude_timeout_seconds": 180,
+            "max_budget_cents": None,
+            "base_prompt": "",
+            "answer_style": "normal",
+            "privacy_level": "strict",
+            "denied_globs": [],
+            "telegram_group_mode": "mentions",
+            "telegram_private_mode": "all_messages",
+            "telegram_attach_markdown": True,
+            "version": 0,
+            "updated_by_admin_id": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+    return {
+        "project_id": str(row.project_id),
+        "enabled": row.enabled,
+        "claude_model": row.claude_model,
+        "claude_effort": row.claude_effort,
+        "claude_timeout_seconds": row.claude_timeout_seconds,
+        "max_budget_cents": row.max_budget_cents,
+        "base_prompt": row.base_prompt,
+        "answer_style": row.answer_style,
+        "privacy_level": row.privacy_level,
+        "denied_globs": row.denied_globs,
+        "telegram_group_mode": row.telegram_group_mode,
+        "telegram_private_mode": row.telegram_private_mode,
+        "telegram_attach_markdown": row.telegram_attach_markdown,
+        "version": row.version,
+        "updated_by_admin_id": (
+            str(row.updated_by_admin_id) if row.updated_by_admin_id is not None else None
+        ),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def claude_integration_status(
+    settings: Settings,
+    *,
+    panel_configured: bool,
+) -> dict[str, Any]:
+    environment_configured = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip())
+    source = "panel" if panel_configured else "environment" if environment_configured else "missing"
+    return {
+        "configured": source != "missing",
+        "source": source,
+        "proxy_configured": settings.outbound_proxy_url is not None,
+    }
+
+
+def validate_future_expiry(expires_at: datetime | None) -> None:
+    if expires_at is None:
+        return
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "expires_at_timezone_required")
+    if expires_at <= utcnow():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "expires_at_must_be_future")
+
+
+async def require_projects(session: Any, project_ids: list[UUID]) -> None:
+    existing = set(await session.scalars(select(Project.id).where(Project.id.in_(project_ids))))
+    if existing != set(project_ids):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project_not_found")
+
+
+async def serialize_mcp_account(
+    session: Any,
+    account: ServiceAccount,
+) -> dict[str, Any]:
+    project_ids = list(
+        await session.scalars(
+            select(ServiceAccountProject.project_id)
+            .where(ServiceAccountProject.service_account_id == account.id)
+            .order_by(ServiceAccountProject.project_id)
+        )
+    )
+    return {
+        "id": str(account.id),
+        "name": account.name,
+        "active": account.active,
+        "tool_scopes": account.tool_scopes,
+        "project_ids": [str(project_id) for project_id in project_ids],
+        "expires_at": account.expires_at,
+        "last_used_at": account.last_used_at,
+        "token_prefix": account.token_prefix,
+        "version": account.version,
+        "created_at": account.created_at,
+        "updated_at": account.updated_at,
+    }
+
+
+def serialize_interaction(row: Interaction) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "repository_id": str(row.repository_id) if row.repository_id is not None else None,
+        "correlation_id": row.correlation_id,
+        "source": row.source,
+        "source_ref": row.source_ref,
+        "question": row.question,
+        "commit_sha": row.commit_sha,
+        "status": row.status,
+        "answer_markdown": row.answer_markdown,
+        "citations": row.citations,
+        "rejected_citations": row.rejected_citations,
+        "uncertainty": row.uncertainty,
+        "provider_metadata": row.provider_metadata,
+        "error_code": row.error_code,
+        "artifacts": row.artifacts,
+        "privacy_findings": row.privacy_findings,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def serialize_interaction_summary(row: Interaction) -> dict[str, Any]:
+    question_limit = 500
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "repository_id": str(row.repository_id) if row.repository_id is not None else None,
+        "source": row.source,
+        "question": row.question[:question_limit],
+        "question_truncated": len(row.question) > question_limit,
+        "commit_sha": row.commit_sha,
+        "status": row.status,
+        "provider_metadata": row.provider_metadata,
+        "error_code": row.error_code,
+        "artifacts": [
+            {
+                key: artifact[key]
+                for key in ("name", "filename", "kind", "media_type", "size_bytes")
+                if key in artifact
+            }
+            for artifact in row.artifacts
+        ],
+        "privacy_findings_count": len(row.privacy_findings),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
 
 
 def serialize_clarification(row: Clarification) -> dict[str, Any]:

@@ -114,10 +114,12 @@ install -m 0600 \
   /etc/dca/dca.env
 ```
 
-Fill `/etc/dca/dca.env`. Required secrets are the database password, Telegram token, a random
-session/HMAC secret of at least 32 characters, Claude OAuth token and outbound proxy URL. Production
-uses `DCA_TELEGRAM_MODE=polling`; the webhook secret is required only for `webhook` mode. Keep the
-file `root:root 0600`.
+Fill `/etc/dca/dca.env`. Required secrets are the database password, Telegram token and a random
+session/HMAC secret of at least 32 characters. Configure the Claude OAuth token either in this file
+as the fallback `CLAUDE_CODE_OAUTH_TOKEN` or, after the first admin login, in **Agent -> Claude Code
+CLI**; the panel stores only encrypted ciphertext and never returns the token. The outbound proxy is
+shared by Telegram and Claude. Production uses `DCA_TELEGRAM_MODE=polling`; the webhook secret is
+required only for `webhook` mode. Keep the file `root:root 0600`.
 
 Create the `dca` database and least-privilege login, then run the first release:
 

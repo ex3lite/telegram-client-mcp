@@ -134,10 +134,32 @@ def validate_citation(snapshot_root: Path, citation: Citation) -> CitationCheck:
     return CitationCheck(citation=citation, accepted=True)
 
 
+class KnowledgeArtifact(BaseModel):
+    name: str = Field(min_length=4, max_length=128)
+    content: str = Field(min_length=1, max_length=500_000)
+
+    @field_validator("name")
+    @classmethod
+    def require_safe_markdown_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md", value) or ".." in value:
+            raise ValueError("artifact name must be a safe .md filename")
+        return value
+
+
 class KnowledgeAnswer(BaseModel):
     answer_markdown: str = Field(min_length=1, max_length=200_000)
     citations: list[Citation] = Field(default_factory=list, max_length=100)
     uncertainty: list[str] = Field(default_factory=list, max_length=50)
+    artifacts: list[KnowledgeArtifact] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def artifact_names_are_unique(self) -> KnowledgeAnswer:
+        names = [artifact.name.casefold() for artifact in self.artifacts]
+        if len(names) != len(set(names)):
+            raise ValueError("artifact names must be unique")
+        if sum(len(artifact.content.encode()) for artifact in self.artifacts) > 1_000_000:
+            raise ValueError("artifact content exceeds the combined size limit")
+        return self
 
 
 class AskUserInput(BaseModel):

@@ -22,6 +22,7 @@ from dca.telegram import (
     extract_bot_mention,
     extract_project_prefix,
     ingest_telegram_update,
+    markdown_documents,
     new_draft_id,
     split_rich_answer,
 )
@@ -66,6 +67,17 @@ def test_long_rich_answer_falls_back_to_markdown_attachment() -> None:
     preview, attachment = split_rich_answer(original)
     assert len(preview) <= MAX_RICH_MESSAGE_CHARS
     assert attachment == original
+
+
+def test_explicit_markdown_artifacts_do_not_duplicate_long_answer() -> None:
+    documents = markdown_documents(
+        [{"name": "report.md", "content": "same answer"}],
+        attachment="same answer",
+    )
+
+    assert [(document.name, document.content) for document in documents] == [
+        ("report.md", "same answer")
+    ]
 
 
 def test_draft_id_is_never_zero() -> None:
@@ -153,6 +165,73 @@ async def test_private_final_retries_as_plain_html_without_losing_answer(
     assert len(calls) == 2
     assert calls[0].kwargs["rich_message"].markdown == answer
     assert calls[1].kwargs["rich_message"].html == ("Ответ &lt;важный&gt; &amp; проверенный")
+
+
+@pytest.mark.asyncio
+async def test_private_answer_sends_explicit_markdown_when_enabled(
+    adapter: TelegramAdapter,
+) -> None:
+    sent = SimpleNamespace(chat=SimpleNamespace(id=42))
+    adapter.bot.send_rich_message = AsyncMock(return_value=sent)  # type: ignore[method-assign]
+    adapter.bot.send_document = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    interaction = SimpleNamespace(source_ref={"delivery": {"kind": "private_draft", "chat_id": 42}})
+
+    await adapter.publish_knowledge_answer(
+        interaction,
+        "Короткий ответ",
+        artifacts=[{"name": "runbook.md", "content": "# Runbook"}],
+        attach_markdown=True,
+    )
+
+    document = adapter.bot.send_document.await_args.kwargs["document"]
+    assert document.filename == "runbook.md"
+    assert document.data == b"# Runbook"
+
+
+@pytest.mark.asyncio
+async def test_agent_text_message_uses_rich_markdown_with_plain_fallback(
+    adapter: TelegramAdapter,
+) -> None:
+    sent = SimpleNamespace(message_id=71)
+    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=bad_rich_message()
+    )
+    adapter.bot.send_message = AsyncMock(return_value=sent)  # type: ignore[method-assign]
+
+    message_id = await adapter.deliver_agent_message(
+        chat_id=-100,
+        message_thread_id=7,
+        text_markdown="**Готово**",
+        attachment_name=None,
+        attachment_markdown=None,
+    )
+
+    assert message_id == 71
+    rich = adapter.bot.send_rich_message.await_args.kwargs["rich_message"]
+    assert rich.markdown == "**Готово**"
+    adapter.bot.send_message.assert_awaited_once_with(
+        chat_id=-100,
+        message_thread_id=7,
+        text="**Готово**",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_attachment_never_silently_truncates_caption(
+    adapter: TelegramAdapter,
+) -> None:
+    adapter.bot.send_document = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    with pytest.raises(telegram_module.ServiceError, match="1024"):
+        await adapter.deliver_agent_message(
+            chat_id=-100,
+            message_thread_id=None,
+            text_markdown="x" * 1_025,
+            attachment_name="report.md",
+            attachment_markdown="# Report",
+        )
+
+    adapter.bot.send_document.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -317,6 +396,17 @@ async def test_group_and_ephemeral_questions_create_scoped_placeholders(
         "resolve_context",
         AsyncMock(return_value=SimpleNamespace(project=SimpleNamespace(id="p"), user_id="u")),
     )
+    monkeypatch.setattr(
+        telegram_module,
+        "load_project_agent_settings",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                telegram_private_mode="all_messages",
+                telegram_group_mode="mentions",
+            )
+        ),
+    )
     queued = AsyncMock()
     monkeypatch.setattr(telegram_module, "queue_interaction", queued)
     placeholder = SimpleNamespace(
@@ -381,6 +471,29 @@ async def test_group_mention_queues_question_with_explicit_project(
     assert call.kwargs["question"] == "Где проверяется токен?"
     assert call.kwargs["explicit_project_slug"] == "backend"
     assert call.kwargs["prefer_ephemeral"] is False
+
+
+@pytest.mark.asyncio
+async def test_plain_text_uses_all_messages_mode_without_command_path(
+    adapter: TelegramAdapter,
+) -> None:
+    adapter._queue_code_question = AsyncMock()  # type: ignore[method-assign]
+    payload = {
+        "update_id": 18,
+        "message": {
+            "message_id": 4,
+            "date": 0,
+            "chat": {"id": -100, "type": "supergroup", "title": "Developers"},
+            "from": {"id": 777, "is_bot": False, "first_name": "Dev"},
+            "text": "project:backend Где хранится конфиг?",
+        },
+    }
+
+    await adapter.process_raw_update(payload)
+
+    call = adapter._queue_code_question.await_args  # type: ignore[attr-defined]
+    assert call.kwargs["question"] == "Где хранится конфиг?"
+    assert call.kwargs["allowed_modes"] == {"all_messages"}
 
 
 @pytest.mark.parametrize(

@@ -45,12 +45,20 @@ from dca.db import (
     append_audit,
     enqueue_job,
 )
-from dca.domain import ChangeRequestCreate, ClarificationStatus, RepositoryStatus, utcnow
+from dca.domain import (
+    ChangeRequestCreate,
+    ClarificationStatus,
+    KnowledgeArtifact,
+    RepositoryStatus,
+    utcnow,
+)
 from dca.service import (
     ServiceError,
     answer_clarification_from_telegram,
     create_change_request,
     expire_clarification,
+    is_safe_markdown_attachment_name,
+    load_project_agent_settings,
     project_member_profile,
 )
 
@@ -234,6 +242,49 @@ class TelegramAdapter:
                 reply_parameters=ReplyParameters(message_id=clarification.telegram_message_id),
             )
 
+    async def deliver_agent_message(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int | None,
+        text_markdown: str,
+        attachment_name: str | None,
+        attachment_markdown: str | None,
+    ) -> int:
+        if (attachment_name is None) != (attachment_markdown is None):
+            raise ServiceError("invalid_attachment", "Agent message attachment is incomplete")
+        if attachment_name is None:
+            try:
+                sent = await self.bot.send_rich_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    rich_message=InputRichMessage(
+                        markdown=text_markdown,
+                        skip_entity_detection=True,
+                    ),
+                )
+            except TelegramBadRequest:
+                sent = await self.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    text=text_markdown,
+                )
+            return sent.message_id
+        assert attachment_markdown is not None
+        if len(text_markdown) > 1_024:
+            raise ServiceError(
+                "invalid_message", "Agent message caption must not exceed 1024 characters"
+            )
+        if not is_safe_markdown_attachment_name(attachment_name):
+            raise ServiceError("invalid_attachment", "Agent message attachment name is unsafe")
+        sent = await self.bot.send_document(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            document=BufferedInputFile(attachment_markdown.encode(), filename=attachment_name),
+            caption=text_markdown,
+        )
+        return sent.message_id
+
     async def send_knowledge_progress(self, interaction: Interaction, draft_id: int) -> None:
         delivery = interaction.source_ref.get("delivery", {})
         kind = delivery.get("kind")
@@ -262,10 +313,17 @@ class TelegramAdapter:
         self,
         interaction: Interaction,
         answer_markdown: str,
+        *,
+        artifacts: list[dict[str, Any]] | None = None,
+        attach_markdown: bool = True,
     ) -> None:
         delivery = interaction.source_ref.get("delivery", {})
         kind = delivery.get("kind")
-        short_answer, attachment = split_rich_answer(answer_markdown)
+        short_answer, attachment = split_rich_answer(
+            answer_markdown,
+            attach_markdown=attach_markdown,
+        )
+        documents = markdown_documents(artifacts or [], attachment=attachment)
         rich = InputRichMessage(markdown=short_answer, skip_entity_detection=True)
         if kind == "private_draft":
             kwargs = {
@@ -279,12 +337,11 @@ class TelegramAdapter:
                     **kwargs,
                     rich_message=plain_rich_message(short_answer),
                 )
-            if attachment is not None:
-                await self.bot.send_document(
+            if attach_markdown:
+                await self._send_markdown_documents(
                     chat_id=sent.chat.id,
                     message_thread_id=delivery.get("message_thread_id"),
-                    document=BufferedInputFile(attachment.encode(), filename="answer.md"),
-                    caption="Полный ответ с источниками",
+                    documents=documents,
                 )
         elif kind == "guest":
             kwargs = {"inline_message_id": str(delivery["inline_message_id"])}
@@ -314,13 +371,27 @@ class TelegramAdapter:
                     **kwargs,
                     rich_message=plain_rich_message(short_answer),
                 )
-            if attachment is not None:
-                await self.bot.send_document(
+            if attach_markdown:
+                await self._send_markdown_documents(
                     chat_id=int(delivery["chat_id"]),
                     message_thread_id=delivery.get("message_thread_id"),
-                    document=BufferedInputFile(attachment.encode(), filename="answer.md"),
-                    caption="Полный ответ с источниками",
+                    documents=documents,
                 )
+
+    async def _send_markdown_documents(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int | None,
+        documents: list[KnowledgeArtifact],
+    ) -> None:
+        for artifact in documents:
+            await self.bot.send_document(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                document=BufferedInputFile(artifact.content.encode(), filename=artifact.name),
+                caption=f"Документ: {artifact.name}",
+            )
 
     async def publish_knowledge_error(self, interaction: Interaction) -> None:
         delivery = interaction.source_ref.get("delivery", {})
@@ -520,6 +591,7 @@ class TelegramAdapter:
                 question=question,
                 explicit_project_slug=explicit_project,
                 prefer_ephemeral=False,
+                allowed_modes={"mentions", "all_messages"},
             )
 
         @self.router.message(F.reply_to_message, F.text)
@@ -540,6 +612,26 @@ class TelegramAdapter:
                 if exc.code != "request_not_found":
                     await message.answer(exc.message)
 
+        @self.router.message(F.text)
+        async def configured_text_question(message: Message, event_update: Update) -> None:
+            text = (message.text or "").strip()
+            if (
+                not text
+                or text.startswith("/")
+                or message.reply_to_message is not None
+                or (message.from_user is not None and message.from_user.is_bot)
+            ):
+                return
+            explicit_project, question = extract_project_prefix(text)
+            await self._queue_code_question(
+                message=message,
+                event_update=event_update,
+                question=question,
+                explicit_project_slug=explicit_project,
+                prefer_ephemeral=False,
+                allowed_modes={"all_messages"},
+            )
+
     async def _queue_code_question(
         self,
         *,
@@ -548,6 +640,7 @@ class TelegramAdapter:
         question: str,
         explicit_project_slug: str | None,
         prefer_ephemeral: bool,
+        allowed_modes: set[str] | None = None,
     ) -> None:
         if prefer_ephemeral and not await self._ephemeral_available(message):
             return
@@ -558,6 +651,16 @@ class TelegramAdapter:
                     message=message,
                     explicit_project_slug=explicit_project_slug,
                 )
+                agent_settings = await load_project_agent_settings(session, context.project.id)
+                if not agent_settings.enabled:
+                    raise ServiceError("agent_disabled", "Агент отключён для этого проекта")
+                mode = (
+                    agent_settings.telegram_private_mode
+                    if message.chat.type == ChatType.PRIVATE
+                    else agent_settings.telegram_group_mode
+                )
+                if allowed_modes is not None and mode not in allowed_modes:
+                    return
                 delivery: dict[str, Any]
                 if (
                     prefer_ephemeral
@@ -895,12 +998,32 @@ async def queue_interaction(
     return interaction
 
 
-def split_rich_answer(answer: str) -> tuple[str, str | None]:
+def split_rich_answer(answer: str, *, attach_markdown: bool = True) -> tuple[str, str | None]:
     if len(answer) <= MAX_RICH_MESSAGE_CHARS:
         return answer, None
     preview = answer[: MAX_RICH_MESSAGE_CHARS - 220].rstrip()
-    preview += "\n\nПолный ответ превышает лимит Rich Message и приложен файлом `answer.md`."
-    return preview, answer
+    if attach_markdown:
+        preview += "\n\nПолный ответ превышает лимит Rich Message и приложен файлом `answer.md`."
+        return preview, answer
+    preview += "\n\nПолный ответ сокращён по настройкам Telegram-вложений проекта."
+    return preview, None
+
+
+def markdown_documents(
+    artifacts: list[dict[str, Any]],
+    *,
+    attachment: str | None,
+) -> list[KnowledgeArtifact]:
+    documents = [
+        KnowledgeArtifact.model_validate({"name": item.get("name"), "content": item.get("content")})
+        for item in artifacts
+    ]
+    names = {document.name.casefold() for document in documents}
+    contents = {document.content for document in documents}
+    if attachment is not None and attachment not in contents:
+        name = "answer.md" if "answer.md" not in names else "full-answer.md"
+        documents.insert(0, KnowledgeArtifact(name=name, content=attachment))
+    return documents
 
 
 def plain_rich_message(text: str) -> InputRichMessage:

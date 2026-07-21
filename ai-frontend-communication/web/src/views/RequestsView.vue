@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
@@ -23,7 +23,7 @@ const requests = useQuery({
     api<ChangeRequest[]>(
       `/requests${queryString({ project_id: projectId.value, status: requestStatus.value })}`
     ),
-  refetchInterval: 15_000
+  placeholderData: keepPreviousData
 });
 const selected = computed(() => requests.data.value?.find((row) => row.id === selectedId.value));
 
@@ -131,7 +131,7 @@ function mutateStatus(row: ChangeRequest, status: ChangeRequest["status"]) {
           <button
             v-for="target in targets[selected.status]"
             :key="target"
-            class="cds--btn cds--btn--sm cds--btn--tertiary"
+            class="button button--secondary button--small"
             :disabled="changeStatus.isPending.value"
             @click="mutateStatus(selected, target)"
           >

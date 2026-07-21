@@ -21,7 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import dca.worker as worker_module
 from dca.claude import ClaudeError
 from dca.config import Settings
-from dca.db import Interaction, Job
+from dca.db import AgentMessage, Interaction, Job, TelegramChat
 from dca.worker import TELEGRAM_EXTERNAL_ACTIONS, Worker, trusted_requester_profile
 
 
@@ -242,6 +242,102 @@ def test_trusted_requester_profile_whitelists_telegram_server_metadata() -> None
     }
     interaction.source = "api"
     assert trusted_requester_profile(interaction) is None
+
+
+@pytest.mark.asyncio
+async def test_agent_message_delivery_revalidates_chat_and_records_message_id(monkeypatch) -> None:
+    project_id = uuid4()
+    chat_id = uuid4()
+    message = AgentMessage(
+        id=uuid4(),
+        project_id=project_id,
+        service_account_id=uuid4(),
+        correlation_id="run-1",
+        idempotency_key="message-1",
+        target_user_id=None,
+        target_chat_id=chat_id,
+        text_markdown="Deployment finished",
+        attachment_name=None,
+        attachment_markdown=None,
+        privacy_findings=[],
+        status="queued",
+    )
+    chat = TelegramChat(
+        id=chat_id,
+        project_id=project_id,
+        telegram_chat_id=-100,
+        message_thread_id=7,
+        kind="project_group",
+        enabled=True,
+    )
+
+    class FakeSession:
+        async def get(self, model, _key):
+            return message if model is AgentMessage else chat if model is TelegramChat else None
+
+        async def flush(self) -> None:
+            return None
+
+        def expunge(self, _value) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.telegram = SimpleNamespace(deliver_agent_message=AsyncMock(return_value=73))
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                enabled=True,
+                telegram_attach_markdown=True,
+                privacy_level="strict",
+            )
+        ),
+    )
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+
+    result = await worker._deliver_agent_message(message.id)
+
+    assert result["status"] == "sent"
+    assert message.status == "sent"
+    assert message.telegram_message_id == 73
+    worker.telegram.deliver_agent_message.assert_awaited_once_with(
+        chat_id=-100,
+        message_thread_id=7,
+        text_markdown="Deployment finished",
+        attachment_name=None,
+        attachment_markdown=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_message_delivery_uncertainty_updates_durable_message(monkeypatch) -> None:
+    session_object = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def session():
+        yield session_object
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+    job = Job(
+        id=uuid4(),
+        kind="telegram.deliver_agent_message",
+        payload={"agent_message_id": str(uuid4())},
+    )
+
+    await worker._delivery_uncertain(job, "telegram_network_timeout", "connection lost")
+
+    assert session_object.execute.await_count == 2
+    agent_update = session_object.execute.await_args_list[1].args[0]
+    assert agent_update.compile().params["status"] == "delivery_uncertain"
+    assert agent_update.compile().params["error_code"] == "telegram_network_timeout"
 
 
 @pytest.mark.asyncio

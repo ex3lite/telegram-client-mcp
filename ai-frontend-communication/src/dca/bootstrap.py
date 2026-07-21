@@ -24,16 +24,9 @@ from dca.db import (
     append_audit,
 )
 from dca.domain import utcnow
-from dca.mcp import generate_service_token
+from dca.mcp import MCP_TOOL_SCOPES, generate_service_token
 from dca.service import admin_key_fingerprint, validate_admin_access_key
 from dca.telegram import TelegramAdapter
-
-DEFAULT_SERVICE_TOOLS = [
-    "identity.resolve_user",
-    "telegram.ask_user",
-    "telegram.get_clarification",
-    "telegram.cancel_clarification",
-]
 
 
 def uuid4_argument(value: str) -> UUID:
@@ -62,7 +55,7 @@ async def seed(args: argparse.Namespace, settings: Settings) -> None:
                     name=args.service_account_name,
                     token_prefix=prefix,
                     token_hash=token_hash,
-                    tool_scopes=DEFAULT_SERVICE_TOOLS,
+                    tool_scopes=sorted(MCP_TOOL_SCOPES),
                 )
                 session.add(account)
                 await session.flush()

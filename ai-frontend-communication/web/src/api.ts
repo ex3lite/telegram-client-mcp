@@ -3,8 +3,18 @@ export class ApiError extends Error {
     readonly status: number,
     readonly detail: unknown
   ) {
-    super(typeof detail === "string" ? detail : `HTTP ${status}`);
+    super(errorMessage(detail, status));
   }
+}
+
+function errorMessage(detail: unknown, status: number): string {
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    const value = detail as Record<string, unknown>;
+    if (typeof value.message === "string") return value.message;
+    if (typeof value.code === "string") return value.code;
+  }
+  return `HTTP ${status}`;
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -39,4 +49,3 @@ export function queryString(values: Record<string, string | undefined>): string 
   const rendered = params.toString();
   return rendered ? `?${rendered}` : "";
 }
-

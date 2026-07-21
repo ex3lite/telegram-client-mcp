@@ -65,8 +65,9 @@ async def database() -> AsyncIterator[Database]:
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE admin_sessions, admin_access_keys, admin_principals, audit_events, "
-                "interactions, telegram_identities, telegram_chats, "
+                "TRUNCATE agent_messages, system_secrets, project_agent_settings, admin_sessions, "
+                "admin_access_keys, admin_principals, audit_events, interactions, "
+                "telegram_identities, telegram_chats, "
                 "service_account_projects, repositories, project_memberships, clarifications, "
                 "change_requests, telegram_updates, users, service_accounts, projects, jobs "
                 "RESTART IDENTITY CASCADE"

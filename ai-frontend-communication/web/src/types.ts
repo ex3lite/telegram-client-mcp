@@ -5,6 +5,11 @@ export interface Project {
   enabled: boolean;
 }
 
+export interface AdminIdentity {
+  principal_id: string;
+  name: string;
+}
+
 export interface AuditEvent {
   id: string;
   event_type: string;
@@ -83,3 +88,121 @@ export interface ReadyStatus {
   };
 }
 
+export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type AnswerStyle = "brief" | "normal" | "detailed";
+export type PrivacyLevel = "strict" | "balanced";
+export type TelegramGroupMode = "commands_only" | "mentions" | "all_messages";
+export type TelegramPrivateMode = "commands_only" | "all_messages";
+
+export interface AgentSettings {
+  project_id: string;
+  enabled: boolean;
+  claude_model: string | null;
+  claude_effort: ClaudeEffort;
+  claude_timeout_seconds: number;
+  max_budget_cents: number | null;
+  base_prompt: string;
+  answer_style: AnswerStyle;
+  privacy_level: PrivacyLevel;
+  denied_globs: string[];
+  telegram_group_mode: TelegramGroupMode;
+  telegram_private_mode: TelegramPrivateMode;
+  telegram_attach_markdown: boolean;
+  version: number;
+  updated_by_admin_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ClaudeIntegration {
+  configured: boolean;
+  source: "panel" | "environment" | "missing";
+  proxy_configured: boolean;
+}
+
+export interface ClaudeCheck {
+  ok: boolean;
+  version: string | null;
+}
+
+export interface McpAccount {
+  id: string;
+  name: string;
+  active: boolean;
+  tool_scopes: string[];
+  project_ids: string[];
+  expires_at: string | null;
+  last_used_at: string | null;
+  token_prefix: string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpTokenResult {
+  account: McpAccount;
+  token: string;
+}
+
+export interface Citation {
+  path: string;
+  start_line: number;
+  end_line: number;
+}
+
+export interface KnowledgeArtifact {
+  name: string;
+  filename?: string;
+  content: string;
+}
+
+export interface ArtifactSummary {
+  name?: string;
+  filename?: string;
+  kind?: string;
+  media_type?: string;
+  size_bytes?: number;
+}
+
+export interface PrivacyFinding {
+  kind: string;
+  location: string;
+}
+
+export interface Interaction {
+  id: string;
+  project_id: string;
+  repository_id: string | null;
+  correlation_id: string;
+  source: string;
+  question: string;
+  commit_sha: string | null;
+  status: "queued" | "generating" | "answer_ready" | "published" | "failed";
+  answer_markdown: string | null;
+  citations: Citation[];
+  rejected_citations: Array<{ citation: Citation; accepted: false; reason: string | null }>;
+  uncertainty: string[];
+  provider_metadata: Record<string, unknown>;
+  error_code: string | null;
+  artifacts: KnowledgeArtifact[];
+  privacy_findings: PrivacyFinding[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InteractionSummary {
+  id: string;
+  project_id: string;
+  repository_id: string | null;
+  source: string;
+  question: string;
+  question_truncated: boolean;
+  commit_sha: string | null;
+  status: Interaction["status"];
+  provider_metadata: Record<string, unknown>;
+  error_code: string | null;
+  artifacts: ArtifactSummary[];
+  privacy_findings_count: number;
+  created_at: string;
+  updated_at: string;
+}

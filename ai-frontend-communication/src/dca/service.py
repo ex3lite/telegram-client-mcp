@@ -1,21 +1,28 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import and_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dca.db import (
+    AgentMessage,
     ChangeRequest,
     Clarification,
+    ProjectAgentSettings,
     ProjectMembership,
     ServiceAccount,
     ServiceAccountProject,
+    SystemSecret,
+    TelegramChat,
     TelegramIdentity,
     User,
     append_audit,
@@ -31,14 +38,26 @@ from dca.domain import (
     ensure_transition,
     utcnow,
 )
+from dca.privacy import PrivacyLevel, sanitize_text
+
+SYSTEM_SECRET_CLAUDE_OAUTH = "claude_oauth_token"  # noqa: S105 - database key, not a secret
+_MARKDOWN_ATTACHMENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md")
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.metadata = metadata or {}
 
     def as_dict(self) -> dict[str, Any]:
         return {"code": self.code, "message": self.message, "retryable": self.retryable}
@@ -58,6 +77,39 @@ def validate_admin_access_key(access_key: UUID) -> UUID:
     return access_key
 
 
+def encrypt_system_secret(value: str, server_secret: str) -> bytes:
+    if not value:
+        raise ValueError("system secret cannot be empty")
+    return _system_secret_cipher(server_secret).encrypt(value.encode())
+
+
+def decrypt_system_secret(ciphertext: bytes, server_secret: str) -> str:
+    try:
+        return _system_secret_cipher(server_secret).decrypt(ciphertext).decode()
+    except (InvalidToken, UnicodeDecodeError) as exc:
+        raise ServiceError(
+            "secret_unavailable", "Stored system secret cannot be decrypted"
+        ) from exc
+
+
+async def load_system_secret(
+    session: AsyncSession,
+    name: str,
+    server_secret: str,
+) -> str | None:
+    secret = await session.get(SystemSecret, name)
+    if secret is None:
+        return None
+    return decrypt_system_secret(secret.ciphertext, server_secret)
+
+
+def _system_secret_cipher(server_secret: str) -> Fernet:
+    if len(server_secret) < 32:
+        raise ValueError("server secret must contain at least 32 characters")
+    digest = hashlib.sha256(b"dca-system-secret-v1\0" + server_secret.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
 def project_member_profile(user: User, membership: ProjectMembership) -> dict[str, str | None]:
     return {
         "display_name": user.display_name,
@@ -65,6 +117,32 @@ def project_member_profile(user: User, membership: ProjectMembership) -> dict[st
         "department": membership.department,
         "stack": membership.stack,
     }
+
+
+async def load_project_agent_settings(
+    session: AsyncSession,
+    project_id: UUID,
+) -> ProjectAgentSettings:
+    stored = await session.get(ProjectAgentSettings, project_id)
+    if stored is not None:
+        return stored
+    return ProjectAgentSettings(
+        project_id=project_id,
+        enabled=True,
+        claude_model=None,
+        claude_effort="medium",
+        claude_timeout_seconds=180,
+        max_budget_cents=None,
+        base_prompt="",
+        answer_style="normal",
+        privacy_level="strict",
+        denied_globs=[],
+        telegram_group_mode="mentions",
+        telegram_private_mode="all_messages",
+        telegram_attach_markdown=True,
+        version=0,
+        updated_by_admin_id=None,
+    )
 
 
 async def require_service_scope(
@@ -92,6 +170,276 @@ async def require_service_scope(
     if tool not in account.tool_scopes:
         raise ServiceError("forbidden", "Service account cannot use this tool")
     return account
+
+
+async def create_agent_message(
+    session: AsyncSession,
+    *,
+    service_account_id: UUID,
+    project_id: UUID,
+    correlation_id: str,
+    idempotency_key: str,
+    target_user_id: UUID | None,
+    target_chat_id: UUID | None,
+    text_markdown: str,
+    attachment_name: str | None,
+    attachment_markdown: str | None,
+) -> tuple[AgentMessage, bool]:
+    await require_service_scope(
+        session,
+        service_account_id=service_account_id,
+        project_id=project_id,
+        tool="telegram.send_message",
+    )
+    if target_user_id is None and target_chat_id is None:
+        project_chats = list(
+            await session.scalars(
+                select(TelegramChat)
+                .where(
+                    TelegramChat.project_id == project_id,
+                    TelegramChat.enabled.is_(True),
+                )
+                .order_by(TelegramChat.created_at)
+                .limit(2)
+            )
+        )
+        if not project_chats:
+            raise ServiceError("chat_unavailable", "Project has no enabled Telegram chat")
+        if len(project_chats) > 1:
+            raise ServiceError("chat_ambiguous", "Specify an internal target_chat_id")
+        target_chat_id = project_chats[0].id
+    validate_agent_message(
+        correlation_id=correlation_id,
+        idempotency_key=idempotency_key,
+        target_user_id=target_user_id,
+        target_chat_id=target_chat_id,
+        text_markdown=text_markdown,
+        attachment_name=attachment_name,
+        attachment_markdown=attachment_markdown,
+    )
+    project_settings = await load_project_agent_settings(session, project_id)
+    if not project_settings.enabled:
+        raise ServiceError("agent_disabled", "The project agent is disabled")
+    privacy_level = cast(PrivacyLevel, project_settings.privacy_level)
+    text_result = sanitize_text(
+        text_markdown,
+        level=privacy_level,
+        location="agent_message.text",
+    )
+    attachment_result = (
+        sanitize_text(
+            attachment_markdown,
+            level=privacy_level,
+            location="agent_message.attachment",
+        )
+        if attachment_markdown is not None
+        else None
+    )
+    if text_result.blocked or (attachment_result is not None and attachment_result.blocked):
+        blocked_findings = [
+            *text_result.findings,
+            *(attachment_result.findings if attachment_result is not None else []),
+        ]
+        raise ServiceError(
+            "privacy_blocked",
+            "Message contains protected credential material",
+            metadata={
+                "privacy_findings_count": len(blocked_findings),
+                "privacy_findings": [
+                    {"kind": finding["kind"], "location": finding["location"]}
+                    for finding in blocked_findings
+                ],
+            },
+        )
+    text_markdown = text_result.text
+    attachment_markdown = attachment_result.text if attachment_result is not None else None
+    privacy_findings = [
+        *text_result.findings,
+        *(attachment_result.findings if attachment_result is not None else []),
+    ]
+    existing = await session.scalar(
+        select(AgentMessage).where(
+            AgentMessage.service_account_id == service_account_id,
+            AgentMessage.idempotency_key == idempotency_key,
+        )
+    )
+    if existing is not None:
+        ensure_same_agent_message(
+            existing,
+            project_id=project_id,
+            correlation_id=correlation_id,
+            target_user_id=target_user_id,
+            target_chat_id=target_chat_id,
+            text_markdown=text_markdown,
+            attachment_name=attachment_name,
+            attachment_markdown=attachment_markdown,
+        )
+        return existing, False
+
+    if target_user_id is not None:
+        recipient = await session.scalar(
+            select(TelegramIdentity)
+            .join(ProjectMembership, ProjectMembership.user_id == TelegramIdentity.user_id)
+            .where(
+                ProjectMembership.project_id == project_id,
+                TelegramIdentity.user_id == target_user_id,
+                TelegramIdentity.verified_at.is_not(None),
+                TelegramIdentity.reachable.is_(True),
+                TelegramIdentity.private_chat_id.is_not(None),
+            )
+        )
+        if recipient is None:
+            raise ServiceError(
+                "recipient_unreachable",
+                "Recipient is not a verified, reachable member of this project",
+            )
+    else:
+        chat = await session.scalar(
+            select(TelegramChat).where(
+                TelegramChat.id == target_chat_id,
+                TelegramChat.project_id == project_id,
+                TelegramChat.enabled.is_(True),
+            )
+        )
+        if chat is None:
+            raise ServiceError("chat_unavailable", "Target chat is unavailable to this project")
+
+    message_id = uuid4()
+    statement = (
+        insert(AgentMessage)
+        .values(
+            id=message_id,
+            project_id=project_id,
+            service_account_id=service_account_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            target_user_id=target_user_id,
+            target_chat_id=target_chat_id,
+            text_markdown=text_markdown,
+            attachment_name=attachment_name,
+            attachment_markdown=attachment_markdown,
+            privacy_findings=privacy_findings,
+            status="queued",
+        )
+        .on_conflict_do_nothing(
+            index_elements=[AgentMessage.service_account_id, AgentMessage.idempotency_key]
+        )
+        .returning(AgentMessage.id)
+    )
+    inserted = (await session.execute(statement)).scalar_one_or_none()
+    if inserted is None:
+        raced = await session.scalar(
+            select(AgentMessage).where(
+                AgentMessage.service_account_id == service_account_id,
+                AgentMessage.idempotency_key == idempotency_key,
+            )
+        )
+        if raced is None:
+            raise ServiceError("internal_error", "Idempotency conflict could not be resolved")
+        ensure_same_agent_message(
+            raced,
+            project_id=project_id,
+            correlation_id=correlation_id,
+            target_user_id=target_user_id,
+            target_chat_id=target_chat_id,
+            text_markdown=text_markdown,
+            attachment_name=attachment_name,
+            attachment_markdown=attachment_markdown,
+        )
+        return raced, False
+
+    message = await session.get(AgentMessage, message_id)
+    if message is None:
+        raise ServiceError("internal_error", "Agent message was not persisted")
+    await enqueue_job(
+        session,
+        kind="telegram.deliver_agent_message",
+        payload={"agent_message_id": str(message.id)},
+        deduplication_key=f"agent-message:{message.id}:deliver",
+    )
+    await append_audit(
+        session,
+        event_type="agent_message.created",
+        correlation_id=correlation_id,
+        actor_type="service_account",
+        actor_id=str(service_account_id),
+        project_id=project_id,
+        subject_type="agent_message",
+        subject_id=str(message.id),
+        payload={
+            "target_type": "user" if target_user_id is not None else "chat",
+            "target_id": str(target_user_id or target_chat_id),
+            "has_attachment": attachment_name is not None,
+            "privacy_findings_count": len(privacy_findings),
+            "privacy_findings": [
+                {"kind": finding["kind"], "location": finding["location"]}
+                for finding in privacy_findings
+            ],
+        },
+    )
+    return message, True
+
+
+def validate_agent_message(
+    *,
+    correlation_id: str,
+    idempotency_key: str,
+    target_user_id: UUID | None,
+    target_chat_id: UUID | None,
+    text_markdown: str,
+    attachment_name: str | None,
+    attachment_markdown: str | None,
+) -> None:
+    if (target_user_id is None) == (target_chat_id is None):
+        raise ServiceError("invalid_target", "Exactly one message target is required")
+    if not 1 <= len(correlation_id) <= 255 or not 1 <= len(idempotency_key) <= 255:
+        raise ServiceError("invalid_request", "Correlation and idempotency keys are required")
+    if not 1 <= len(text_markdown) <= 4_096 or "\0" in text_markdown:
+        raise ServiceError("invalid_message", "Message must contain 1-4096 safe characters")
+    if (attachment_name is None) != (attachment_markdown is None):
+        raise ServiceError(
+            "invalid_attachment", "Attachment name and content must be supplied together"
+        )
+    if attachment_name is None:
+        return
+    if len(text_markdown) > 1_024:
+        raise ServiceError(
+            "invalid_message", "Messages with a Markdown attachment are limited to 1024 characters"
+        )
+    if not is_safe_markdown_attachment_name(attachment_name):
+        raise ServiceError("invalid_attachment", "Only a safe .md filename is supported")
+    if not attachment_markdown or len(attachment_markdown.encode()) > 1_048_576:
+        raise ServiceError("invalid_attachment", "Markdown attachment exceeds the 1 MiB limit")
+
+
+def is_safe_markdown_attachment_name(value: str) -> bool:
+    return ".." not in value and _MARKDOWN_ATTACHMENT_NAME_RE.fullmatch(value) is not None
+
+
+def ensure_same_agent_message(
+    message: AgentMessage,
+    *,
+    project_id: UUID,
+    correlation_id: str,
+    target_user_id: UUID | None,
+    target_chat_id: UUID | None,
+    text_markdown: str,
+    attachment_name: str | None,
+    attachment_markdown: str | None,
+) -> None:
+    if (
+        message.project_id != project_id
+        or message.correlation_id != correlation_id
+        or message.target_user_id != target_user_id
+        or message.target_chat_id != target_chat_id
+        or message.text_markdown != text_markdown
+        or message.attachment_name != attachment_name
+        or message.attachment_markdown != attachment_markdown
+    ):
+        raise ServiceError(
+            "idempotency_conflict",
+            "The idempotency key was already used for a different message",
+        )
 
 
 async def create_clarification(

@@ -105,7 +105,10 @@ async def test_materialize_enforces_allowed_paths_and_policy_cache(tmp_path: Pat
     (working / "src").mkdir()
     (working / "src" / "public.py").write_text("VISIBLE = True\n")
     (working / "secret.txt").write_text("must not leak\n")
-    run_git(working, "add", ".")
+    (working / ".env.production").write_text("API_KEY=must-not-leak\n")
+    (working / "deploy.pem").write_text("private key material\n")
+    (working / "credentials.json").write_text('{"token":"must-not-leak"}\n')
+    run_git(working, "add", "-f", ".")
     run_git(working, "commit", "-m", "fixture")
     commit = run_git(working, "rev-parse", "HEAD")
 
@@ -126,6 +129,15 @@ async def test_materialize_enforces_allowed_paths_and_policy_cache(tmp_path: Pat
 
     unrestricted = await snapshots.materialize(repository, commit)
     assert (unrestricted / "secret.txt").is_file()
+    assert (unrestricted / "src" / "public.py").is_file()
+    assert not (unrestricted / ".env.production").exists()
+    assert not (unrestricted / "deploy.pem").exists()
+    assert not (unrestricted / "credentials.json").exists()
+
+    denied = await snapshots.materialize(repository, commit, denied_globs=["secret.txt"])
+    assert denied != unrestricted
+    assert not (denied / "secret.txt").exists()
+    assert (denied / "src" / "public.py").is_file()
 
     repository.allowed_paths = ["src"]
     restricted = await snapshots.materialize(repository, commit)
@@ -138,3 +150,8 @@ async def test_materialize_enforces_allowed_paths_and_policy_cache(tmp_path: Pat
         with pytest.raises(ClaudeError) as error:
             await snapshots.materialize(repository, commit)
         assert error.value.code == "repository_invalid_allowed_path"
+
+    repository.allowed_paths = []
+    with pytest.raises(ClaudeError) as error:
+        await snapshots.materialize(repository, commit, denied_globs=["../secret.txt"])
+    assert error.value.code == "repository_invalid_denied_glob"

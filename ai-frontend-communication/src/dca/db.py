@@ -64,6 +64,35 @@ class Project(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class ProjectAgentSettings(Base, TimestampMixin):
+    __tablename__ = "project_agent_settings"
+
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    claude_model: Mapped[str | None] = mapped_column(String(120))
+    claude_effort: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
+    claude_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
+    max_budget_cents: Mapped[int | None] = mapped_column(Integer)
+    base_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    answer_style: Mapped[str] = mapped_column(String(16), nullable=False, default="normal")
+    privacy_level: Mapped[str] = mapped_column(String(16), nullable=False, default="strict")
+    denied_globs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    telegram_group_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="mentions")
+    telegram_private_mode: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="all_messages"
+    )
+    telegram_attach_markdown: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by_admin_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("admin_principals.id", ondelete="SET NULL"),
+    )
+
+
 class Repository(Base, TimestampMixin):
     __tablename__ = "repositories"
     __table_args__ = (UniqueConstraint("project_id", "name"),)
@@ -196,6 +225,7 @@ class ServiceAccount(Base, TimestampMixin):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class ServiceAccountProject(Base):
@@ -247,6 +277,49 @@ class Interaction(Base, TimestampMixin):
     )
     uncertainty: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     provider_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    artifacts: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    privacy_findings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+
+class AgentMessage(Base, TimestampMixin):
+    __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "service_account_id",
+            "idempotency_key",
+            name="uq_agent_message_idempotency",
+        ),
+        Index("ix_agent_message_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    service_account_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("service_accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    correlation_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    target_chat_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("telegram_chats.id", ondelete="RESTRICT")
+    )
+    text_markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    attachment_name: Mapped[str | None] = mapped_column(String(255))
+    attachment_markdown: Mapped[str | None] = mapped_column(Text)
+    privacy_findings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
     error_code: Mapped[str | None] = mapped_column(String(64))
 
 
@@ -363,6 +436,17 @@ class AuditEvent(Base):
     outcome: Mapped[str] = mapped_column(String(32), nullable=False, default="success")
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     remote_address_hash: Mapped[bytes | None] = mapped_column(LargeBinary)
+
+
+class SystemSecret(Base, TimestampMixin):
+    __tablename__ = "system_secrets"
+
+    name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    updated_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("admin_principals.id", ondelete="SET NULL"),
+    )
 
 
 def create_engine(settings: Settings) -> AsyncEngine:

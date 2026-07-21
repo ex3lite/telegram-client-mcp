@@ -9,7 +9,6 @@
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "@carbon/styles": "^1.96.0",
     "@tanstack/vue-query": "^5.90.0",
     "vue": "^3.5.0",
     "vue-router": "^4.6.0"

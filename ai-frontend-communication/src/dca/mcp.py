@@ -13,27 +13,40 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import or_, select, update
 
 from dca.config import Settings
 from dca.db import (
+    AgentMessage,
     Database,
     ProjectMembership,
     ServiceAccount,
     ServiceAccountProject,
     TelegramIdentity,
     User,
+    append_audit,
 )
 from dca.domain import AskUserInput, parse_service_token, utcnow
 from dca.service import (
     ServiceError,
     cancel_clarification,
     clarification_result,
+    create_agent_message,
     create_clarification,
     get_clarification,
     project_member_profile,
     require_service_scope,
+)
+
+MCP_TOOL_SCOPES = frozenset(
+    {
+        "identity.resolve_user",
+        "telegram.ask_user",
+        "telegram.get_clarification",
+        "telegram.cancel_clarification",
+        "telegram.send_message",
+    }
 )
 
 
@@ -62,6 +75,41 @@ class ToolResult(BaseModel):
                 retryable=error.retryable,
             ),
         )
+
+
+class TelegramSendMessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    correlation_id: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+    target_user_id: UUID | None = None
+    target_chat_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Internal telegram_chats UUID, never a raw Telegram chat ID. Omit both targets "
+            "to use the project's only enabled chat."
+        ),
+    )
+    text_markdown: str = Field(min_length=1, max_length=4_096)
+    attachment_name: str | None = Field(default=None, max_length=255)
+    attachment_markdown: str | None = Field(default=None, max_length=1_048_576)
+
+    @field_validator("correlation_id", "idempotency_key")
+    @classmethod
+    def normalize_key(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value cannot be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_target_and_attachment(self) -> TelegramSendMessageInput:
+        if self.target_user_id is not None and self.target_chat_id is not None:
+            raise ValueError("at most one explicit target is allowed")
+        if (self.attachment_name is None) != (self.attachment_markdown is None):
+            raise ValueError("attachment name and content must be supplied together")
+        return self
 
 
 class DatabaseTokenVerifier(TokenVerifier):
@@ -268,6 +316,45 @@ def build_mcp(settings: Settings, database: Database) -> FastMCP[None]:
         except ServiceError as exc:
             return ToolResult.failure(exc)
 
+    @server.tool(name="telegram_send_message")
+    async def telegram_send_message(request: TelegramSendMessageInput) -> ToolResult:
+        """Queue one idempotent message or Markdown document to an allowed project target."""
+        account_id: UUID | None = None
+        try:
+            account_id = current_service_account_id()
+            async with database.session() as session:
+                message, created = await create_agent_message(
+                    session,
+                    service_account_id=account_id,
+                    project_id=request.project_id,
+                    correlation_id=request.correlation_id,
+                    idempotency_key=request.idempotency_key,
+                    target_user_id=request.target_user_id,
+                    target_chat_id=request.target_chat_id,
+                    text_markdown=request.text_markdown,
+                    attachment_name=request.attachment_name,
+                    attachment_markdown=request.attachment_markdown,
+                )
+                return ToolResult.success(
+                    delivery=agent_message_result(message),
+                    created=created,
+                )
+        except ServiceError as exc:
+            if exc.code == "privacy_blocked":
+                async with database.session() as session:
+                    await append_audit(
+                        session,
+                        event_type="agent_message.privacy_blocked",
+                        correlation_id=request.correlation_id,
+                        actor_type="service_account",
+                        actor_id=str(account_id or "unknown"),
+                        project_id=request.project_id,
+                        subject_type="agent_message_attempt",
+                        outcome="failure",
+                        payload=exc.metadata,
+                    )
+            return ToolResult.failure(exc)
+
     return server
 
 
@@ -277,3 +364,18 @@ def generate_service_token() -> tuple[str, str, str]:
     token = f"dca_{prefix}_{secret}"
     token_hash = PasswordHasher().hash(secret)
     return token, prefix, token_hash
+
+
+def agent_message_result(message: AgentMessage) -> dict[str, Any]:
+    return {
+        "id": str(message.id),
+        "project_id": str(message.project_id),
+        "status": message.status,
+        "target_type": "user" if message.target_user_id is not None else "chat",
+        "target_id": str(message.target_user_id or message.target_chat_id),
+        "has_attachment": message.attachment_name is not None,
+        "telegram_message_id": message.telegram_message_id,
+        "error_code": message.error_code,
+        "created_at": message.created_at,
+        "updated_at": message.updated_at,
+    }

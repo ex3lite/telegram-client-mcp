@@ -30,7 +30,6 @@ class Settings(BaseSettings):
     cookie_secure: bool = True
 
     claude_bin: str = "claude"
-    claude_timeout_seconds: int = Field(default=180, ge=10, le=900)
     repository_root: Path = Path("runtime/repositories")
     snapshot_root: Path = Path("runtime/snapshots")
 

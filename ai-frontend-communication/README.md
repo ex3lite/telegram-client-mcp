@@ -15,6 +15,22 @@ contract and trust boundaries live in [PROJECT_SPEC.md](PROJECT_SPEC.md).
 - Native systemd production services with transactional SQL up/down migrations
 - Docker Compose only for local development
 
+## Operator control plane
+
+The panel at `/` is the working control plane, not only a health dashboard. Per project it controls
+the Claude model, effort, timeout, budget, base prompt, answer style, Telegram response modes and
+Markdown attachments. Claude credentials are encrypted at rest when entered through the panel and
+are never returned to the browser; an environment credential remains a supported fallback.
+
+Privacy is enforced after model output and before every MCP-originated Telegram delivery. `strict`
+blocks suspected credentials before persistence or delivery, while `balanced` persists and sends
+only redacted content. Repository snapshots always exclude built-in secret globs, with additional
+project deny globs configured in the panel.
+
+MCP service accounts are managed from the same panel with project and tool scopes, expiry,
+deactivation and one-time token rotation. Besides durable clarifications they can send idempotent
+informational messages and Markdown documents without receiving the Telegram bot token.
+
 ## Local quick start
 
 ```bash
