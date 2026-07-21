@@ -2,7 +2,7 @@
 Description=Developer Communication Agent Worker
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsExecutable=/opt/dca/current/.venv/bin/dca-worker
+ConditionFileIsExecutable=/opt/dca/current/.venv/bin/dca-worker
 
 [Service]
 Type=simple

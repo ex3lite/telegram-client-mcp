@@ -2,7 +2,7 @@
 Description=Developer Communication Agent API
 After=network-online.target
 Wants=network-online.target
-ConditionPathIsExecutable=/opt/dca/current/.venv/bin/uvicorn
+ConditionFileIsExecutable=/opt/dca/current/.venv/bin/uvicorn
 
 [Service]
 Type=simple
