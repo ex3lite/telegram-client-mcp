@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -40,6 +42,20 @@ class ServiceError(RuntimeError):
 
     def as_dict(self) -> dict[str, Any]:
         return {"code": self.code, "message": self.message, "retryable": self.retryable}
+
+
+def admin_key_fingerprint(access_key: UUID, server_secret: str) -> bytes:
+    return hmac.new(
+        server_secret.encode(),
+        b"dca-admin-access-v1\0" + access_key.bytes,
+        hashlib.sha256,
+    ).digest()
+
+
+def validate_admin_access_key(access_key: UUID) -> UUID:
+    if access_key.version != 4:
+        raise ValueError("admin access key must be UUIDv4")
+    return access_key
 
 
 def project_member_profile(user: User, membership: ProjectMembership) -> dict[str, str | None]:

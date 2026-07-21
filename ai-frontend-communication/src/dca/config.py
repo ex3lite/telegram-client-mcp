@@ -24,8 +24,6 @@ class Settings(BaseSettings):
     outbound_proxy_url: Secret[AnyHttpUrl] | None = None
     max_telegram_body_bytes: int = Field(default=1_048_576, ge=1_024, le=10_485_760)
 
-    admin_email: str = "admin@example.com"
-    admin_password_hash: SecretStr = SecretStr("")
     session_secret: SecretStr = SecretStr("")
     cookie_secure: bool = True
 

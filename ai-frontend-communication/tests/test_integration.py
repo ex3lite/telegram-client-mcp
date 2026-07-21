@@ -19,8 +19,12 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 
 from dca.app import create_app, queue_telegram_update, reserve_telegram_update
+from dca.bootstrap import revoke_admin_key, upsert_admin_key
 from dca.config import Settings
 from dca.db import (
+    AdminAccessKey,
+    AdminPrincipal,
+    AdminSession,
     AuditEvent,
     Clarification,
     Database,
@@ -37,6 +41,7 @@ from dca.db import (
 from dca.domain import AskUserInput, ClarificationStatus, JobStatus, utcnow
 from dca.service import (
     ServiceError,
+    admin_key_fingerprint,
     answer_clarification_from_telegram,
     cancel_clarification,
     create_clarification,
@@ -60,7 +65,8 @@ async def database() -> AsyncIterator[Database]:
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE audit_events, interactions, telegram_identities, telegram_chats, "
+                "TRUNCATE admin_sessions, admin_access_keys, admin_principals, audit_events, "
+                "interactions, telegram_identities, telegram_chats, "
                 "service_account_projects, repositories, project_memberships, clarifications, "
                 "change_requests, telegram_updates, users, service_accounts, projects, jobs "
                 "RESTART IDENTITY CASCADE"
@@ -108,6 +114,89 @@ async def seed_scope(database: Database) -> dict[str, Any]:
         "user_id": user.id,
         "account_id": account.id,
     }
+
+
+@pytest.mark.asyncio
+async def test_admin_key_bootstrap_is_idempotent_and_renames_without_reprinting_secret(
+    database: Database,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    access_key = uuid4()
+    settings = Settings(
+        database_url=os.environ["DCA_TEST_DATABASE_URL"],
+        session_secret=SecretStr("integration-admin-session-secret"),
+    )
+    name = f"Owner {uuid4().hex[:8]}"
+    args = SimpleNamespace(name=name, access_key=access_key)
+
+    await upsert_admin_key(args, settings)
+    created_output = capsys.readouterr().out
+    assert str(access_key) in created_output
+
+    await upsert_admin_key(args, settings)
+    repeated_output = capsys.readouterr().out
+    assert str(access_key) not in repeated_output
+
+    args.name = f"Renamed {uuid4().hex[:8]}"
+    await upsert_admin_key(args, settings)
+    renamed_output = capsys.readouterr().out
+    assert str(access_key) not in renamed_output
+
+    async with database.session() as session:
+        key = await session.scalar(
+            select(AdminAccessKey).where(
+                AdminAccessKey.fingerprint
+                == admin_key_fingerprint(access_key, settings.session_secret.get_secret_value())
+            )
+        )
+        assert key is not None
+        principal = await session.get(AdminPrincipal, key.principal_id)
+        assert principal is not None
+        assert principal.name == args.name
+        admin_session = AdminSession(
+            access_key_id=key.id,
+            expires_at=utcnow() + timedelta(days=1),
+        )
+        session.add(admin_session)
+        await session.flush()
+        key_id = key.id
+        session_id = admin_session.id
+
+    await revoke_admin_key(SimpleNamespace(name=args.name, key_id=None), settings)
+    revoked_output = capsys.readouterr().out
+    assert f"revoked_admin_access_key_id={key_id}" in revoked_output
+
+    async with database.session() as session:
+        revoked_key = await session.get(AdminAccessKey, key_id)
+        revoked_session = await session.get(AdminSession, session_id)
+        assert revoked_key is not None and revoked_key.active is False
+        assert revoked_session is not None and revoked_session.revoked_at is not None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.event_type == "admin.access_key_revoked",
+                    AuditEvent.subject_id == str(key_id),
+                )
+            )
+            == 1
+        )
+
+    args.access_key = None
+    await upsert_admin_key(args, settings)
+    rotated_output = capsys.readouterr().out
+    assert "Store this UUID now" in rotated_output
+
+    async with database.session() as session:
+        keys = list(
+            await session.scalars(
+                select(AdminAccessKey).where(AdminAccessKey.principal_id == principal.id)
+            )
+        )
+        assert len(keys) == 2
+        assert sum(key.active for key in keys) == 1
+        assert next(key for key in keys if key.id == key_id).active is False
 
 
 @pytest.mark.asyncio
@@ -421,20 +510,36 @@ async def test_concurrent_repository_sync_reuses_active_job(
         repository_id = repository.id
 
     secret = "integration-session-secret-32-bytes"  # noqa: S105 - synthetic credential
-    admin_hash = PasswordHasher().hash("integration-test-password")
+    access_key = uuid4()
+    async with database.session() as session:
+        principal = AdminPrincipal(name=f"integration-admin-{uuid4().hex[:8]}")
+        session.add(principal)
+        await session.flush()
+        admin_key = AdminAccessKey(
+            principal_id=principal.id,
+            fingerprint=admin_key_fingerprint(access_key, secret),
+        )
+        session.add(admin_key)
+        await session.flush()
+        admin_session = AdminSession(
+            access_key_id=admin_key.id,
+            expires_at=utcnow() + timedelta(days=1),
+        )
+        session.add(admin_session)
+        await session.flush()
+        admin_session_id = admin_session.id
     app = create_app(
         Settings(
             public_url="http://testserver",
             database_url=os.environ["DCA_TEST_DATABASE_URL"],
             session_secret=SecretStr(secret),
-            admin_password_hash=SecretStr(admin_hash),
             cookie_secure=False,
             repository_root=tmp_path / "repositories",
             snapshot_root=tmp_path / "snapshots",
         )
     )
-    cookie = URLSafeTimedSerializer(secret, salt="dca-admin-session-v1").dumps(
-        {"email": "admin@example.com"}
+    cookie = URLSafeTimedSerializer(secret, salt="dca-admin-session-v2").dumps(
+        {"session_id": str(admin_session_id)}
     )
     transport = ASGITransport(app=app)
     try:

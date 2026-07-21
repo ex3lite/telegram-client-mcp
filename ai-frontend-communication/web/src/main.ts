@@ -16,7 +16,7 @@ import RequestsView from "./views/RequestsView.vue";
 import SettingsView from "./views/SettingsView.vue";
 
 const router = createRouter({
-  history: createWebHashHistory("/admin/"),
+  history: createWebHashHistory(),
   routes: [
     { path: "/login", name: "login", component: LoginView, meta: { public: true } },
     { path: "/", redirect: "/overview" },
@@ -33,7 +33,7 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   if (to.meta.public) return true;
   try {
-    await api<{ email: string }>("/auth/me");
+    await api<{ principal_id: string; name: string }>("/auth/me");
     return true;
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
@@ -44,4 +44,3 @@ router.beforeEach(async (to) => {
 });
 
 createApp(App).use(VueQueryPlugin).use(router).mount("#app");
-

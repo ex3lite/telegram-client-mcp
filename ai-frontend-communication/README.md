@@ -20,22 +20,31 @@ contract and trust boundaries live in [PROJECT_SPEC.md](PROJECT_SPEC.md).
 ```bash
 cp .env.example .env
 uv sync
-uv run dca-bootstrap hash-password
 ```
 
-Put the generated Argon2id hash in `DCA_ADMIN_PASSWORD_HASH`. In a Compose `.env` file, wrap the
-hash in single quotes so its `$` characters remain literal. Fill the remaining secrets, then start
-the stack and seed the first project:
+Generate `DCA_SESSION_SECRET` with `openssl rand -hex 32`, fill the remaining secrets, then start
+the stack, create the first UUID admin key and seed the first project:
 
 ```bash
 docker compose config --quiet
 docker compose up -d --build
+docker compose run --rm --no-deps api uv run --no-sync dca-bootstrap admin-key \
+  --name "Owner"
 docker compose run --rm --no-deps api uv run --no-sync dca-bootstrap seed \
   --project-slug backend \
   --project-name "Backend"
 ```
 
 The `seed` command prints the first MCP service-account token once; store it in a secret manager.
+Admin cookies contain only a server-side session ID. Revoke all keys and sessions for a principal,
+or one internal key, with:
+
+```bash
+docker compose run --rm --no-deps api uv run --no-sync dca-bootstrap \
+  admin-key-revoke --name "Owner"
+docker compose run --rm --no-deps api uv run --no-sync dca-bootstrap \
+  admin-key-revoke --key-id <admin-access-key-id>
+```
 
 Register the Telegram command menu and webhook after the public HTTPS endpoint is reachable:
 
@@ -51,7 +60,7 @@ sudo dca-deploy deploy
 sudo dca-deploy rollback
 ```
 
-The admin UI is served at `/admin/`. The API also exposes `/health/live`, `/health/ready`,
+The admin UI is served at `/`. The API also exposes `/health/live`, `/health/ready`,
 `/api/v1`, the Telegram webhook at `/webhooks/telegram`, and Streamable HTTP MCP at `/mcp`.
 Repository-key provisioning, user linking, deployment lifecycle, and release gates are in
 [docs/OPERATIONS.md](docs/OPERATIONS.md). The exact Telegram feature matrix is in

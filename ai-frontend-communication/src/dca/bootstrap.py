@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import anyio
-from argon2 import PasswordHasher
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from dca.config import Settings, get_settings
 from dca.db import (
+    AdminAccessKey,
+    AdminPrincipal,
+    AdminSession,
     Database,
     Project,
     ProjectMembership,
@@ -22,7 +23,9 @@ from dca.db import (
     User,
     append_audit,
 )
+from dca.domain import utcnow
 from dca.mcp import generate_service_token
+from dca.service import admin_key_fingerprint, validate_admin_access_key
 from dca.telegram import TelegramAdapter
 
 DEFAULT_SERVICE_TOOLS = [
@@ -31,6 +34,13 @@ DEFAULT_SERVICE_TOOLS = [
     "telegram.get_clarification",
     "telegram.cancel_clarification",
 ]
+
+
+def uuid4_argument(value: str) -> UUID:
+    try:
+        return validate_admin_access_key(UUID(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a UUIDv4") from exc
 
 
 async def seed(args: argparse.Namespace, settings: Settings) -> None:
@@ -255,20 +265,153 @@ async def setup_telegram(settings: Settings) -> None:
         await database.close()
 
 
-def hash_password() -> None:
-    password = getpass.getpass("Admin password: ")
-    confirmation = getpass.getpass("Repeat password: ")
-    if password != confirmation:
-        raise SystemExit("Passwords do not match")
-    if len(password) < 12:
-        raise SystemExit("Use at least 12 characters")
-    print(PasswordHasher().hash(password))
+async def upsert_admin_key(args: argparse.Namespace, settings: Settings) -> None:
+    server_secret = settings.session_secret.get_secret_value()
+    if len(server_secret) < 32:
+        raise SystemExit("DCA_SESSION_SECRET must contain at least 32 characters")
+    name = args.name.strip()
+    if not name or len(name) > 160:
+        raise SystemExit("Admin name must contain 1-160 characters")
+    supplied_key: UUID | None = args.access_key
+    access_key = supplied_key or uuid4()
+    fingerprint = admin_key_fingerprint(access_key, server_secret)
+    created = False
+    database = Database(settings)
+    try:
+        async with database.session() as session:
+            key = await session.scalar(
+                select(AdminAccessKey).where(AdminAccessKey.fingerprint == fingerprint)
+            )
+            named_principal = await session.scalar(
+                select(AdminPrincipal).where(AdminPrincipal.name == name)
+            )
+            if key is not None:
+                principal = await session.get(AdminPrincipal, key.principal_id)
+                if principal is None:
+                    raise SystemExit("Admin key points to a missing principal")
+                if named_principal is not None and named_principal.id != principal.id:
+                    raise SystemExit("Another admin principal already uses this name")
+                principal.name = name
+            elif supplied_key is None and named_principal is not None:
+                principal = named_principal
+                key = await session.scalar(
+                    select(AdminAccessKey)
+                    .where(
+                        AdminAccessKey.principal_id == principal.id,
+                        AdminAccessKey.active.is_(True),
+                    )
+                    .order_by(AdminAccessKey.created_at)
+                )
+                if key is None:
+                    key = AdminAccessKey(principal_id=principal.id, fingerprint=fingerprint)
+                    session.add(key)
+                    await session.flush()
+                    created = True
+            else:
+                principal = named_principal
+                if principal is None:
+                    principal = AdminPrincipal(name=name)
+                    session.add(principal)
+                    await session.flush()
+                key = AdminAccessKey(principal_id=principal.id, fingerprint=fingerprint)
+                session.add(key)
+                await session.flush()
+                created = True
+            if key is None:
+                raise SystemExit("Admin principal has no access key")
+            await append_audit(
+                session,
+                event_type=("admin.access_key_created" if created else "admin.access_key_upserted"),
+                correlation_id=f"bootstrap:admin-key:{uuid4().hex}",
+                actor_type="system",
+                actor_id="dca-bootstrap",
+                subject_type="admin_principal",
+                subject_id=str(principal.id),
+                payload={
+                    "key_id": str(key.id),
+                    "name": principal.name,
+                    "principal_active": principal.active,
+                    "key_active": key.active,
+                },
+            )
+        print(f"admin_principal_id={principal.id}")
+        print(f"admin_access_key_id={key.id}")
+        print(f"admin_principal_active={principal.active}")
+        print(f"admin_access_key_active={key.active}")
+        if created:
+            print("Store this UUID now; only its HMAC-SHA-256 fingerprint is persisted:")
+            print(access_key)
+    finally:
+        await database.close()
+
+
+async def revoke_admin_key(args: argparse.Namespace, settings: Settings) -> None:
+    database = Database(settings)
+    try:
+        async with database.session() as session:
+            if args.name is not None:
+                principal = await session.scalar(
+                    select(AdminPrincipal).where(AdminPrincipal.name == args.name.strip())
+                )
+                if principal is None:
+                    raise SystemExit("Unknown admin principal")
+                keys = list(
+                    await session.scalars(
+                        select(AdminAccessKey).where(AdminAccessKey.principal_id == principal.id)
+                    )
+                )
+            else:
+                key = await session.get(AdminAccessKey, args.key_id)
+                if key is None:
+                    raise SystemExit("Unknown admin access key")
+                principal = await session.get(AdminPrincipal, key.principal_id)
+                if principal is None:
+                    raise SystemExit("Admin key points to a missing principal")
+                keys = [key]
+            if not keys:
+                raise SystemExit("Admin principal has no access keys")
+            now = utcnow()
+            for key in keys:
+                key.active = False
+                await session.execute(
+                    update(AdminSession)
+                    .where(
+                        AdminSession.access_key_id == key.id,
+                        AdminSession.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now, updated_at=now)
+                )
+                await append_audit(
+                    session,
+                    event_type="admin.access_key_revoked",
+                    correlation_id=f"bootstrap:admin-key-revoke:{uuid4().hex}",
+                    actor_type="system",
+                    actor_id="dca-bootstrap",
+                    subject_type="admin_access_key",
+                    subject_id=str(key.id),
+                    payload={
+                        "principal_id": str(principal.id),
+                        "name": principal.name,
+                    },
+                )
+        for key in keys:
+            print(f"revoked_admin_access_key_id={key.id}")
+    finally:
+        await database.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dca-bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("hash-password")
+
+    admin_parser = subparsers.add_parser("admin-key")
+    admin_parser.add_argument("--name", required=True)
+    admin_parser.add_argument("--uuid", dest="access_key", type=uuid4_argument)
+
+    revoke_parser = subparsers.add_parser("admin-key-revoke")
+    revoke_target = revoke_parser.add_mutually_exclusive_group(required=True)
+    revoke_target.add_argument("--name")
+    revoke_target.add_argument("--key-id", type=UUID)
 
     seed_parser = subparsers.add_parser("seed")
     seed_parser.add_argument("--project-slug", required=True)
@@ -316,14 +459,15 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await add_repository(args, settings)
     elif args.command == "telegram-setup":
         await setup_telegram(settings)
+    elif args.command == "admin-key":
+        await upsert_admin_key(args, settings)
+    elif args.command == "admin-key-revoke":
+        await revoke_admin_key(args, settings)
 
 
 def run() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    if args.command == "hash-password":
-        hash_password()
-        return
     asyncio.run(async_main(args, get_settings()))
 
 

@@ -2,17 +2,16 @@ import hashlib
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
-import anyio
 import orjson
 import redis.asyncio as redis
 import structlog
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import (
     Cookie,
     Depends,
@@ -24,16 +23,19 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import FileResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dca.config import Settings, get_settings
 from dca.db import (
+    AdminAccessKey,
+    AdminPrincipal,
+    AdminSession,
     AuditEvent,
     ChangeRequest,
     Clarification,
@@ -52,23 +54,45 @@ from dca.domain import (
     utcnow,
 )
 from dca.mcp import build_mcp
-from dca.service import ServiceError, update_change_request_status
+from dca.service import (
+    ServiceError,
+    admin_key_fingerprint,
+    update_change_request_status,
+    validate_admin_access_key,
+)
 from dca.telegram import TelegramAdapter
 from dca.worker import configure_logging
 
 log = structlog.get_logger()
 SESSION_COOKIE = "dca_admin"
-SESSION_MAX_AGE = 8 * 60 * 60
+SESSION_MAX_AGE = 180 * 24 * 60 * 60
 
 
 class LoginInput(BaseModel):
-    email: str = Field(max_length=320)
-    password: str = Field(min_length=1, max_length=1_024)
+    model_config = ConfigDict(extra="forbid")
+
+    access_key: UUID
+
+    @field_validator("access_key")
+    @classmethod
+    def require_uuid4(cls, value: UUID) -> UUID:
+        return validate_admin_access_key(value)
 
 
 class AdminIdentity(BaseModel):
-    email: str
+    principal_id: UUID
+    name: str
     role: str = "owner"
+
+
+@dataclass(frozen=True, slots=True)
+class AdminContext:
+    principal_id: UUID
+    session_id: UUID
+    name: str
+
+    def identity(self) -> AdminIdentity:
+        return AdminIdentity(principal_id=self.principal_id, name=self.name)
 
 
 class StatusUpdateInput(BaseModel):
@@ -87,12 +111,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     mcp_server = build_mcp(settings, database)
     mcp_application = mcp_server.streamable_http_app()
     raw_session_secret = settings.session_secret.get_secret_value()
-    admin_auth_configured = (
-        bool(settings.admin_password_hash.get_secret_value()) and len(raw_session_secret) >= 32
-    )
+    admin_auth_configured = len(raw_session_secret) >= 32
     sessions = URLSafeTimedSerializer(
         raw_session_secret or secrets.token_urlsafe(48),
-        salt="dca-admin-session-v1",
+        salt="dca-admin-session-v2",
     )
 
     @asynccontextmanager
@@ -115,9 +137,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.telegram = telegram
     app.state.redis = redis_client
 
-    def require_admin(
+    async def require_admin(
         session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
-    ) -> AdminIdentity:
+    ) -> AdminContext:
         if not admin_auth_configured:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -129,9 +151,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload = sessions.loads(session_cookie, max_age=SESSION_MAX_AGE)
         except (BadSignature, SignatureExpired) as exc:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session_expired") from exc
-        if not isinstance(payload, dict) or payload.get("email") != settings.admin_email:
+        if not isinstance(payload, dict):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_session")
-        return AdminIdentity(email=settings.admin_email)
+        try:
+            session_id = UUID(str(payload["session_id"]))
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_session") from exc
+        async with database.session() as session:
+            admin_session = await session.get(AdminSession, session_id)
+            if admin_session is None or admin_session.revoked_at is not None:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session_revoked")
+            if admin_session.expires_at <= utcnow():
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session_expired")
+            key = await session.get(AdminAccessKey, admin_session.access_key_id)
+            if key is None or not key.active:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session_revoked")
+            principal = await session.get(AdminPrincipal, key.principal_id)
+            if principal is None or not principal.active:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session_revoked")
+        return AdminContext(
+            principal_id=principal.id,
+            session_id=admin_session.id,
+            name=principal.name,
+        )
 
     def require_same_origin(request: Request) -> None:
         origin = request.headers.get("origin")
@@ -183,20 +225,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "admin_auth_not_configured",
             )
         await enforce_login_rate_limit(request, redis_client, settings)
-        expected_hash = settings.admin_password_hash.get_secret_value()
-        valid = payload.email.casefold() == settings.admin_email.casefold() and bool(expected_hash)
-        if valid:
-            try:
-                valid = await anyio.to_thread.run_sync(
-                    PasswordHasher().verify,
-                    expected_hash,
-                    payload.password,
+        fingerprint = admin_key_fingerprint(payload.access_key, raw_session_secret)
+        async with database.session() as session:
+            key = await session.scalar(
+                select(AdminAccessKey).where(
+                    AdminAccessKey.fingerprint == fingerprint,
+                    AdminAccessKey.active.is_(True),
                 )
-            except (InvalidHashError, VerificationError):
-                valid = False
-        if not valid:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
-        token = sessions.dumps({"email": settings.admin_email, "issued_at": utcnow().isoformat()})
+            )
+            if key is None:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
+            principal = await session.get(AdminPrincipal, key.principal_id)
+            if principal is None or not principal.active:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
+            now = utcnow()
+            key.last_used_at = now
+            identity = AdminIdentity(principal_id=principal.id, name=principal.name)
+            admin_session = AdminSession(
+                id=uuid4(),
+                access_key_id=key.id,
+                expires_at=now + timedelta(seconds=SESSION_MAX_AGE),
+            )
+            session.add(admin_session)
+            await append_audit(
+                session,
+                event_type="admin.login_succeeded",
+                correlation_id=f"admin-login:{key.id}:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(principal.id),
+                subject_type="admin_access_key",
+                subject_id=str(key.id),
+            )
+        token = sessions.dumps({"session_id": str(admin_session.id)})
         response.set_cookie(
             SESSION_COOKIE,
             token,
@@ -206,19 +266,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             samesite="lax",
             path="/",
         )
-        return AdminIdentity(email=settings.admin_email)
+        return identity
 
     @app.get("/api/v1/auth/me")
-    async def me(admin: Annotated[AdminIdentity, Depends(require_admin)]) -> AdminIdentity:
-        return admin
+    async def me(admin: Annotated[AdminContext, Depends(require_admin)]) -> AdminIdentity:
+        return admin.identity()
 
     @app.post("/api/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
     async def logout(
         response: Response,
-        _: Annotated[AdminIdentity, Depends(require_admin)],
         __: Annotated[None, Depends(require_same_origin)],
+        session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
     ) -> None:
-        response.delete_cookie(SESSION_COOKIE, path="/")
+        session_id: UUID | None = None
+        if session_cookie:
+            try:
+                payload = sessions.loads(session_cookie, max_age=SESSION_MAX_AGE)
+                if isinstance(payload, dict):
+                    session_id = UUID(str(payload["session_id"]))
+            except (BadSignature, KeyError, SignatureExpired, ValueError):
+                pass
+        if session_id is not None:
+            async with database.session() as session:
+                admin_session = await session.get(AdminSession, session_id)
+                if admin_session is not None and admin_session.revoked_at is None:
+                    admin_session.revoked_at = utcnow()
+                    key = await session.get(AdminAccessKey, admin_session.access_key_id)
+                    await append_audit(
+                        session,
+                        event_type="admin.logout",
+                        correlation_id=f"admin-logout:{session_id}:{secrets.token_hex(8)}",
+                        actor_type="admin",
+                        actor_id=str(key.principal_id) if key is not None else "unknown",
+                        subject_type="admin_session",
+                        subject_id=str(session_id),
+                    )
+        response.delete_cookie(
+            SESSION_COOKIE,
+            path="/",
+            secure=settings.cookie_secure,
+            httponly=True,
+            samesite="lax",
+        )
 
     @app.post("/webhooks/telegram", include_in_schema=False)
     async def telegram_webhook(
@@ -263,7 +352,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/projects")
     async def list_projects(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
     ) -> list[dict[str, Any]]:
         async with database.session() as session:
             projects = list(await session.scalars(select(Project).order_by(Project.name)))
@@ -279,7 +368,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/overview")
     async def overview(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
         project_id: UUID | None = None,
     ) -> dict[str, Any]:
         async with database.session() as session:
@@ -326,7 +415,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/clarifications")
     async def list_clarifications(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
         project_id: UUID | None = None,
         clarification_status: Annotated[ClarificationStatus | None, Query(alias="status")] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -344,7 +433,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/clarifications/{request_id}")
     async def clarification_detail(
         request_id: UUID,
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
     ) -> dict[str, Any]:
         async with database.session() as session:
             row = await session.get(Clarification, request_id)
@@ -364,7 +453,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/requests")
     async def list_requests(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
         project_id: UUID | None = None,
         request_status: Annotated[ChangeRequestStatus | None, Query(alias="status")] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -383,7 +472,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def change_request_status(
         request_id: UUID,
         payload: StatusUpdateInput,
-        admin: Annotated[AdminIdentity, Depends(require_admin)],
+        admin: Annotated[AdminContext, Depends(require_admin)],
         _: Annotated[None, Depends(require_same_origin)],
     ) -> dict[str, Any]:
         try:
@@ -393,7 +482,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     request_id=request_id,
                     target=payload.status,
                     expected_version=payload.expected_version,
-                    actor_id=admin.email,
+                    actor_id=str(admin.principal_id),
                 )
                 return serialize_request(row)
         except ServiceError as exc:
@@ -401,7 +490,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/repositories")
     async def list_repositories(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
     ) -> list[dict[str, Any]]:
         async with database.session() as session:
             rows = list(await session.scalars(select(Repository).order_by(Repository.name)))
@@ -410,7 +499,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/repositories/{repository_id}/sync", status_code=status.HTTP_202_ACCEPTED)
     async def sync_repository(
         repository_id: UUID,
-        admin: Annotated[AdminIdentity, Depends(require_admin)],
+        admin: Annotated[AdminContext, Depends(require_admin)],
         _: Annotated[None, Depends(require_same_origin)],
     ) -> dict[str, Any]:
         async with database.session() as session:
@@ -449,7 +538,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 event_type="repository.sync_requested",
                 correlation_id=f"repository:{repository_id}:sync:{job.id}",
                 actor_type="admin",
-                actor_id=admin.email,
+                actor_id=str(admin.principal_id),
                 project_id=repository.project_id,
                 subject_type="repository",
                 subject_id=str(repository.id),
@@ -458,7 +547,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/audit")
     async def list_audit(
-        _: Annotated[AdminIdentity, Depends(require_admin)],
+        _: Annotated[AdminContext, Depends(require_admin)],
         project_id: UUID | None = None,
         correlation_id: str | None = None,
         event_type: str | None = None,
@@ -478,8 +567,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     frontend = Path("web/dist")
     if frontend.is_dir():
-        app.mount("/admin", StaticFiles(directory=frontend, html=True), name="admin")
-    # Mount last: FastMCP owns /mcp and the RFC 9728 metadata URL at the public root.
+        app.mount("/assets", StaticFiles(directory=frontend / "assets"), name="admin-assets")
+
+        @app.get("/", include_in_schema=False)
+        async def admin_index() -> FileResponse:
+            return FileResponse(frontend / "index.html")
+
+    # Mount last so API, the admin index and assets retain their exact routes.
     app.mount("/", mcp_application)
     return app
 

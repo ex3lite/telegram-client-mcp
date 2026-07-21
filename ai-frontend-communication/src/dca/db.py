@@ -96,6 +96,42 @@ class User(Base, TimestampMixin):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class AdminPrincipal(Base, TimestampMixin):
+    __tablename__ = "admin_principals"
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), unique=True, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class AdminAccessKey(Base, TimestampMixin):
+    __tablename__ = "admin_access_keys"
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    principal_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("admin_principals.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    fingerprint: Mapped[bytes] = mapped_column(LargeBinary(32), unique=True, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AdminSession(Base, TimestampMixin):
+    __tablename__ = "admin_sessions"
+    __table_args__ = (Index("ix_admin_session_access_key", "access_key_id"),)
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    access_key_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("admin_access_keys.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ProjectMembership(Base):
     __tablename__ = "project_memberships"
 

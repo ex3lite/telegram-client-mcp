@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-shopt -s inherit_errexit
+shopt -s inherit_errexit 2>/dev/null || true
 
 umask 027
 
@@ -16,7 +16,8 @@ LOCK_FILE=/run/lock/dca-deploy.lock
 SERVICE_USER=dca
 SERVICES=(dca-api.service dca-worker.service)
 SMOKE_URL='http://172.18.0.1:8000/health/ready?deep=true'
-SMOKE_ADMIN_URL='http://172.18.0.1:8000/admin/'
+SMOKE_FRONTEND_URL='http://172.18.0.1:8000/'
+SMOKE_FRONTEND_LEGACY_URL='http://172.18.0.1:8000/admin/'
 
 SERVICES_STOPPED=0
 MIGRATION_ATTEMPTED=0
@@ -83,7 +84,10 @@ import shlex
 import sys
 
 path, *command = sys.argv[1:]
-environment = os.environ.copy()
+environment = {
+    "LANG": "C.UTF-8",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
 with open(path, encoding="utf-8") as source:
     for number, raw_line in enumerate(source, 1):
         line = raw_line.strip()
@@ -107,7 +111,7 @@ PY
 }
 
 validate_sql_pairs() {
-  local release=$1 migration up down
+  local release=$1 migration name revision up down
   local directory="$release/migrations/sql"
   [[ -d $directory ]] || return 0
 
@@ -121,10 +125,22 @@ validate_sql_pairs() {
     up=${down%.down.sql}.up.sql
     [[ -f $up ]] || die "missing SQL up migration for $(basename "$down")"
   done
-  while IFS= read -r migration; do
-    [[ $(basename "$migration") =~ ^[0-9a-f]+(_[a-z0-9_-]+)?\.(up|down)\.sql$ ]] ||
-      die "invalid SQL migration name: $(basename "$migration")"
-  done < <(find "$directory" -maxdepth 1 -type f \( -name '*.up.sql' -o -name '*.down.sql' \) -print)
+  for migration in "$directory"/*.sql; do
+    [[ -e $migration ]] || continue
+    name=$(basename "$migration")
+    case "$name" in
+      *.up.sql) revision=${name%.up.sql} ;;
+      *.down.sql) revision=${name%.down.sql} ;;
+      *) die "invalid SQL migration name: $name" ;;
+    esac
+    case "$revision" in
+      744685d9ddd2 | 91d7cfe41a2b) ;;
+      *)
+        [[ $revision =~ ^[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])_([01][0-9]|2[0-3])[0-5][0-9][0-5][0-9]_[a-z0-9][a-z0-9_-]*$ ]] ||
+          die "new SQL migrations require UTC prefix YYYYMMDD_HHMMSS_: $name"
+        ;;
+    esac
+  done
 }
 
 alembic_head() {
@@ -241,6 +257,20 @@ stop_services() {
   systemctl stop "${SERVICES[@]}"
 }
 
+stop_for_release_change() {
+  SERVICES_STOPPED=1
+  stop_services
+}
+
+smoke_frontend() {
+  if curl --noproxy '*' --fail --silent --show-error "$SMOKE_FRONTEND_URL" |
+    grep -q '<div id="app"></div>'; then
+    return 0
+  fi
+  curl --noproxy '*' --fail --silent --show-error "$SMOKE_FRONTEND_LEGACY_URL" |
+    grep -q '<div id="app"></div>'
+}
+
 smoke() {
   local release=$1
   "$release/.venv/bin/python" - "$SMOKE_URL" <<'PY'
@@ -272,7 +302,29 @@ for _ in range(30):
         time.sleep(2)
 raise SystemExit(f"smoke failed: {last_error}")
 PY
-  curl --fail --silent --show-error "$SMOKE_ADMIN_URL" | grep -q '<div id="app"></div>'
+  smoke_frontend
+}
+
+restart_recovered_release() {
+  local release=$1
+  if start_release "$release"; then
+    return 0
+  fi
+  echo "dca-deploy: OUTAGE: restored release failed to start or pass smoke" >&2
+  systemctl --no-pager --full status "${SERVICES[@]}" >&2 || true
+  return 1
+}
+
+bootstrap() {
+  local release runuser_bin
+  [[ $# -gt 0 ]] || die "bootstrap requires a dca-bootstrap command"
+  release=$(current_target "$CURRENT_LINK")
+  [[ -n $release ]] || die "no active release"
+  runuser_bin=$(command -v runuser)
+  run_with_env "$release" "$runuser_bin" \
+    --user "$SERVICE_USER" --preserve-environment -- \
+    /usr/bin/env HOME="$STATE_DIR" USER="$SERVICE_USER" LOGNAME="$SERVICE_USER" \
+    PYTHONDONTWRITEBYTECODE=1 "$release/.venv/bin/dca-bootstrap" "$@"
 }
 
 recover() {
@@ -280,7 +332,11 @@ recover() {
   trap - ERR
   set +e
   if [[ $SERVICES_STOPPED -eq 1 ]]; then
-    stop_services
+    if ! stop_services; then
+      echo "dca-deploy: OUTAGE: unable to stop services safely for recovery" >&2
+      systemctl --no-pager --full status "${SERVICES[@]}" >&2 || true
+      exit "$exit_code"
+    fi
     if [[ $MIGRATION_ATTEMPTED -eq 1 ]]; then
       if ! run_with_env "$RECOVERY_RELEASE" \
         "$RECOVERY_RELEASE/.venv/bin/alembic" "$RECOVERY_COMMAND" "$RECOVERY_REVISION"; then
@@ -295,8 +351,10 @@ recover() {
       echo "dca-deploy: release link recovery failed; services remain stopped" >&2
       exit "$exit_code"
     fi
-    if [[ $RECOVERY_CURRENT_PRESENT -eq 1 ]]; then
-      start_release "$RECOVERY_CURRENT" || true
+    if [[ $RECOVERY_CURRENT_PRESENT -eq 1 ]] &&
+      ! restart_recovered_release "$RECOVERY_CURRENT"; then
+      [[ -n $LAST_BACKUP ]] && echo "dca-deploy: backup: $LAST_BACKUP" >&2
+      exit "$exit_code"
     fi
   fi
   [[ -n $LAST_BACKUP ]] && echo "dca-deploy: rolled back; backup: $LAST_BACKUP" >&2
@@ -321,8 +379,7 @@ deploy() {
   [[ -L $PREVIOUS_LINK ]] && RECOVERY_PREVIOUS_PRESENT=1
   trap recover ERR
 
-  stop_services
-  SERVICES_STOPPED=1
+  stop_for_release_change
   backup_database "$release" "before-${release##*/}"
   MIGRATION_ATTEMPTED=1
   run_with_env "$release" "$release/.venv/bin/alembic" upgrade head
@@ -358,8 +415,7 @@ rollback() {
   RECOVERY_PREVIOUS_PRESENT=1
   trap recover ERR
 
-  stop_services
-  SERVICES_STOPPED=1
+  stop_for_release_change
   backup_database "$active" "before-rollback-${active##*/}"
   MIGRATION_ATTEMPTED=1
   run_with_env "$active" "$active/.venv/bin/alembic" downgrade "$target_revision"
@@ -399,6 +455,14 @@ main() {
       acquire_lock
       "$command"
       ;;
+    bootstrap)
+      require_root
+      require_command flock
+      require_command runuser
+      acquire_lock
+      shift
+      bootstrap "$@"
+      ;;
     smoke)
       smoke "$(current_target "$CURRENT_LINK")"
       ;;
@@ -406,9 +470,11 @@ main() {
       status
       ;;
     *)
-      die "usage: $0 [deploy|rollback|smoke|status]"
+      die "usage: $0 [deploy|rollback|bootstrap <command> [args...]|smoke|status]"
       ;;
   esac
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
