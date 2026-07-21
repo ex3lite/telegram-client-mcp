@@ -14,6 +14,14 @@ Docker Compose remains a local-development option and is not part of the release
 On `test_ai`, native PostgreSQL and Redis use `127.0.0.1:5433` and `127.0.0.1:6380` so the
 existing container services on 5432/6379 remain untouched. The nginx locations from
 `ops/nginx/dca-apex.locations.conf` belong inside the HTTPS `kakaduai.com` server block.
+Allow only the nginx bridge to reach the native API:
+
+```bash
+ufw allow from 172.18.0.0/16 to 172.18.0.1 port 8000 proto tcp
+```
+
+The nginx config is mounted as a read-only file. After replacing it, recreate only that container
+once so Docker remounts the new inode; subsequent application releases do not touch nginx.
 
 Claude Code supports HTTP/HTTPS proxy environment variables, not SOCKS. Set one secret
 `DCA_OUTBOUND_PROXY_URL`; the application passes only that URL to both Claude and aiogram. It does
@@ -34,8 +42,8 @@ install -m 0600 \
 
 Fill `/etc/dca/dca.env`. Required secrets are the database password, Telegram token and webhook
 secret, Argon2id admin password hash, independent session secret, Claude OAuth token and outbound
-proxy URL. Generate the admin hash with `dca-bootstrap hash-password` in a built release. Keep the
-file `root:root 0600`.
+proxy URL. Generate the admin hash with `uv run dca-bootstrap hash-password` from the source
+checkout after `uv sync`. Keep the file `root:root 0600`.
 
 Create the `dca` database and least-privilege login, then run the first release:
 

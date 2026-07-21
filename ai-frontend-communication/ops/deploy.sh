@@ -16,6 +16,7 @@ LOCK_FILE=/run/lock/dca-deploy.lock
 SERVICE_USER=dca
 SERVICES=(dca-api.service dca-worker.service)
 SMOKE_URL='http://172.18.0.1:8000/health/ready?deep=true'
+SMOKE_ADMIN_URL='http://172.18.0.1:8000/admin/'
 
 SERVICES_STOPPED=0
 MIGRATION_ATTEMPTED=0
@@ -150,7 +151,7 @@ prepare_release() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$release"
   uv_bin=$(command -v uv)
   runuser -u "$SERVICE_USER" -- env \
-    HOME="$STATE_DIR" UV_CACHE_DIR="$STATE_DIR/.cache/uv" \
+    HOME="$STATE_DIR" UV_CACHE_DIR="$STATE_DIR/.cache/uv" UV_LINK_MODE=copy \
     "$uv_bin" --directory "$release" sync \
     --frozen --no-dev --no-editable --python 3.14 >&2
   # Positional parameters are intentionally expanded by the child shell after it changes cwd.
@@ -259,6 +260,7 @@ for _ in range(30):
         time.sleep(2)
 raise SystemExit(f"smoke failed: {last_error}")
 PY
+  curl --fail --silent --show-error "$SMOKE_ADMIN_URL" | grep -q '<div id="app"></div>'
 }
 
 recover() {
@@ -368,6 +370,7 @@ main() {
       require_command runuser
       require_command uv
       require_command corepack
+      require_command curl
       require_command pg_dump
       require_command systemctl
       install -d -m 0750 -o root -g "$SERVICE_USER" "$RELEASES_DIR" "$BACKUP_DIR"
