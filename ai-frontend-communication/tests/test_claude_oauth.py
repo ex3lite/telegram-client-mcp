@@ -52,7 +52,12 @@ print(
 )
 print("Paste\\033[8Gcode\\033[13Ghere\\033[18Gif\\033[21Gprompted\\033[30G>", flush=True)
 tty.setraw(sys.stdin.fileno())
-code_bytes = bytearray()
+time.sleep(0.05)
+first_input = os.read(sys.stdin.fileno(), 4096)
+if b"\\r" in first_input:
+    print("Code and Enter were coalesced", flush=True)
+    raise SystemExit(6)
+code_bytes = bytearray(first_input)
 while True:
     character = os.read(sys.stdin.fileno(), 1)
     if character == b"\\r":
