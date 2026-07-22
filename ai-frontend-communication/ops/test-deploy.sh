@@ -11,6 +11,26 @@ grep -Fxq 'InaccessiblePaths=/etc/dca' "$SCRIPT_DIR/systemd/dca-worker.service"
 sandbox=$(mktemp -d)
 trap 'rm -rf -- "$sandbox"' EXIT
 
+units_release="$sandbox/units-release"
+mkdir -p "$units_release/ops/systemd"
+touch \
+  "$units_release/ops/systemd/dca-api.service" \
+  "$units_release/ops/systemd/dca-worker.service"
+(
+  installed=()
+  daemon_reloaded=0
+  install() { installed+=("$*"); }
+  systemctl() {
+    [[ $1 == daemon-reload ]]
+    daemon_reloaded=1
+  }
+  install_systemd_units "$units_release"
+  [[ ${#installed[@]} -eq 2 ]]
+  [[ ${installed[0]} == *'/dca-api.service /etc/systemd/system/dca-api.service' ]]
+  [[ ${installed[1]} == *'/dca-worker.service /etc/systemd/system/dca-worker.service' ]]
+  [[ $daemon_reloaded -eq 1 ]]
+)
+
 valid="$sandbox/valid/migrations/sql"
 mkdir -p "$valid"
 touch \

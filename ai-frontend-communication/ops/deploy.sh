@@ -245,8 +245,18 @@ os.execvpe(
   LAST_BACKUP=$final
 }
 
+install_systemd_units() {
+  local release=$1 unit
+  for unit in "${SERVICES[@]}"; do
+    [[ -f $release/ops/systemd/$unit ]] || die "release is missing systemd unit: $unit"
+    install -m 0644 "$release/ops/systemd/$unit" "/etc/systemd/system/$unit"
+  done
+  systemctl daemon-reload
+}
+
 start_release() {
   local release=$1
+  install_systemd_units "$release"
   systemctl start dca-api.service
   smoke "$release"
   systemctl start dca-worker.service
@@ -450,6 +460,7 @@ main() {
       require_command corepack
       require_command curl
       require_command pg_dump
+      require_command install
       require_command systemctl
       install -d -m 0750 -o root -g "$SERVICE_USER" "$RELEASES_DIR" "$BACKUP_DIR"
       acquire_lock
