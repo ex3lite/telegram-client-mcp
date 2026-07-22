@@ -47,12 +47,17 @@ const credentialSaved = ref(false);
 const oauthFlowOpen = ref(false);
 const oauthSession = ref<ClaudeOAuthStart | null>(null);
 const oauthCode = ref("");
+const oauthCodeError = ref("");
 const oauthExpired = ref(false);
 const oauthConnected = ref(false);
-const oauthCard = ref<HTMLElement | null>(null);
+const oauthStep = ref<1 | 2 | 3>(1);
+const oauthDialog = ref<HTMLDialogElement | null>(null);
+const oauthCodeInput = ref<HTMLTextAreaElement | null>(null);
+const oauthTrigger = ref<HTMLButtonElement | null>(null);
 const settingsSaved = ref(false);
 const confirmDisconnect = ref(false);
 const baseline = ref("");
+const initialClaudeCheckStarted = ref(false);
 let oauthExpiryTimer: number | undefined;
 let oauthViewMounted = true;
 
@@ -122,9 +127,6 @@ const maxBudgetInput = computed({
 
 const serializedForm = computed(() => JSON.stringify(form));
 const dirty = computed(() => Boolean(baseline.value) && serializedForm.value !== baseline.value);
-const oauthStep = computed(() =>
-  oauthConnected.value ? 3 : oauthSession.value ? (oauthCode.value ? 3 : 2) : 1
-);
 const claudeConnectionState = computed(() => {
   if (!claude.data.value?.configured) return "not_configured";
   if (checkClaude.isPending.value) return "syncing";
@@ -133,6 +135,7 @@ const claudeConnectionState = computed(() => {
 });
 const claudeConnectionTitle = computed(() => {
   if (!claude.data.value?.configured) return "Требуется авторизация";
+  if (checkClaude.isPending.value) return "Проверяем Claude";
   if (checkClaude.data.value?.ok) return "Claude подключён";
   if (checkClaude.data.value) return "Credential не прошёл проверку";
   return "Credential сохранён, но ещё не проверен";
@@ -141,6 +144,7 @@ const claudeConnectionDescription = computed(() => {
   if (!claude.data.value?.configured) {
     return "Панель проведёт через вход Anthropic без показа итогового токена.";
   }
+  if (checkClaude.isPending.value) return "Проверяем credential через Claude Code CLI.";
   if (checkClaude.data.value?.ok) return "Можно безопасно переподключить аккаунт через OAuth.";
   if (checkClaude.data.value) return claudeCheckMessage(checkClaude.data.value.error_code);
   return "Запустите проверку: наличие credential в хранилище ещё не означает успешный вход.";
@@ -168,7 +172,11 @@ function clearOauthState() {
   oauthFlowOpen.value = false;
   oauthSession.value = null;
   oauthCode.value = "";
+  oauthCodeError.value = "";
   oauthExpired.value = false;
+  oauthConnected.value = false;
+  oauthStep.value = 1;
+  if (oauthViewMounted) void nextTick(() => oauthTrigger.value?.focus());
 }
 
 function abandonOauthSession(sessionId: string) {
@@ -177,15 +185,32 @@ function abandonOauthSession(sessionId: string) {
   });
 }
 
-function oauthErrorMessage(error: Error | null): string {
+function oauthErrorMessage(error: Error | null, action: "start" | "complete" | "token"): string {
   if (!(error instanceof ApiError)) return error?.message ?? "Не удалось продолжить авторизацию";
   const detail = typeof error.detail === "string" ? error.detail : "";
-  if (error.status === 409) return "На сервере уже есть активная OAuth-сессия. Подождите немного и начните заново.";
+  if (detail === "claude_oauth_session_active") {
+    return "Claude ещё готовит предыдущий запрос на вход. Закройте окно, подождите несколько секунд и повторите.";
+  }
+  if (detail === "claude_oauth_invalid_state") {
+    return action === "complete"
+      ? "Эта OAuth-сессия уже закрыта или была перезапущена. Начните подключение заново."
+      : "Сессию входа не удалось восстановить. Начните подключение заново.";
+  }
   if (error.status === 410) return "OAuth-сессия истекла. Начните подключение заново.";
   if (detail === "claude_oauth_proxy_required") return "Для авторизации сначала нужно настроить исходящий прокси.";
-  if (detail === "claude_oauth_invalid_code") return "Claude отклонил одноразовый код. Проверьте код или начните заново.";
-  if (detail === "claude_oauth_invalid_token") return "Это не setup-token Claude. Одноразовый код из Anthropic сюда вставлять нельзя.";
-  if (error.status === 422) return "Claude не смог завершить OAuth-сессию. Начните подключение заново.";
+  if (detail === "claude_oauth_invalid_code") return "Anthropic не принял этот одноразовый код. Создайте новую сессию и получите новый код.";
+  if (detail === "claude_oauth_invalid_token") {
+    return action === "token"
+      ? "Это поле принимает только готовый setup-token вида sk-ant-oat…. Одноразовый code#state вставляется в мастере подключения."
+      : "Claude не выдал итоговый credential. Начните подключение заново.";
+  }
+  if (detail === "claude_oauth_provider_error") {
+    return action === "start"
+      ? "Claude Code не смог подготовить страницу входа. Повторите попытку."
+      : "Claude Code не смог завершить вход с этим кодом. Начните подключение заново.";
+  }
+  if (error.status === 409) return "Состояние OAuth изменилось. Начните подключение заново.";
+  if (error.status === 422) return action === "start" ? "Не удалось начать OAuth-вход." : "Не удалось завершить OAuth-вход.";
   return error.message;
 }
 
@@ -201,9 +226,36 @@ function claudeCheckMessage(errorCode: string | null): string {
   return "Claude CLI не смог подтвердить подключение.";
 }
 
-async function focusOauthCard() {
+async function openOauthDialog() {
   await nextTick();
-  oauthCard.value?.focus();
+  const dialog = oauthDialog.value;
+  if (!dialog) return;
+  if (!dialog.open) dialog.showModal();
+  dialog.focus();
+}
+
+async function showCodeStep() {
+  oauthStep.value = 2;
+  oauthCodeError.value = "";
+  await nextTick();
+  oauthCodeInput.value?.focus();
+}
+
+function normalizeOauthCode(value: string): string | null {
+  const text = value.trim();
+  const codeAndState = text.match(/([A-Za-z0-9_-]{16,}#[A-Za-z0-9_-]{16,})/);
+  if (codeAndState?.[1]) return codeAndState[1];
+
+  const callback = text.match(/https:\/\/platform\.claude\.com\/oauth\/code\/callback\?[^\s<>"']+/)?.[0];
+  if (!callback) return null;
+  try {
+    const url = new URL(callback.replace(/[\])},.;]+$/, ""));
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    return code && state ? `${code}#${state}` : null;
+  } catch {
+    return null;
+  }
 }
 
 onBeforeUnmount(() => {
@@ -267,6 +319,16 @@ const checkClaude = useMutation({
   mutationFn: () => api<ClaudeCheck>("/integrations/claude/check", { method: "POST" })
 });
 
+watch(
+  () => claude.data.value?.configured,
+  (configured) => {
+    if (!configured || initialClaudeCheckStarted.value) return;
+    initialClaudeCheckStarted.value = true;
+    checkClaude.mutate();
+  },
+  { immediate: true }
+);
+
 async function verifyClaude() {
   await claude.refetch();
   try {
@@ -306,8 +368,10 @@ const startOauth = useMutation({
       return;
     }
     oauthSession.value = value;
+    oauthStep.value = 1;
     oauthExpired.value = false;
     oauthCode.value = "";
+    oauthCodeError.value = "";
     scheduleOauthExpiry(value.expires_at);
   }
 });
@@ -324,13 +388,15 @@ async function beginOauth() {
   clearOauthState();
   oauthFlowOpen.value = true;
   oauthConnected.value = false;
+  oauthStep.value = 1;
   oauthSession.value = null;
   oauthCode.value = "";
+  oauthCodeError.value = "";
   oauthExpired.value = false;
   startOauth.reset();
   completeOauth.reset();
   startOauth.mutate();
-  void focusOauthCard();
+  void openOauthDialog();
 }
 
 const completeOauth = useMutation({
@@ -348,11 +414,28 @@ const completeOauth = useMutation({
     clearOauthTimer();
     checkClaude.reset();
     oauthConnected.value = true;
+    oauthStep.value = 3;
     oauthSession.value = null;
     oauthCode.value = "";
     await verifyClaude();
+  },
+  onError: () => {
+    oauthStep.value = 2;
   }
 });
+
+function submitOauthCode() {
+  const normalized = normalizeOauthCode(oauthCode.value);
+  if (!normalized) {
+    oauthCodeError.value = "Вставьте code#state или полную callback-ссылку со страницы Anthropic.";
+    void nextTick(() => oauthCodeInput.value?.focus());
+    return;
+  }
+  oauthCode.value = normalized;
+  oauthCodeError.value = "";
+  oauthStep.value = 3;
+  completeOauth.mutate();
+}
 
 const cancelOauth = useMutation({
   mutationFn: (sessionId: string) =>
@@ -361,7 +444,11 @@ const cancelOauth = useMutation({
 });
 
 function closeOauth() {
-  if (startOauth.isPending.value) return;
+  if (cancelOauth.isPending.value) return;
+  if (startOauth.isPending.value || completeOauth.isPending.value) {
+    clearOauthState();
+    return;
+  }
   const sessionId = oauthSession.value?.session_id;
   if (sessionId) cancelOauth.mutate(sessionId);
   else clearOauthState();
@@ -410,119 +497,165 @@ const disconnectClaude = useMutation({
             <strong>{{ claudeConnectionTitle }}</strong>
             <p>{{ claudeConnectionDescription }}</p>
           </div>
-          <button class="button button--primary" type="button" :disabled="startOauth.isPending.value || cancelOauth.isPending.value" @click="beginOauth">
+          <button ref="oauthTrigger" class="button button--primary" type="button" :disabled="startOauth.isPending.value || cancelOauth.isPending.value" @click="beginOauth">
             {{ startOauth.isPending.value ? "Создаю сессию…" : claude.data.value?.configured ? "Переподключить Claude" : "Подключить Claude" }}
           </button>
         </div>
       </div>
 
-      <section
-        v-if="oauthFlowOpen"
-        ref="oauthCard"
-        class="oauth-flow"
-        role="dialog"
-        aria-labelledby="oauth-flow-title"
-        aria-describedby="oauth-flow-description"
-        tabindex="-1"
-      >
-        <header class="oauth-flow__header">
-          <div>
-            <span class="eyebrow">Безопасное подключение</span>
-            <h3 id="oauth-flow-title">Авторизация Claude</h3>
-            <p id="oauth-flow-description">Сессия одноразовая. Панель сохранит credential в зашифрованном виде.</p>
-          </div>
-          <button class="text-button" type="button" :disabled="startOauth.isPending.value || cancelOauth.isPending.value" aria-label="Закрыть авторизацию" @click="closeOauth">
-            {{ cancelOauth.isPending.value ? "Закрываю…" : "Закрыть" }}
-          </button>
-        </header>
-
-        <ol class="oauth-steps" aria-label="Шаги авторизации">
-          <li :class="{ 'oauth-step--active': oauthStep === 1, 'oauth-step--done': oauthStep > 1 }"><span>1</span><div><strong>Сессия</strong><small>Создать одноразовый вход</small></div></li>
-          <li :class="{ 'oauth-step--active': oauthStep === 2, 'oauth-step--done': oauthStep > 2 }"><span>2</span><div><strong>Anthropic</strong><small>Разрешить доступ</small></div></li>
-          <li :class="{ 'oauth-step--active': oauthStep === 3, 'oauth-step--done': oauthConnected }"><span>3</span><div><strong>Код</strong><small>Завершить подключение</small></div></li>
-        </ol>
-
-        <div v-if="startOauth.isPending.value" class="oauth-flow__state" aria-live="polite">
-          <strong>Создаём защищённую OAuth-сессию…</strong>
-          <span>Это обычно занимает несколько секунд.</span>
-        </div>
-
-        <div
-          v-else-if="oauthConnected"
-          class="oauth-flow__state"
-          :class="{
-            'oauth-flow__state--success': checkClaude.data.value?.ok,
-            'oauth-flow__state--error': checkClaude.data.value && !checkClaude.data.value.ok
-          }"
-          role="status"
+      <Teleport to="body">
+        <dialog
+          v-if="oauthFlowOpen"
+          ref="oauthDialog"
+          class="oauth-flow oauth-flow--modal"
+          aria-labelledby="oauth-flow-title"
+          aria-describedby="oauth-flow-description"
+          @cancel.prevent="closeOauth"
         >
-          <strong>{{ checkClaude.data.value?.ok ? "Claude подключён" : "Credential сохранён" }}</strong>
-          <span>{{ checkClaude.isPending.value ? "Проверяем подключение…" : checkClaude.data.value?.ok ? `Проверка пройдена · ${checkClaude.data.value.version ?? "Claude CLI"}` : claudeCheckMessage(checkClaude.data.value?.error_code ?? null) }}</span>
-          <button class="button button--secondary button--small" type="button" @click="clearOauthState">Готово</button>
-        </div>
+          <header class="oauth-flow__header">
+            <div>
+              <span class="eyebrow">Подключение аккаунта</span>
+              <h3 id="oauth-flow-title">Claude через Anthropic</h3>
+              <p id="oauth-flow-description">Три шага в одном окне. Итоговый credential останется только на сервере.</p>
+            </div>
+            <button
+              class="oauth-modal__close"
+              type="button"
+              :disabled="cancelOauth.isPending.value"
+              aria-label="Закрыть подключение Claude"
+              @click="closeOauth"
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          </header>
 
-        <div v-else-if="startOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
-          <strong>Сессию не удалось создать</strong>
-          <span>{{ oauthErrorMessage(startOauth.error.value) }}</span>
-          <button class="button button--secondary button--small" type="button" @click="beginOauth">Повторить</button>
-        </div>
+          <ol class="oauth-steps" aria-label="Шаги подключения Claude">
+            <li :class="{ 'oauth-step--active': oauthStep === 1, 'oauth-step--done': oauthStep > 1 }"><span>1</span><div><strong>Anthropic</strong><small>Разрешить вход</small></div></li>
+            <li :class="{ 'oauth-step--active': oauthStep === 2, 'oauth-step--done': oauthStep > 2 }"><span>2</span><div><strong>Код</strong><small>Вставить code#state</small></div></li>
+            <li :class="{ 'oauth-step--active': oauthStep === 3, 'oauth-step--done': checkClaude.data.value?.ok }"><span>3</span><div><strong>Проверка</strong><small>Запустить Claude CLI</small></div></li>
+          </ol>
 
-        <div v-else-if="oauthSession" class="oauth-flow__body">
-          <div v-if="oauthExpired" class="oauth-flow__state oauth-flow__state--error" role="alert">
-            <strong>Сессия истекла</strong>
-            <span>Одноразовый код больше не будет принят.</span>
+          <div v-if="startOauth.isPending.value" class="oauth-flow__state oauth-flow__state--progress" aria-live="polite">
+            <span class="oauth-progress" aria-hidden="true"></span>
+            <div><strong>Готовим вход в Anthropic</strong><span>Обычно это занимает несколько секунд.</span></div>
+          </div>
+
+          <div v-else-if="startOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
+            <strong>Не удалось подготовить вход</strong>
+            <span>{{ oauthErrorMessage(startOauth.error.value, "start") }}</span>
+            <button class="button button--secondary button--small" type="button" @click="beginOauth">Повторить</button>
+          </div>
+
+          <div v-else-if="oauthExpired" class="oauth-flow__state oauth-flow__state--error" role="alert">
+            <strong>Время сессии закончилось</strong>
+            <span>Создайте новую сессию, чтобы Anthropic выдал действующий код.</span>
             <button class="button button--secondary button--small" type="button" @click="beginOauth">Начать заново</button>
           </div>
 
-          <template v-else>
-            <div class="authorization-action">
-              <div><strong>Откройте Anthropic</strong><span>Войдите в аккаунт и подтвердите доступ. Страница откроется в новой вкладке.</span></div>
-              <a class="button button--secondary" :href="oauthSession.authorization_url" target="_blank" rel="noopener noreferrer">Открыть страницу авторизации</a>
+          <section v-else-if="oauthStep === 1 && oauthSession" class="oauth-stage" aria-labelledby="oauth-stage-one-title">
+            <span class="oauth-stage__number" aria-hidden="true">01</span>
+            <div class="oauth-stage__content">
+              <h4 id="oauth-stage-one-title">Разрешите доступ в Anthropic</h4>
+              <p>Откроется новая вкладка. Вы уже авторизованы — подтвердите доступ и скопируйте выданный код.</p>
+              <div class="oauth-stage__actions">
+                <a class="button button--primary" :href="oauthSession.authorization_url" target="_blank" rel="noopener noreferrer" @click="showCodeStep">Открыть Anthropic</a>
+                <button class="text-button" type="button" @click="showCodeStep">Код уже получен</button>
+              </div>
+              <small class="oauth-expiry">Сессия действует до {{ formatDate(oauthSession.expires_at) }}.</small>
             </div>
-            <p class="oauth-expiry">Сессия действует до {{ formatDate(oauthSession.expires_at) }}.</p>
-            <form class="oauth-code-form" @submit.prevent="completeOauth.mutate()">
-              <label class="field">
-                <span>Одноразовый код</span>
-                <input v-model.trim="oauthCode" autocomplete="one-time-code" autocapitalize="none" inputmode="text" maxlength="4096" spellcheck="false" placeholder="Вставьте код из Anthropic" required />
-                <small>Код используется только для этой OAuth-сессии.</small>
-              </label>
-              <button class="button button--primary" type="submit" :disabled="completeOauth.isPending.value || !oauthCode">
-                {{ completeOauth.isPending.value ? "Подключаю…" : "Завершить подключение" }}
-              </button>
-            </form>
-            <div v-if="completeOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
-              <strong>Подключение не завершено</strong>
-              <span>{{ oauthErrorMessage(completeOauth.error.value) }}</span>
-              <button class="text-button" type="button" @click="beginOauth">Начать заново</button>
+          </section>
+
+          <section v-else-if="oauthStep === 2 && oauthSession" class="oauth-stage" aria-labelledby="oauth-stage-two-title">
+            <span class="oauth-stage__number" aria-hidden="true">02</span>
+            <div class="oauth-stage__content">
+              <h4 id="oauth-stage-two-title">Вставьте ответ Anthropic</h4>
+              <p>Подойдёт строка <code>code#state</code>, полная callback-ссылка или весь текст со страницы.</p>
+
+              <div v-if="completeOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
+                <strong>Этот код не сработал</strong>
+                <span>{{ oauthErrorMessage(completeOauth.error.value, "complete") }}</span>
+                <button class="button button--secondary button--small" type="button" @click="beginOauth">Получить новый код</button>
+              </div>
+
+              <form v-else class="oauth-code-form oauth-code-form--stacked" @submit.prevent="submitOauthCode">
+                <label class="field">
+                  <span>Одноразовый код</span>
+                  <textarea
+                    ref="oauthCodeInput"
+                    v-model="oauthCode"
+                    autocomplete="one-time-code"
+                    autocapitalize="none"
+                    maxlength="4096"
+                    rows="3"
+                    spellcheck="false"
+                    placeholder="Вставьте code#state или callback-ссылку"
+                    :aria-invalid="Boolean(oauthCodeError)"
+                    :aria-describedby="oauthCodeError ? 'oauth-code-help oauth-code-error' : 'oauth-code-help'"
+                    required
+                    @input="oauthCodeError = ''"
+                  ></textarea>
+                  <small id="oauth-code-help">Панель сама извлечёт code#state. Повторно этот код использовать нельзя.</small>
+                </label>
+                <p v-if="oauthCodeError" id="oauth-code-error" class="inline-error" role="alert">{{ oauthCodeError }}</p>
+                <div class="oauth-stage__actions oauth-stage__actions--submit">
+                  <button class="button button--primary" type="submit" :disabled="!oauthCode.trim()">Подключить Claude</button>
+                  <button class="text-button" type="button" @click="oauthStep = 1">Назад</button>
+                </div>
+              </form>
+              <small class="oauth-expiry">Сессия действует до {{ formatDate(oauthSession.expires_at) }}.</small>
             </div>
-          </template>
-        </div>
-      </section>
+          </section>
+
+          <section v-else-if="oauthStep === 3" class="oauth-stage" aria-labelledby="oauth-stage-three-title">
+            <span class="oauth-stage__number" aria-hidden="true">03</span>
+            <div class="oauth-stage__content">
+              <h4 id="oauth-stage-three-title">Проверяем подключение</h4>
+
+              <div v-if="completeOauth.isPending.value || checkClaude.isPending.value || (oauthConnected && !checkClaude.data.value && !checkClaude.error.value)" class="oauth-flow__state oauth-flow__state--progress" aria-live="polite">
+                <span class="oauth-progress" aria-hidden="true"></span>
+                <div>
+                  <strong>{{ completeOauth.isPending.value ? "Завершаем OAuth-вход" : "Запускаем Claude Code CLI" }}</strong>
+                  <span>{{ completeOauth.isPending.value ? "Передаём одноразовый код Claude." : "Проверяем credential реальным запросом." }}</span>
+                </div>
+              </div>
+
+              <div v-else-if="checkClaude.data.value?.ok" class="oauth-flow__state oauth-flow__state--success" role="status">
+                <strong>Проверка пройдена</strong>
+                <span>Claude {{ checkClaude.data.value.version ?? "CLI" }} подключён и готов отвечать.</span>
+                <button class="button button--primary button--small" type="button" @click="clearOauthState">Готово</button>
+              </div>
+
+              <div v-else class="oauth-flow__state oauth-flow__state--error" role="alert">
+                <strong>OAuth сохранён, но проверка не пройдена</strong>
+                <span>{{ checkClaude.data.value ? claudeCheckMessage(checkClaude.data.value.error_code) : "Не удалось запустить проверку Claude CLI." }}</span>
+                <div class="oauth-stage__actions">
+                  <button class="button button--secondary button--small" type="button" :disabled="checkClaude.isPending.value" @click="verifyClaude">Проверить снова</button>
+                  <button class="text-button" type="button" @click="beginOauth">Подключить заново</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </dialog>
+      </Teleport>
 
       <details class="manual-token">
-        <summary>У меня уже есть токен</summary>
+        <summary>Расширенный режим</summary>
+        <p class="oauth-expiry">Только для готового setup-token вида <code>sk-ant-oat…</code>. Для одноразового кода используйте кнопку «Подключить Claude» выше.</p>
         <form class="credential-form" @submit.prevent="saveCredential.mutate()">
-          <label class="field">
-            <span>{{ claude.data.value?.configured ? "Заменить OAuth-токен" : "OAuth-токен" }}</span>
-            <input v-model.trim="credential" type="password" autocomplete="new-password" placeholder="Вставьте готовый setup-token" required />
-            <small>Fallback для токена, который уже был создан вручную. Поле очищается после сохранения.</small>
+          <label class="field" aria-describedby="setup-token-help">
+            <span>Готовый setup-token</span>
+            <input v-model.trim="credential" type="password" autocomplete="new-password" placeholder="sk-ant-oat…" required />
+            <small id="setup-token-help">Поле очистится сразу после сохранения.</small>
           </label>
           <button class="button button--secondary" type="submit" :disabled="saveCredential.isPending.value || !credential">
-            {{ saveCredential.isPending.value ? "Сохраняю…" : "Сохранить готовый токен" }}
+            {{ saveCredential.isPending.value ? "Сохраняю и проверяю…" : "Сохранить setup-token" }}
           </button>
         </form>
+        <p v-if="credentialSaved && checkClaude.isPending.value" class="inline-success" role="status">Setup-token сохранён. Проверяем Claude CLI…</p>
+        <p v-else-if="credentialSaved && checkClaude.data.value?.ok" class="inline-success" role="status">Проверка пройдена · Claude {{ checkClaude.data.value.version ?? "CLI" }}</p>
+        <p v-else-if="credentialSaved && checkClaude.data.value" class="inline-error" role="alert">{{ claudeCheckMessage(checkClaude.data.value.error_code) }}</p>
+        <p v-if="saveCredential.error.value" class="inline-error" role="alert">{{ oauthErrorMessage(saveCredential.error.value, "token") }}</p>
       </details>
-      <p v-if="credentialSaved" class="inline-success" role="status">Setup-token сохранён; это ещё не подтверждает подключение. Результат проверки показан ниже.</p>
-      <p v-if="saveCredential.error.value" class="inline-error" role="alert">{{ oauthErrorMessage(saveCredential.error.value) }}</p>
-      <div class="integration-check">
-        <button class="button button--secondary button--small" type="button" :disabled="checkClaude.isPending.value" @click="checkClaude.mutate()">
-          {{ checkClaude.isPending.value ? "Проверяю…" : "Проверить подключение" }}
-        </button>
-        <span v-if="checkClaude.data.value" :class="checkClaude.data.value.ok ? 'check-result check-result--ok' : 'check-result check-result--error'">
-          {{ checkClaude.data.value.ok ? `Подключение работает · ${checkClaude.data.value.version ?? "версия неизвестна"}` : claudeCheckMessage(checkClaude.data.value.error_code) }}
-        </span>
-        <span v-if="checkClaude.error.value" class="check-result check-result--error">{{ checkClaude.error.value.message }}</span>
-      </div>
       <div v-if="claude.data.value?.source === 'panel'" class="danger-row">
         <template v-if="confirmDisconnect">
           <span>Удалить токен, сохранённый через панель?</span>
@@ -710,3 +843,185 @@ const disconnectClaude = useMutation({
     </form>
   </PageState>
 </template>
+
+<style scoped>
+.oauth-flow--modal {
+  width: min(44rem, calc(100vw - 2rem));
+  max-width: none;
+  max-height: calc(100dvh - 2rem);
+  margin: auto;
+  overflow-y: auto;
+  color: #24251f;
+  box-shadow: 0 1.5rem 5rem rgb(78 48 35 / 24%);
+}
+
+.oauth-flow--modal::backdrop {
+  background: rgb(31 29 26 / 62%);
+  backdrop-filter: blur(0.25rem);
+}
+
+.oauth-modal__close {
+  display: grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 auto;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.oauth-modal__close:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: #24251f;
+  background: #f5ebe4;
+}
+
+.oauth-modal__close:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.oauth-modal__close:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.oauth-modal__close span {
+  font-size: 1.5rem;
+  line-height: 1;
+  transform: translateY(-0.06rem);
+}
+
+.oauth-stage {
+  display: grid;
+  grid-template-columns: 3.25rem minmax(0, 1fr);
+  gap: 1rem;
+  min-height: 14rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #faf7f1;
+}
+
+.oauth-stage__number {
+  color: #c8a99c;
+  font-family: "SFMono-Regular", monospace;
+  font-size: 1.45rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.oauth-stage__content {
+  min-width: 0;
+}
+
+.oauth-stage__content h4 {
+  margin: 0;
+  font-size: 1.12rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.oauth-stage__content > p {
+  max-width: 56ch;
+  margin: 0.45rem 0 1.25rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-wrap: pretty;
+}
+
+.oauth-stage__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  margin-top: 1rem;
+}
+
+.oauth-stage__actions--submit {
+  justify-content: space-between;
+}
+
+.oauth-stage__content > .oauth-expiry {
+  display: block;
+  margin-top: 1rem;
+}
+
+.oauth-code-form--stacked {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+.oauth-code-form--stacked textarea {
+  min-height: 6rem;
+  resize: vertical;
+  word-break: break-all;
+}
+
+.oauth-flow__state--progress {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: stretch;
+  min-height: 8rem;
+  padding: 1.25rem;
+}
+
+.oauth-flow__state--progress div,
+.oauth-flow__state--progress strong,
+.oauth-flow__state--progress span {
+  display: block;
+}
+
+.oauth-flow__state--progress div > span {
+  margin-top: 0.2rem;
+}
+
+.oauth-progress {
+  width: 1.55rem;
+  height: 1.55rem;
+  border: 2px solid #e3cfc5;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: oauth-spin 800ms linear infinite;
+}
+
+.manual-token > .oauth-expiry {
+  margin: 0.75rem 0 0;
+}
+
+@keyframes oauth-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 42rem) {
+  .oauth-flow--modal {
+    width: calc(100vw - 1rem);
+    max-height: calc(100dvh - 1rem);
+    padding: 1rem;
+  }
+
+  .oauth-stage {
+    grid-template-columns: 1fr;
+    gap: 0.5rem;
+    padding: 1rem;
+  }
+
+  .oauth-stage__actions,
+  .oauth-stage__actions--submit {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .oauth-stage__actions .button,
+  .oauth-stage__actions .text-button {
+    width: 100%;
+    text-align: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .oauth-progress { animation: none; }
+}
+</style>
