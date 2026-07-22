@@ -85,6 +85,7 @@ CLAUDE_OAUTH_CODE_ANCHOR = "Paste code here if prompted >"
 _CLAUDE_OAUTH_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _CLAUDE_OAUTH_URL_RE = re.compile(r"https://[^\s\x00-\x1f\x7f<>\"']{1,8192}")
 _CLAUDE_OAUTH_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{20,8192}")
+_CLAUDE_SETUP_TOKEN_RE = re.compile(r"sk-ant-oat[A-Za-z0-9_-]{20,16374}")
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC8_OPEN_RE = re.compile(
     r"\x1b\]8;[^\x07\x1b;]{0,512};(?P<url>https://[^\x07\x1b]{1,8192})(?:\x07|\x1b\\)"
@@ -248,6 +249,7 @@ class ClaudeOAuthManager:
                 ),
                 detect_invalid_code=True,
             )
+            provider_value = validate_claude_oauth_token(provider_value)
         except asyncio.CancelledError:
             await self._finish_session(session, "cancelled")
             raise
@@ -805,6 +807,9 @@ class ClaudeCode:
         if len(stdout) > 2_000_000 or len(stderr) > 500_000:
             raise ClaudeError("model_provider_invalid_output", "Claude Code output exceeded limits")
         if process.returncode != 0:
+            error_code = _claude_cli_error_code(stdout)
+            if error_code is not None:
+                raise ClaudeError(error_code, "Claude rejected the configured credential")
             detail = _safe_error_detail(stderr.decode(errors="replace")[-2_000:])
             raise ClaudeError(
                 "model_provider_unavailable",
@@ -871,6 +876,9 @@ class ClaudeCode:
                 raise ClaudeError(
                     "model_provider_timeout", "Claude connection probe timed out"
                 ) from exc
+        error_code = _claude_cli_error_code(stdout)
+        if error_code is not None:
+            raise ClaudeError(error_code, "Claude rejected the configured credential")
         if process.returncode != 0 or not stdout:
             detail = _safe_error_detail(stderr.decode(errors="replace")[-1_000:])
             raise ClaudeError(
@@ -903,6 +911,7 @@ class ClaudeCode:
                 "model_provider_not_configured",
                 "CLAUDE_CODE_OAUTH_TOKEN is missing; create it with claude setup-token",
             )
+        token = validate_claude_oauth_token(token)
         return {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LANG": "C.UTF-8",
@@ -1072,10 +1081,19 @@ def _extract_oauth_value(raw: bytes) -> str | None:
 
 def _contains_invalid_code(raw: bytes | bytearray) -> bool:
     text = _compact_terminal_text(_terminal_text(raw))
-    return (
-        any(_compact_terminal_text(marker) in text for marker in _CLAUDE_OAUTH_INVALID_CODE_MARKERS)
-        or _compact_terminal_text(CLAUDE_OAUTH_CODE_ANCHOR) in text
+    return any(
+        _compact_terminal_text(marker) in text for marker in _CLAUDE_OAUTH_INVALID_CODE_MARKERS
     )
+
+
+def validate_claude_oauth_token(value: str) -> str:
+    normalized = value.strip()
+    if _CLAUDE_SETUP_TOKEN_RE.fullmatch(normalized) is None:
+        raise ClaudeError(
+            "claude_oauth_invalid_token",
+            "Claude credential is not a setup-token",
+        )
+    return normalized
 
 
 def _validate_oauth_code(value: str) -> str:
@@ -1164,6 +1182,25 @@ QUESTION:
 
 def _safe_error_detail(value: str) -> str:
     return sanitize_text(value, level="balanced", location="provider_error").text
+
+
+def _claude_cli_error_code(raw: bytes) -> str | None:
+    try:
+        envelope = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("is_error") is not True:
+        return None
+    result = envelope.get("result")
+    if not isinstance(result, str):
+        return None
+    normalized = result.casefold()
+    if any(
+        marker in normalized
+        for marker in ("failed to authenticate", "invalid bearer token", "api error: 401")
+    ):
+        return "model_provider_authentication_failed"
+    return None
 
 
 def parse_claude_output(raw: bytes) -> KnowledgeAnswer:

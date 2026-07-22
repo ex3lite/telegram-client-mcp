@@ -127,6 +127,7 @@ export interface ClaudeIntegration {
 export interface ClaudeCheck {
   ok: boolean;
   version: string | null;
+  error_code: string | null;
 }
 
 export interface ClaudeOAuthStart {

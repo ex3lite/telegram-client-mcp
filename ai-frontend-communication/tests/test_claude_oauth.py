@@ -13,7 +13,7 @@ from itsdangerous import URLSafeTimedSerializer
 from pydantic import SecretStr
 
 from dca.app import create_app
-from dca.claude import ClaudeError, ClaudeOAuthManager, ClaudeOAuthStart
+from dca.claude import ClaudeCode, ClaudeError, ClaudeOAuthManager, ClaudeOAuthStart
 from dca.config import Settings
 from dca.db import (
     AdminAccessKey,
@@ -31,6 +31,7 @@ def write_fake_setup_token_cli(path: Path) -> None:
         """#!/usr/bin/env python3
 import os
 import sys
+import time
 
 blocked = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 if any(name in os.environ for name in blocked):
@@ -50,15 +51,22 @@ print(
 )
 print("Paste\\033[8Gcode\\033[13Ghere\\033[18Gif\\033[21Gprompted\\033[30G>", flush=True)
 code = sys.stdin.readline().strip()
-if code != "one-time-code":
+if code not in {"one-time-code", "invalid-provider-token"}:
     print("Invalid code", flush=True)
     raise SystemExit(5)
+print("Paste code here if prompted >", flush=True)
+time.sleep(0.05)
 print(
     "Your\\033[6GOAuth\\033[12Gtoken\\033[18G(valid\\033[25Gfor"
     "\\033[29G1\\033[31Gyear):",
     flush=True,
 )
-print("long-lived-test-value-1234567890", flush=True)
+token = (
+    "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890"
+    if code == "one-time-code"
+    else "long-lived-but-not-a-setup-token-value"
+)
+print(token, flush=True)
 """
     )
     path.chmod(0o700)
@@ -116,8 +124,13 @@ async def test_claude_oauth_pty_flow_and_terminal_states(
         assert manager._sessions[started.session_id].state == "awaiting_code"
 
         issued_value = await manager.complete(owner_id, started.session_id, "one-time-code")
-        assert issued_value == "long-lived-test-value-1234567890"
+        assert issued_value == "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890"
         assert await manager.cancel(other_owner_id, other.session_id) is True
+
+        invalid_provider = await manager.start(owner_id)
+        with pytest.raises(ClaudeError) as invalid_token:
+            await manager.complete(owner_id, invalid_provider.session_id, "invalid-provider-token")
+        assert invalid_token.value.code == "claude_oauth_invalid_token"
 
         with pytest.raises(ClaudeError) as restart_state:
             await restarted.complete(owner_id, started.session_id, "one-time-code")
@@ -200,7 +213,7 @@ async def test_claude_oauth_api_encrypts_value_and_never_returns_it(
             expires_at=utcnow() + timedelta(minutes=10),
         )
     )
-    issued_value = "long-lived-test-value-1234567890"
+    issued_value = "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890"
     complete = AsyncMock(return_value=issued_value)
     cancel = AsyncMock(return_value=True)
     monkeypatch.setattr(app.state.claude_oauth, "start", start)
@@ -216,6 +229,15 @@ async def test_claude_oauth_api_encrypts_value_and_never_returns_it(
             base_url="https://testserver",
             cookies={"dca_admin": cookie},
         ) as client:
+            invalid_manual = await client.put(
+                "/api/v1/integrations/claude",
+                json={"oauth_token": "authorization-code-value#oauth-state"},
+                headers={"Origin": "https://testserver"},
+            )
+            assert invalid_manual.status_code == 422
+            assert invalid_manual.json()["detail"] == "claude_oauth_invalid_token"
+            assert not any(isinstance(item, SystemSecret) for item in added)
+
             cross_origin = await client.post(
                 "/api/v1/integrations/claude/oauth/start",
                 json={},
@@ -248,6 +270,26 @@ async def test_claude_oauth_api_encrypts_value_and_never_returns_it(
             assert issued_value not in completed.text
             complete.assert_awaited_once_with(principal.id, session_id, "one-time-code")
 
+            async def reject_probe(_: ClaudeCode, oauth_token: str | None = None) -> str:
+                assert oauth_token == issued_value
+                raise ClaudeError(
+                    "model_provider_authentication_failed",
+                    "provider detail that must not be returned",
+                )
+
+            monkeypatch.setattr(ClaudeCode, "probe", reject_probe)
+            checked = await client.post(
+                "/api/v1/integrations/claude/check",
+                headers={"Origin": "https://testserver"},
+            )
+            assert checked.status_code == 200
+            assert checked.json() == {
+                "ok": False,
+                "version": None,
+                "error_code": "model_provider_authentication_failed",
+            }
+            assert "provider detail" not in checked.text
+
             invalid_cancel = await client.delete(
                 "/api/v1/integrations/claude/oauth/short",
                 headers={"Origin": "https://testserver"},
@@ -267,6 +309,7 @@ async def test_claude_oauth_api_encrypts_value_and_never_returns_it(
         assert [event.event_type for event in audits] == [
             "claude.oauth_started",
             "claude.oauth_completed",
+            "claude.integration_checked",
             "claude.oauth_cancelled",
         ]
         assert issued_value not in str([event.payload for event in audits])

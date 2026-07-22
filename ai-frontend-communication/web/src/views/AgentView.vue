@@ -125,6 +125,26 @@ const dirty = computed(() => Boolean(baseline.value) && serializedForm.value !==
 const oauthStep = computed(() =>
   oauthConnected.value ? 3 : oauthSession.value ? (oauthCode.value ? 3 : 2) : 1
 );
+const claudeConnectionState = computed(() => {
+  if (!claude.data.value?.configured) return "not_configured";
+  if (checkClaude.isPending.value) return "syncing";
+  if (!checkClaude.data.value) return "stored";
+  return checkClaude.data.value.ok ? "connected" : "failed";
+});
+const claudeConnectionTitle = computed(() => {
+  if (!claude.data.value?.configured) return "Требуется авторизация";
+  if (checkClaude.data.value?.ok) return "Claude подключён";
+  if (checkClaude.data.value) return "Credential не прошёл проверку";
+  return "Credential сохранён, но ещё не проверен";
+});
+const claudeConnectionDescription = computed(() => {
+  if (!claude.data.value?.configured) {
+    return "Панель проведёт через вход Anthropic без показа итогового токена.";
+  }
+  if (checkClaude.data.value?.ok) return "Можно безопасно переподключить аккаунт через OAuth.";
+  if (checkClaude.data.value) return claudeCheckMessage(checkClaude.data.value.error_code);
+  return "Запустите проверку: наличие credential в хранилище ещё не означает успешный вход.";
+});
 
 function clearOauthTimer() {
   if (oauthExpiryTimer !== undefined) window.clearTimeout(oauthExpiryTimer);
@@ -164,8 +184,21 @@ function oauthErrorMessage(error: Error | null): string {
   if (error.status === 410) return "OAuth-сессия истекла. Начните подключение заново.";
   if (detail === "claude_oauth_proxy_required") return "Для авторизации сначала нужно настроить исходящий прокси.";
   if (detail === "claude_oauth_invalid_code") return "Claude отклонил одноразовый код. Проверьте код или начните заново.";
+  if (detail === "claude_oauth_invalid_token") return "Это не setup-token Claude. Одноразовый код из Anthropic сюда вставлять нельзя.";
   if (error.status === 422) return "Claude не смог завершить OAuth-сессию. Начните подключение заново.";
   return error.message;
+}
+
+function claudeCheckMessage(errorCode: string | null): string {
+  if (errorCode === "model_provider_authentication_failed") {
+    return "Anthropic отклонил credential. Создайте новый setup-token или подключитесь через OAuth.";
+  }
+  if (errorCode === "claude_oauth_invalid_token") {
+    return "Сохранённое значение не является setup-token Claude. Переподключите аккаунт.";
+  }
+  if (errorCode === "model_provider_not_configured") return "Credential Claude не настроен.";
+  if (errorCode === "model_provider_timeout") return "Claude не ответил вовремя. Повторите проверку.";
+  return "Claude CLI не смог подтвердить подключение.";
 }
 
 async function focusOauthCard() {
@@ -251,9 +284,13 @@ const saveCredential = useMutation({
     }),
   onSuccess: async (value) => {
     queryClient.setQueryData(["integrations", "claude"], value);
+    checkClaude.reset();
     credential.value = "";
     credentialSaved.value = true;
     await verifyClaude();
+  },
+  onMutate: () => {
+    credentialSaved.value = false;
   }
 });
 
@@ -309,6 +346,7 @@ const completeOauth = useMutation({
   onSuccess: async (value) => {
     queryClient.setQueryData(["integrations", "claude"], value);
     clearOauthTimer();
+    checkClaude.reset();
     oauthConnected.value = true;
     oauthSession.value = null;
     oauthCode.value = "";
@@ -333,6 +371,8 @@ const disconnectClaude = useMutation({
   mutationFn: () => api<ClaudeIntegration>("/integrations/claude", { method: "DELETE" }),
   onSuccess: (value) => {
     queryClient.setQueryData(["integrations", "claude"], value);
+    checkClaude.reset();
+    credentialSaved.value = false;
     confirmDisconnect.value = false;
   }
 });
@@ -355,7 +395,7 @@ const disconnectClaude = useMutation({
         <h2 id="claude-connection-title">Claude Code CLI</h2>
         <p>OAuth-токен хранится на сервере и никогда не возвращается в браузер.</p>
       </div>
-      <StatusBadge :value="claude.data.value?.configured ? 'connected' : 'not_configured'" />
+      <StatusBadge :value="claudeConnectionState" />
     </div>
 
     <PageState :loading="claude.isPending.value" :error="claude.error.value" @retry="claude.refetch()">
@@ -363,12 +403,12 @@ const disconnectClaude = useMutation({
         <div class="integration-facts">
           <div><span>Источник</span><strong>{{ claude.data.value?.source ?? "missing" }}</strong></div>
           <div><span>Прокси</span><strong>{{ claude.data.value?.proxy_configured ? "Настроен" : "Не настроен" }}</strong></div>
-          <div><span>Проверка</span><strong>{{ checkClaude.data.value ? (checkClaude.data.value.ok ? `Claude ${checkClaude.data.value.version ?? "доступен"}` : "Ошибка") : "Не запускалась" }}</strong></div>
+          <div><span>Проверка</span><strong>{{ checkClaude.data.value ? (checkClaude.data.value.ok ? `Claude ${checkClaude.data.value.version ?? "доступен"}` : claudeCheckMessage(checkClaude.data.value.error_code)) : "Не запускалась" }}</strong></div>
         </div>
         <div class="connection-primary">
           <div>
-            <strong>{{ claude.data.value?.configured ? "Claude подключён" : "Требуется авторизация" }}</strong>
-            <p>{{ claude.data.value?.configured ? "Можно безопасно переподключить аккаунт через OAuth." : "Панель проведёт через вход Anthropic без показа итогового токена." }}</p>
+            <strong>{{ claudeConnectionTitle }}</strong>
+            <p>{{ claudeConnectionDescription }}</p>
           </div>
           <button class="button button--primary" type="button" :disabled="startOauth.isPending.value || cancelOauth.isPending.value" @click="beginOauth">
             {{ startOauth.isPending.value ? "Создаю сессию…" : claude.data.value?.configured ? "Переподключить Claude" : "Подключить Claude" }}
@@ -407,9 +447,17 @@ const disconnectClaude = useMutation({
           <span>Это обычно занимает несколько секунд.</span>
         </div>
 
-        <div v-else-if="oauthConnected" class="oauth-flow__state oauth-flow__state--success" role="status">
-          <strong>Claude подключён</strong>
-          <span>{{ checkClaude.data.value?.ok ? `Проверка пройдена · ${checkClaude.data.value.version ?? "Claude CLI"}` : "Credential сохранён. Результат проверки показан ниже." }}</span>
+        <div
+          v-else-if="oauthConnected"
+          class="oauth-flow__state"
+          :class="{
+            'oauth-flow__state--success': checkClaude.data.value?.ok,
+            'oauth-flow__state--error': checkClaude.data.value && !checkClaude.data.value.ok
+          }"
+          role="status"
+        >
+          <strong>{{ checkClaude.data.value?.ok ? "Claude подключён" : "Credential сохранён" }}</strong>
+          <span>{{ checkClaude.isPending.value ? "Проверяем подключение…" : checkClaude.data.value?.ok ? `Проверка пройдена · ${checkClaude.data.value.version ?? "Claude CLI"}` : claudeCheckMessage(checkClaude.data.value?.error_code ?? null) }}</span>
           <button class="button button--secondary button--small" type="button" @click="clearOauthState">Готово</button>
         </div>
 
@@ -464,14 +512,14 @@ const disconnectClaude = useMutation({
           </button>
         </form>
       </details>
-      <p v-if="credentialSaved" class="inline-success" role="status">Готовый токен принят сервером; результат проверки показан ниже.</p>
-      <p v-if="saveCredential.error.value" class="inline-error" role="alert">{{ saveCredential.error.value.message }}</p>
+      <p v-if="credentialSaved" class="inline-success" role="status">Setup-token сохранён; это ещё не подтверждает подключение. Результат проверки показан ниже.</p>
+      <p v-if="saveCredential.error.value" class="inline-error" role="alert">{{ oauthErrorMessage(saveCredential.error.value) }}</p>
       <div class="integration-check">
         <button class="button button--secondary button--small" type="button" :disabled="checkClaude.isPending.value" @click="checkClaude.mutate()">
           {{ checkClaude.isPending.value ? "Проверяю…" : "Проверить подключение" }}
         </button>
         <span v-if="checkClaude.data.value" :class="checkClaude.data.value.ok ? 'check-result check-result--ok' : 'check-result check-result--error'">
-          {{ checkClaude.data.value.ok ? `Подключение работает · ${checkClaude.data.value.version ?? "версия неизвестна"}` : "Claude недоступен" }}
+          {{ checkClaude.data.value.ok ? `Подключение работает · ${checkClaude.data.value.version ?? "версия неизвестна"}` : claudeCheckMessage(checkClaude.data.value.error_code) }}
         </span>
         <span v-if="checkClaude.error.value" class="check-result check-result--error">{{ checkClaude.error.value.message }}</span>
       </div>

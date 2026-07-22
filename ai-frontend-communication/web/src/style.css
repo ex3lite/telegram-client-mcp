@@ -554,6 +554,7 @@ pre {
 .status--expired,
 .status--cancelled,
 .status--disabled,
+.status--stored,
 .status--uncertain {
   border-color: #b28600;
   color: #684e00;

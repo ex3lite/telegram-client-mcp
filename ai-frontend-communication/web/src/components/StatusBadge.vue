@@ -22,6 +22,7 @@ const labels: Record<string, string> = {
   uncertain: "Неопределённо",
   active: "Активен",
   connected: "Подключён",
+  stored: "Сохранён, не проверен",
   not_configured: "Не настроен",
   queued: "В очереди",
   generating: "Claude отвечает",

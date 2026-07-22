@@ -16,6 +16,7 @@ from dca.claude import (
     RepositorySnapshots,
     build_prompt,
     parse_claude_output,
+    validate_claude_oauth_token,
 )
 from dca.config import Settings
 from dca.db import Repository
@@ -58,6 +59,47 @@ def test_parse_claude_structured_output() -> None:
 
 def test_empty_mcp_config_matches_claude_cli_schema() -> None:
     assert json.loads(EMPTY_MCP_CONFIG) == {"mcpServers": {}}
+
+
+def test_claude_oauth_token_rejects_authorization_code() -> None:
+    token = "sk-ant-oat01-" + "a" * 40
+
+    assert validate_claude_oauth_token(f"  {token}  ") == token
+    for invalid in ("authorization-code#state", "long-but-not-a-setup-token-value"):
+        with pytest.raises(ClaudeError) as error:
+            validate_claude_oauth_token(invalid)
+        assert error.value.code == "claude_oauth_invalid_token"
+
+
+@pytest.mark.asyncio
+async def test_probe_classifies_json_stdout_authentication_failure(tmp_path: Path) -> None:
+    executable = tmp_path / "fake-claude"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+config = sys.argv[sys.argv.index("--mcp-config") + 1]
+assert json.loads(config) == {"mcpServers": {}}
+assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"].startswith("sk-ant-oat")
+print(json.dumps({
+    "type": "result",
+    "is_error": True,
+    "result": "Failed to authenticate. API Error: 401 Invalid bearer token",
+}))
+raise SystemExit(1)
+"""
+    )
+    executable.chmod(0o700)
+
+    with pytest.raises(ClaudeError) as error:
+        await ClaudeCode(Settings(claude_bin=str(executable))).probe(
+            oauth_token="sk-ant-oat01-" + "a" * 40
+        )
+
+    assert error.value.code == "model_provider_authentication_failed"
+    assert "bearer" not in error.value.message.casefold()
 
 
 def test_parse_claude_rejects_unstructured_text() -> None:
@@ -104,7 +146,7 @@ def test_prompt_marks_conversation_memory_as_untrusted_data() -> None:
 def test_claude_environment_adds_only_configured_proxy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-" + "a" * 40)
     monkeypatch.setenv("DCA_DATABASE_URL", "must-not-leak")
     claude = ClaudeCode(
         Settings(

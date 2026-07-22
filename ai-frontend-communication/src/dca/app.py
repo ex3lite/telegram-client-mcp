@@ -35,7 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from dca.claude import ClaudeCode, ClaudeError, ClaudeOAuthManager
+from dca.claude import (
+    ClaudeCode,
+    ClaudeError,
+    ClaudeOAuthManager,
+    validate_claude_oauth_token,
+)
 from dca.config import Settings, get_settings
 from dca.db import (
     AdminAccessKey,
@@ -178,7 +183,7 @@ class AgentSettingsInput(BaseModel):
 class ClaudeIntegrationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    oauth_token: SecretStr = Field(min_length=20, max_length=16_384)
+    oauth_token: SecretStr = Field(max_length=16_384)
 
 
 class ClaudeIntegrationStatus(BaseModel):
@@ -582,7 +587,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload = orjson.loads(body)
             payload["update_id"] = int(payload["update_id"])
         except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid_update") from exc
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_update") from exc
 
         async with database.session() as session:
             await ingest_telegram_update(session, telegram, payload, actor_id="webhook")
@@ -788,9 +793,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[AdminContext, Depends(require_admin)],
         _: Annotated[None, Depends(require_same_origin)],
     ) -> dict[str, Any]:
-        token = payload.oauth_token.get_secret_value().strip()
-        if len(token) < 20:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "oauth_token_too_short")
+        try:
+            token = validate_claude_oauth_token(payload.oauth_token.get_secret_value())
+        except ClaudeError as exc:
+            raise claude_oauth_http_exception(exc) from exc
         async with database.session() as session:
             await store_claude_oauth_token(session, token, admin.principal_id)
             await append_audit(
@@ -832,6 +838,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         source = "unknown"
         version: str | None = None
+        error_code: str | None = None
         try:
             async with database.session() as session:
                 token = await load_system_secret(
@@ -848,6 +855,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             version = await ClaudeCode(settings).probe(oauth_token=token)
         except Exception as exc:
             log.warning("claude.probe_failed", error_type=type(exc).__name__)
+            error_code = (
+                exc.code if isinstance(exc, ClaudeError) else "model_provider_unavailable"
+            )
             outcome = "failure"
         else:
             outcome = "success"
@@ -861,9 +871,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 subject_type="system_secret",
                 subject_id=SYSTEM_SECRET_CLAUDE_OAUTH,
                 outcome=outcome,
-                payload={"source": source, "version": version},
+                payload={"source": source, "version": version, "error_code": error_code},
             )
-        return {"ok": outcome == "success", "version": version}
+        return {"ok": outcome == "success", "version": version, "error_code": error_code}
 
     @app.get("/api/v1/mcp/accounts")
     async def list_mcp_accounts(
@@ -933,13 +943,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         changed = payload.model_fields_set - {"expected_version"}
         if not changed:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "no_changes")
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "no_changes")
         if payload.expires_at is not None:
             validate_future_expiry(payload.expires_at)
         for required in ("name", "active", "tool_scopes", "project_ids"):
             if required in changed and getattr(payload, required) is None:
                 raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
                     f"{required}_cannot_be_null",
                 )
         try:
@@ -1503,9 +1513,9 @@ def validate_future_expiry(expires_at: datetime | None) -> None:
     if expires_at is None:
         return
     if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "expires_at_timezone_required")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "expires_at_timezone_required")
     if expires_at <= utcnow():
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "expires_at_must_be_future")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "expires_at_must_be_future")
 
 
 async def require_projects(session: Any, project_ids: list[UUID]) -> None:
@@ -1715,10 +1725,10 @@ def claude_oauth_http_exception(error: ClaudeError) -> HTTPException:
         "claude_oauth_session_active": status.HTTP_409_CONFLICT,
         "claude_oauth_invalid_state": status.HTTP_409_CONFLICT,
         "claude_oauth_session_expired": status.HTTP_410_GONE,
-        "claude_oauth_invalid_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
-        "claude_oauth_provider_error": status.HTTP_422_UNPROCESSABLE_ENTITY,
-        "claude_oauth_proxy_required": status.HTTP_422_UNPROCESSABLE_ENTITY,
-    }.get(error.code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        "claude_oauth_invalid_code": status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "claude_oauth_provider_error": status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "claude_oauth_proxy_required": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    }.get(error.code, status.HTTP_422_UNPROCESSABLE_CONTENT)
     return HTTPException(status_code, error.code)
 
 
