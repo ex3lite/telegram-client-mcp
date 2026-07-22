@@ -10,12 +10,13 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, Filter
+from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject, Filter
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BufferedInputFile,
+    ChatMemberUpdated,
     ForceReply,
     InlineQueryResultArticle,
     InputRichBlockThinking,
@@ -72,6 +73,14 @@ MAX_EPHEMERAL_CHARS = 4_096
 MAX_THINKING_DRAFT_CHARS = 8_000
 MAX_INTERACTION_QUESTION_CHARS = 32_000
 KNOWLEDGE_PROGRESS_TEXT = "Разбираюсь и собираю ответ"
+GROUP_WELCOME_TEXT = (
+    "Привет! Меня зовут Братулец. Можешь писать мне тут или в личку.\n\n"
+    "Пиши, если надо что-то узнать про бэкенд или передать бэкенд-разработчикам "
+    "заявку на дополнение."
+)
+GROUP_WELCOME_UNBOUND_SUFFIX = (
+    "\n\nЧтобы я отвечал в этой группе, администратору осталось добавить чат в whitelist панели."
+)
 PROJECT_PREFIX_RE = re.compile(r"^project:([a-z0-9][a-z0-9-]{0,79})\s+", re.IGNORECASE)
 BOT_NAME_ALIASES = (
     "братулец агент",
@@ -573,6 +582,30 @@ class TelegramAdapter:
             )
 
     def _register_handlers(self) -> None:
+        @self.router.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+        async def welcome_group(event: ChatMemberUpdated) -> None:
+            if event.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+                return
+            async with self.database.session() as session:
+                bound_chat_id = await session.scalar(
+                    select(TelegramChat.id)
+                    .join(Project, Project.id == TelegramChat.project_id)
+                    .where(
+                        TelegramChat.telegram_chat_id == event.chat.id,
+                        TelegramChat.enabled.is_(True),
+                        Project.enabled.is_(True),
+                    )
+                    .limit(1)
+                )
+            await self.bot.send_message(
+                chat_id=event.chat.id,
+                text=(
+                    GROUP_WELCOME_TEXT
+                    if bound_chat_id is not None
+                    else GROUP_WELCOME_TEXT + GROUP_WELCOME_UNBOUND_SUFFIX
+                ),
+            )
+
         @self.router.message(Command("start"))
         async def start(message: Message) -> None:
             if message.from_user is None or message.chat.type != ChatType.PRIVATE:
@@ -1109,6 +1142,11 @@ async def _message_context(
         )
         .order_by(TelegramChat.message_thread_id.desc().nullslast())
     )
+    if message.chat.type != ChatType.PRIVATE and chat_id is None:
+        raise ServiceError(
+            "chat_unavailable",
+            "Этот чат не подключён к проекту. Добавьте его в whitelist панели.",
+        )
     return MessageContext(
         project=project,
         user_id=user_id,

@@ -641,6 +641,78 @@ async def test_ephemeral_command_and_answer_keep_receiver_scope(
 
 
 @pytest.mark.asyncio
+async def test_bot_join_sends_group_welcome_and_enables_membership_updates(
+    adapter: TelegramAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSession:
+        async def scalar(self, _statement: object) -> object:
+            return uuid4()
+
+    @asynccontextmanager
+    async def session() -> AsyncIterator[FakeSession]:
+        yield FakeSession()
+
+    monkeypatch.setattr(adapter.database, "session", session)
+    adapter.bot.send_message = AsyncMock(return_value=SimpleNamespace())  # type: ignore[method-assign]
+    payload = {
+        "update_id": 20,
+        "my_chat_member": {
+            "chat": {"id": -100, "type": "supergroup", "title": "Developers"},
+            "from": {"id": 777, "is_bot": False, "first_name": "Admin"},
+            "date": 0,
+            "old_chat_member": {
+                "status": "left",
+                "user": {"id": 999, "is_bot": True, "first_name": "Братулец"},
+            },
+            "new_chat_member": {
+                "status": "member",
+                "user": {"id": 999, "is_bot": True, "first_name": "Братулец"},
+            },
+        },
+    }
+
+    await adapter.process_raw_update(payload)
+
+    assert "my_chat_member" in adapter.allowed_updates()
+    call = adapter.bot.send_message.await_args
+    assert call.kwargs["chat_id"] == -100
+    assert "Меня зовут Братулец" in call.kwargs["text"]
+    assert "узнать про бэкенд" in call.kwargs["text"]
+    assert "whitelist" not in call.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_unbound_group_context_is_rejected() -> None:
+    class FakeResult:
+        def one_or_none(self) -> tuple[object, object]:
+            return SimpleNamespace(), SimpleNamespace()
+
+    class FakeSession:
+        async def execute(self, _statement: object) -> FakeResult:
+            return FakeResult()
+
+        async def scalar(self, _statement: object) -> None:
+            return None
+
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
+        message_thread_id=None,
+    )
+
+    with pytest.raises(telegram_module.ServiceError) as error:
+        await telegram_module._message_context(
+            FakeSession(),
+            SimpleNamespace(id=uuid4()),
+            uuid4(),
+            message,
+            telegram_user_id=777,
+        )
+
+    assert error.value.code == "chat_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_knowledge_error_never_exposes_internal_failure_detail(
     adapter: TelegramAdapter,
 ) -> None:

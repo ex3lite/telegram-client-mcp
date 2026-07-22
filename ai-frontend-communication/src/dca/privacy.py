@@ -51,6 +51,21 @@ _SECRET_RE = re.compile(
     "|".join(f"(?P<p{index}>{pattern})" for index, (_, pattern) in enumerate(_SECRET_PATTERNS)),
     re.IGNORECASE | re.MULTILINE,
 )
+_INTERNAL_SERVER_PATH_RE = re.compile(
+    r"(?<![\w/])/(?:etc|opt|srv|root|home|run|mnt|var/(?:lib|log|backups?))"
+    r"(?:/[A-Za-z0-9._~@%+=:,${}-]+)+"
+)
+_ENV_IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+_SENSITIVE_ENV_IDENTIFIER_RE = re.compile(
+    r"\b(?:[A-Z][A-Z0-9]*_)*(?:PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE_KEY|ACCESS_KEY|"
+    r"SIGNING_KEY|API_KEY|HMAC_KEY|PEPPER|CREDENTIALS?|DATABASE_URL|REDIS_URL|PROXY_URL)\b"
+)
+_ENV_INVENTORY_CONTEXT_RE = re.compile(
+    r"(?<![\w.])(?:\.env(?:\.[a-z0-9_-]+)?|[a-z0-9_-]+\.env)(?![\w.])|"
+    r"\b(?:env(?:ironment)?\s+var(?:iable)?s?|environment\s+variables?)\b|"
+    r"\bпеременн\w*\s+окружени\w*\b|\benv\b",
+    re.IGNORECASE,
+)
 
 _SECRET_REQUEST_TARGET_PATTERNS = (
     (
@@ -160,3 +175,35 @@ def sanitize_text(text: str, *, level: PrivacyLevel, location: str) -> PrivacyRe
         findings.append({"kind": kind, "location": location, "action": action})
     chunks.append(text[cursor:])
     return PrivacyResult(text="".join(chunks), findings=findings, blocked=level == "strict")
+
+
+def sanitize_agent_output(text: str, *, level: PrivacyLevel, location: str) -> PrivacyResult:
+    """Hide secret values plus internal paths and environment metadata from agent output."""
+    result = sanitize_text(text, level=level, location=location)
+    if result.blocked:
+        return result
+    identifiers = list(_ENV_IDENTIFIER_RE.finditer(result.text))
+    redact_inventory = _ENV_INVENTORY_CONTEXT_RE.search(result.text) is not None
+    spans = {
+        (match.start(), match.end(), "internal_server_path")
+        for match in _INTERNAL_SERVER_PATH_RE.finditer(result.text)
+    }
+    spans.update(
+        (match.start(), match.end(), "environment_metadata")
+        for match in identifiers
+        if redact_inventory or _SENSITIVE_ENV_IDENTIFIER_RE.fullmatch(match.group())
+    )
+    if not spans:
+        return result
+
+    chunks: list[str] = []
+    findings = list(result.findings)
+    cursor = 0
+    for start, end, kind in sorted(spans):
+        if start < cursor:
+            continue
+        chunks.extend((result.text[cursor:start], f"[REDACTED:{kind}]"))
+        cursor = end
+        findings.append({"kind": kind, "location": location, "action": "redacted"})
+    chunks.append(result.text[cursor:])
+    return PrivacyResult(text="".join(chunks), findings=findings, blocked=result.blocked)

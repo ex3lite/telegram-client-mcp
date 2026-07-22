@@ -5,7 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from dca.domain import AskUserInput, KnowledgeAnswer, KnowledgeArtifact, utcnow
-from dca.privacy import sanitize_text, secret_extraction_request
+from dca.privacy import sanitize_agent_output, sanitize_text, secret_extraction_request
 from dca.service import ServiceError, sanitize_clarification_request
 from dca.worker import sanitize_knowledge_answer
 
@@ -56,6 +56,35 @@ def test_balanced_redacts_without_retaining_secret_value() -> None:
     assert result.blocked is False
 
 
+def test_agent_output_hides_env_inventory_and_server_paths_without_false_positives() -> None:
+    result = sanitize_agent_output(
+        "Файл /srv/kakadudocs/.env содержит POSTGRES_PASSWORD, PASSKEY_ORIGINS и "
+        "INFERENCE_BASE_URL. Значения не показываю.",
+        level="strict",
+        location="answer_markdown",
+    )
+
+    assert result.blocked is False
+    assert "/srv/kakadudocs/.env" not in result.text
+    assert "POSTGRES_PASSWORD" not in result.text
+    assert "PASSKEY_ORIGINS" not in result.text
+    assert "INFERENCE_BASE_URL" not in result.text
+    assert {finding["kind"] for finding in result.findings} == {
+        "environment_metadata",
+        "internal_server_path",
+    }
+
+    public_contract = "GET /v1/avatars emits FAMILY_MEMBER_UPDATED; DCA_PUBLIC_URL is public."
+    assert (
+        sanitize_agent_output(
+            public_contract,
+            level="strict",
+            location="answer_markdown",
+        ).text
+        == public_contract
+    )
+
+
 @pytest.mark.parametrize(
     ("question", "expected_kind"),
     [
@@ -78,6 +107,7 @@ def test_secret_extraction_guard_matches_only_direct_value_requests(
         "Как безопасно хранить API key в Android?",
         "Как ротировать токен бота?",
         "Почему нельзя коммитить .env?",
+        "Что такое env и что в нём может быть?",
         "Покажи пример заголовка Authorization с плейсхолдером",
         "Проверь код валидации пароля пользователя",
     ],

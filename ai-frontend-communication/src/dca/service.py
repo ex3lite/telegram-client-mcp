@@ -43,7 +43,7 @@ from dca.domain import (
     has_explicit_backend_request_intent,
     utcnow,
 )
-from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
+from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_agent_output, sanitize_text
 
 SYSTEM_SECRET_CLAUDE_OAUTH = "claude_oauth_token"  # noqa: S105 - database key, not a secret
 _MARKDOWN_ATTACHMENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md")
@@ -233,13 +233,13 @@ async def create_agent_message(
     if not project_settings.enabled:
         raise ServiceError("agent_disabled", "The project agent is disabled")
     privacy_level = cast(PrivacyLevel, project_settings.privacy_level)
-    text_result = sanitize_text(
+    text_result = sanitize_agent_output(
         text_markdown,
         level=privacy_level,
         location="agent_message.text",
     )
     attachment_result = (
-        sanitize_text(
+        sanitize_agent_output(
             attachment_markdown,
             level=privacy_level,
             location="agent_message.attachment",
@@ -1016,12 +1016,12 @@ async def create_agent_change_request(
     if existing is not None:
         return existing, False
 
-    title = sanitize_text(
+    title = sanitize_agent_output(
         proposal.title,
         level="balanced",
         location="change_request.title",
     ).text
-    summary = sanitize_text(
+    summary = sanitize_agent_output(
         proposal.summary,
         level="balanced",
         location="change_request.agent_summary",

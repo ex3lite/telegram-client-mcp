@@ -153,12 +153,23 @@ def test_stream_privacy_holds_unfinished_secret_tokens() -> None:
         level="strict",
         location="thinking",
     )
+    metadata, metadata_findings = sanitize_stream_text(
+        "Файл /etc/dca/dca.env содержит DCA_SESSION_SEC",
+        level="strict",
+        location="answer",
+    )
 
     assert partial == "Проверяю"
     assert "sk-ant" not in partial
     assert findings == []
     assert private_key == "До ключа [REDACTED:private_key]"
     assert key_findings[0]["kind"] == "private_key"
+    assert "/etc/dca" not in metadata
+    assert "DCA_SESSION_SEC" not in metadata
+    assert {finding["kind"] for finding in metadata_findings} == {
+        "environment_metadata",
+        "internal_server_path",
+    }
 
 
 @pytest.mark.asyncio

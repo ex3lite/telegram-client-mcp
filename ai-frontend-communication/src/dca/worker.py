@@ -63,7 +63,13 @@ from dca.memory import (
     load_conversation_context,
     upsert_conversation_memory,
 )
-from dca.privacy import SECURITY_GUARD_ROLE, PrivacyFinding, PrivacyLevel, sanitize_text
+from dca.privacy import (
+    SECURITY_GUARD_ROLE,
+    PrivacyFinding,
+    PrivacyLevel,
+    sanitize_agent_output,
+    sanitize_text,
+)
 from dca.service import (
     SYSTEM_SECRET_CLAUDE_OAUTH,
     ServiceError,
@@ -217,7 +223,7 @@ def sanitize_stream_text(
     location: str,
 ) -> tuple[str, list[PrivacyFinding]]:
     """Redact complete findings and hold the unfinished token at the stream edge."""
-    result = sanitize_text(value, level=level, location=location)
+    result = sanitize_agent_output(value, level=level, location=location)
     private_key_start = value.find("-----BEGIN")
     if (
         not result.findings
@@ -687,13 +693,13 @@ class Worker:
             if agent_settings.privacy_level not in {"strict", "balanced"}:
                 raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
             level = cast(PrivacyLevel, agent_settings.privacy_level)
-            text_result = sanitize_text(
+            text_result = sanitize_agent_output(
                 message.text_markdown,
                 level=level,
                 location="agent_message.text_markdown",
             )
             attachment_result = (
-                sanitize_text(
+                sanitize_agent_output(
                     message.attachment_markdown,
                     level=level,
                     location=f"agent_message.attachment:{message.attachment_name}",
@@ -1953,20 +1959,24 @@ def sanitize_knowledge_answer(
     level: PrivacyLevel,
 ) -> tuple[KnowledgeAnswer, list[PrivacyFinding], bool]:
     findings: list[PrivacyFinding] = []
-    answer_result = sanitize_text(answer.answer_markdown, level=level, location="answer_markdown")
+    answer_result = sanitize_agent_output(
+        answer.answer_markdown,
+        level=level,
+        location="answer_markdown",
+    )
     findings.extend(answer_result.findings)
 
     uncertainty: list[str] = []
     blocked = answer_result.blocked
     for index, item in enumerate(answer.uncertainty):
-        result = sanitize_text(item, level=level, location=f"uncertainty[{index}]")
+        result = sanitize_agent_output(item, level=level, location=f"uncertainty[{index}]")
         uncertainty.append(result.text)
         findings.extend(result.findings)
         blocked = blocked or result.blocked
 
     artifacts: list[KnowledgeArtifact] = []
     for artifact in answer.artifacts:
-        result = sanitize_text(
+        result = sanitize_agent_output(
             artifact.content,
             level=level,
             location=f"artifact:{artifact.name}",
@@ -1977,12 +1987,12 @@ def sanitize_knowledge_answer(
 
     change_request: AgentChangeRequestProposal | None = None
     if answer.change_request is not None:
-        title_result = sanitize_text(
+        title_result = sanitize_agent_output(
             answer.change_request.title,
             level=level,
             location="change_request.title",
         )
-        summary_result = sanitize_text(
+        summary_result = sanitize_agent_output(
             answer.change_request.summary,
             level=level,
             location="change_request.summary",
