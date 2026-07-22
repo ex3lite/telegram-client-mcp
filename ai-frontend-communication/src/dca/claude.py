@@ -239,7 +239,8 @@ class ClaudeOAuthManager:
         normalized_code = _validate_oauth_code(code)
         session = await self._begin_completion(owner_id, session_id)
         try:
-            await _write_pty(session.master_fd, normalized_code.encode() + b"\n")
+            # Claude Code's Ink prompt runs the TTY in raw mode, where Enter is CR.
+            await _write_pty(session.master_fd, normalized_code.encode() + b"\r")
             provider_value = await self._read_until(
                 session,
                 _extract_oauth_value,

@@ -32,6 +32,7 @@ def write_fake_setup_token_cli(path: Path) -> None:
 import os
 import sys
 import time
+import tty
 
 blocked = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 if any(name in os.environ for name in blocked):
@@ -50,7 +51,14 @@ print(
     "Open URL\\033]8;;\\033\\\\"
 )
 print("Paste\\033[8Gcode\\033[13Ghere\\033[18Gif\\033[21Gprompted\\033[30G>", flush=True)
-code = sys.stdin.readline().strip()
+tty.setraw(sys.stdin.fileno())
+code_bytes = bytearray()
+while True:
+    character = os.read(sys.stdin.fileno(), 1)
+    if character == b"\\r":
+        break
+    code_bytes.extend(character)
+code = code_bytes.decode()
 if code not in {"one-time-code", "invalid-provider-token"}:
     print("Invalid code", flush=True)
     raise SystemExit(5)
