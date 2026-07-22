@@ -55,6 +55,16 @@ def test_knowledge_concurrency_defaults_to_five_and_uses_env(monkeypatch) -> Non
         Settings(knowledge_concurrency=6)
 
 
+def test_worker_entrypoint_treats_sigint_as_clean_shutdown(monkeypatch) -> None:
+    def interrupted(coroutine: Any) -> None:
+        coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker_module.asyncio, "run", interrupted)
+
+    worker_module.run()
+
+
 def test_interaction_agent_role_is_server_marker_only() -> None:
     guarded = SimpleNamespace(source_ref={"agent_role": "bydlo_guard"})
     ordinary = SimpleNamespace(source_ref={"agent_role": "admin", "guard_kinds": ["token"]})
