@@ -244,18 +244,7 @@ async function showCodeStep() {
 function normalizeOauthCode(value: string): string | null {
   const text = value.trim();
   const codeAndState = text.match(/([A-Za-z0-9_-]{16,}#[A-Za-z0-9_-]{16,})/);
-  if (codeAndState?.[1]) return codeAndState[1];
-
-  const callback = text.match(/https:\/\/platform\.claude\.com\/oauth\/code\/callback\?[^\s<>"']+/)?.[0];
-  if (!callback) return null;
-  try {
-    const url = new URL(callback.replace(/[\])},.;]+$/, ""));
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state");
-    return code && state ? `${code}#${state}` : null;
-  } catch {
-    return null;
-  }
+  return codeAndState?.[1] ?? null;
 }
 
 onBeforeUnmount(() => {
@@ -427,7 +416,7 @@ const completeOauth = useMutation({
 function submitOauthCode() {
   const normalized = normalizeOauthCode(oauthCode.value);
   if (!normalized) {
-    oauthCodeError.value = "Вставьте code#state или полную callback-ссылку со страницы Anthropic.";
+    oauthCodeError.value = "Вставьте код целиком — вместе с частью после #.";
     void nextTick(() => oauthCodeInput.value?.focus());
     return;
   }
@@ -569,7 +558,7 @@ const disconnectClaude = useMutation({
             <span class="oauth-stage__number" aria-hidden="true">02</span>
             <div class="oauth-stage__content">
               <h4 id="oauth-stage-two-title">Вставьте ответ Anthropic</h4>
-              <p>Подойдёт строка <code>code#state</code>, полная callback-ссылка или весь текст со страницы.</p>
+              <p>Скопируйте код со страницы Anthropic целиком. Часть после <code>#</code> обязательна.</p>
 
               <div v-if="completeOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
                 <strong>Этот код не сработал</strong>
@@ -588,13 +577,13 @@ const disconnectClaude = useMutation({
                     maxlength="4096"
                     rows="3"
                     spellcheck="false"
-                    placeholder="Вставьте code#state или callback-ссылку"
+                    placeholder="Вставьте код целиком"
                     :aria-invalid="Boolean(oauthCodeError)"
                     :aria-describedby="oauthCodeError ? 'oauth-code-help oauth-code-error' : 'oauth-code-help'"
                     required
                     @input="oauthCodeError = ''"
                   ></textarea>
-                  <small id="oauth-code-help">Панель сама извлечёт code#state. Повторно этот код использовать нельзя.</small>
+                  <small id="oauth-code-help">Панель передаст код в Claude Code без обрезки. Повторно он не используется.</small>
                 </label>
                 <p v-if="oauthCodeError" id="oauth-code-error" class="inline-error" role="alert">{{ oauthCodeError }}</p>
                 <div class="oauth-stage__actions oauth-stage__actions--submit">

@@ -1076,7 +1076,15 @@ def _extract_oauth_value(raw: bytes) -> str | None:
         )
     )
     for anchor in reversed(anchor_matches):
-        token = _CLAUDE_SETUP_TOKEN_RE.search(text, anchor.end())
+        end = re.search(
+            r"Store\s+this\s+token\s+securely\.",
+            text[anchor.end() :],
+            flags=re.IGNORECASE,
+        )
+        if end is None:
+            continue
+        wrapped = "".join(text[anchor.end() : anchor.end() + end.start()].split())
+        token = _CLAUDE_SETUP_TOKEN_RE.search(wrapped)
         if token is not None:
             return token.group(0)
     return None

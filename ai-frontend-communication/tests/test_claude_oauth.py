@@ -75,14 +75,16 @@ print(
     flush=True,
 )
 print("----------------------------------------", flush=True)
-print("Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>", flush=True)
 time.sleep(0.05)
 token = (
     "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890"
     if code == "one-time-code"
     else "long-lived-but-not-a-setup-token-value"
 )
-print(token, flush=True)
+print(token[:36], flush=True)
+print("\\033[1C\\033[1B" + token[36:], flush=True)
+print("Store this token securely. You won't be able to see it again.", flush=True)
+print("Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>", flush=True)
 """
     )
     path.chmod(0o700)
