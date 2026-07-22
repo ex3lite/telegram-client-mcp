@@ -903,19 +903,16 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
         AsyncMock(return_value=settings),
     )
     monkeypatch.setattr(worker_module, "load_system_secret", AsyncMock(return_value="oauth"))
-    monkeypatch.setattr(
-        worker_module,
-        "load_live_requester_profile",
-        AsyncMock(
-            return_value={
-                "role": "frontend",
-                "stack": "JavaScript",
-                "language": "ru",
-                "knowledge_scope": "integration",
-                "can_create_requests": True,
-            }
-        ),
+    load_profile = AsyncMock(
+        return_value={
+            "role": "frontend",
+            "stack": "JavaScript",
+            "language": "ru",
+            "knowledge_scope": "integration",
+            "can_create_requests": True,
+        }
     )
+    monkeypatch.setattr(worker_module, "load_live_requester_profile", load_profile)
     create_request = AsyncMock(
         side_effect=ServiceError(
             "request_intent_required",
@@ -938,6 +935,7 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
     assert interaction.provider_metadata["document_requested"] is False
     assert interaction.provider_metadata["stream_privacy_findings"] == 2
     assert interaction.provider_metadata["proposal_suppressed"] is True
+    assert load_profile.await_count == 4
     create_request.assert_awaited_once()
 
 

@@ -1033,7 +1033,6 @@ class Worker:
 
         async def stream_answer(answer_markdown: str, thinking: str) -> None:
             nonlocal heartbeat, last_stream_at, latest_stream_answer, latest_stream_thinking
-            await ensure_policy_current()
             safe_answer_stream, answer_stream_findings = sanitize_stream_text(
                 answer_markdown,
                 level=cast(PrivacyLevel, agent_settings.privacy_level),
@@ -1055,6 +1054,7 @@ class Worker:
             now = asyncio.get_running_loop().time()
             if now - last_stream_at < KNOWLEDGE_STREAM_INTERVAL_SECONDS:
                 return
+            await ensure_policy_current()
             last_stream_at = now
             try:
                 durable = await refresh_stream()
