@@ -1,0 +1,9 @@
+ALTER TABLE repositories
+    DROP CONSTRAINT ck_repository_sync_generation,
+    DROP CONSTRAINT ck_repository_auto_sync_source,
+    DROP CONSTRAINT uq_repositories_project_github_repository,
+    DROP COLUMN last_webhook_commit,
+    DROP COLUMN last_webhook_at,
+    DROP COLUMN sync_generation,
+    DROP COLUMN auto_sync_enabled,
+    DROP COLUMN github_repository;

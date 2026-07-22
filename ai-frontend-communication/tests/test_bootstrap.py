@@ -1,3 +1,5 @@
+import os
+import stat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -5,7 +7,7 @@ from uuid import UUID
 import pytest
 
 import dca.bootstrap as bootstrap_module
-from dca.bootstrap import build_parser
+from dca.bootstrap import _repository_credential_file_is_secure, build_parser
 from dca.config import Settings
 
 
@@ -46,6 +48,34 @@ def test_link_user_accepts_project_profile() -> None:
     assert args.department == "Mobile"
     assert args.stack == "Android / Kotlin"
     assert args.role is None
+
+
+def test_existing_repository_can_enable_github_auto_sync() -> None:
+    args = build_parser().parse_args(
+        [
+            "repository-auto-sync",
+            "--project-slug",
+            "backend",
+            "--name",
+            "backend_ai",
+            "--github-repository",
+            "Matrena-VPN/backend_ai",
+        ]
+    )
+
+    assert args.project_slug == "backend"
+    assert args.name == "backend_ai"
+    assert args.github_repository == "Matrena-VPN/backend_ai"
+    assert args.disable is False
+
+
+def test_repository_credentials_require_root_service_group_0640() -> None:
+    def metadata(mode: int, uid: int, gid: int) -> os.stat_result:
+        return os.stat_result((stat.S_IFREG | mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+    assert _repository_credential_file_is_secure(metadata(0o640, 0, 987), service_gid=987)
+    assert not _repository_credential_file_is_secure(metadata(0o600, 0, 0), service_gid=987)
+    assert not _repository_credential_file_is_secure(metadata(0o644, 0, 987), service_gid=987)
 
 
 def test_admin_key_cli_accepts_optional_uuid() -> None:

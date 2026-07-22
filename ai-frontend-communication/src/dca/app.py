@@ -63,16 +63,18 @@ from dca.db import (
     SystemSecret,
     User,
     append_audit,
-    enqueue_job,
+    enqueue_repository_sync,
 )
 from dca.domain import (
     ChangeRequestStatus,
     ClarificationStatus,
     JobStatus,
+    RepositoryStatus,
     utcnow,
 )
 from dca.mcp import MCP_TOOL_SCOPES, build_mcp, generate_service_token
 from dca.privacy import sanitize_text
+from dca.repositories import normalize_github_repository, verify_github_webhook_signature
 from dca.service import (
     SYSTEM_SECRET_CLAUDE_OAUTH,
     ServiceError,
@@ -88,6 +90,29 @@ from dca.worker import configure_logging
 log = structlog.get_logger()
 SESSION_COOKIE = "dca_admin"
 SESSION_MAX_AGE = 180 * 24 * 60 * 60
+
+
+async def read_capped_request_body(
+    request: Request,
+    *,
+    limit: int,
+    too_large_detail: str,
+) -> bytes:
+    content_length = request.headers.get("content-length")
+    try:
+        declared_length = int(content_length) if content_length else 0
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_content_length") from exc
+    if declared_length < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_content_length")
+    if declared_length > limit:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, too_large_detail)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, too_large_detail)
+        body.extend(chunk)
+    return bytes(body)
 
 
 class LoginInput(BaseModel):
@@ -577,12 +602,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or not secrets.compare_digest(expected_secret, x_telegram_bot_api_secret_token)
         ):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_webhook_secret")
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > settings.max_telegram_body_bytes:
-            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "update_too_large")
-        body = await request.body()
-        if len(body) > settings.max_telegram_body_bytes:
-            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "update_too_large")
+        body = await read_capped_request_body(
+            request,
+            limit=settings.max_telegram_body_bytes,
+            too_large_detail="update_too_large",
+        )
         try:
             payload = orjson.loads(body)
             payload["update_id"] = int(payload["update_id"])
@@ -592,6 +616,124 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with database.session() as session:
             await ingest_telegram_update(session, telegram, payload, actor_id="webhook")
         return {"ok": True}
+
+    @app.post(
+        "/webhooks/github",
+        status_code=status.HTTP_202_ACCEPTED,
+        include_in_schema=False,
+    )
+    async def github_webhook(
+        request: Request,
+        x_hub_signature_256: Annotated[
+            str | None, Header(alias="X-Hub-Signature-256")
+        ] = None,
+        x_github_event: Annotated[str | None, Header(alias="X-GitHub-Event")] = None,
+        x_github_delivery: Annotated[str | None, Header(alias="X-GitHub-Delivery")] = None,
+    ) -> dict[str, Any]:
+        secret = settings.github_webhook_secret.get_secret_value()
+        if not secret:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "github_webhook_not_configured"
+            )
+        body = await read_capped_request_body(
+            request,
+            limit=settings.max_github_webhook_body_bytes,
+            too_large_detail="payload_too_large",
+        )
+        if not verify_github_webhook_signature(secret, body, x_hub_signature_256):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_webhook_signature")
+        if not x_github_delivery or re.fullmatch(r"[A-Za-z0-9-]{1,128}", x_github_delivery) is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_delivery_id")
+        try:
+            payload = orjson.loads(body)
+            full_name = payload["repository"]["full_name"]
+            if not isinstance(full_name, str):
+                raise ValueError("repository full_name must be a string")
+            repository_name = normalize_github_repository(full_name)
+        except (KeyError, TypeError, ValueError, orjson.JSONDecodeError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_github_payload"
+            ) from exc
+
+        async with database.session() as session:
+            repositories = list(
+                await session.scalars(
+                    select(Repository)
+                    .where(Repository.github_repository == repository_name)
+                    .order_by(Repository.id)
+                    .with_for_update()
+                )
+            )
+            if not repositories:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "repository_not_found")
+            received_at = utcnow()
+            for repository in repositories:
+                repository.last_webhook_at = received_at
+            if x_github_event == "ping":
+                return {"ok": True, "queued": False, "reason": "ping"}
+            if x_github_event != "push":
+                return {"ok": True, "queued": False, "reason": "event_ignored"}
+            commit = payload.get("after")
+            if not isinstance(commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_push_commit")
+            commit = commit.casefold()
+            if payload.get("deleted") is True or commit == "0" * 40:
+                return {"ok": True, "queued": False, "reason": "branch_deleted"}
+            payload_digest = hashlib.sha256(body).hexdigest()
+            jobs: list[dict[str, Any]] = []
+            enabled_count = 0
+            for repository in repositories:
+                if (
+                    not repository.auto_sync_enabled
+                    or repository.status == RepositoryStatus.DISABLED.value
+                ):
+                    continue
+                enabled_count += 1
+                expected_ref = f"refs/heads/{repository.default_branch}"
+                if payload.get("ref") != expected_ref:
+                    continue
+                repository.last_webhook_commit = commit
+                deduplication_key = f"github:{repository.id}:{payload_digest}"
+                job, queued = await enqueue_repository_sync(
+                    session,
+                    repository=repository,
+                    source="github",
+                    requested_commit=commit,
+                    deduplication_key=deduplication_key,
+                )
+                if queued:
+                    if repository.status != RepositoryStatus.SYNCING.value:
+                        repository.status = RepositoryStatus.STALE.value
+                    await append_audit(
+                        session,
+                        event_type="repository.sync_requested",
+                        correlation_id=f"github:{x_github_delivery}",
+                        actor_type="github",
+                        actor_id=repository_name,
+                        project_id=repository.project_id,
+                        subject_type="repository",
+                        subject_id=str(repository.id),
+                        payload={"commit": commit, "ref": expected_ref, "source": "webhook"},
+                    )
+                jobs.append(
+                    {
+                        "repository_id": str(repository.id),
+                        "job_id": str(job.id),
+                        "status": job.status,
+                        "queued": queued,
+                    }
+                )
+            if not jobs:
+                reason = "auto_sync_disabled" if enabled_count == 0 else "branch_ignored"
+                return {"ok": True, "queued": False, "reason": reason}
+        first_job = jobs[0]
+        return {
+            "ok": True,
+            "queued": any(item["queued"] for item in jobs),
+            "job_id": first_job["job_id"],
+            "status": first_job["status"],
+            "jobs": jobs,
+        }
 
     @app.get("/api/v1/projects")
     async def list_projects(
@@ -1336,7 +1478,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[dict[str, Any]]:
         async with database.session() as session:
             rows = list(await session.scalars(select(Repository).order_by(Repository.name)))
-        return [serialize_repository(row) for row in rows]
+        return [serialize_repository(row, settings) for row in rows]
 
     @app.post("/api/v1/repositories/{repository_id}/sync", status_code=status.HTTP_202_ACCEPTED)
     async def sync_repository(
@@ -1350,6 +1492,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if repository is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "repository_not_found")
+            if repository.status == RepositoryStatus.DISABLED.value:
+                raise HTTPException(status.HTTP_409_CONFLICT, "repository_disabled")
             job = await session.scalar(
                 select(Job)
                 .where(
@@ -1368,12 +1512,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if job is not None:
                 return {"job_id": str(job.id), "status": job.status}
-            job = await enqueue_job(
+            job, _created = await enqueue_repository_sync(
                 session,
-                kind="repository.sync",
-                payload={"repository_id": str(repository_id)},
+                repository=repository,
+                source="admin",
                 deduplication_key=f"repository:{repository_id}:sync:{secrets.token_hex(8)}",
-                max_attempts=3,
             )
             await append_audit(
                 session,
@@ -1685,7 +1828,7 @@ def serialize_request(row: ChangeRequest) -> dict[str, Any]:
     }
 
 
-def serialize_repository(row: Repository) -> dict[str, Any]:
+def serialize_repository(row: Repository, settings: Settings) -> dict[str, Any]:
     safe_url = row.ssh_url.split("@", 1)[-1]
     return {
         "id": str(row.id),
@@ -1694,9 +1837,23 @@ def serialize_repository(row: Repository) -> dict[str, Any]:
         "ssh_url": safe_url,
         "default_branch": row.default_branch,
         "allowed_paths": row.allowed_paths,
+        "github_repository": row.github_repository,
+        "auto_sync_enabled": row.auto_sync_enabled,
+        "auto_sync_mode": (
+            "webhook_reconcile"
+            if row.auto_sync_enabled
+            and bool(settings.github_webhook_secret.get_secret_value())
+            else "reconcile"
+            if row.auto_sync_enabled
+            else "disabled"
+        ),
+        "github_webhook_url": settings.github_webhook_url,
+        "repository_reconcile_seconds": settings.repository_reconcile_seconds,
         "current_commit": row.current_commit,
         "status": row.status,
         "last_synced_at": row.last_synced_at,
+        "last_webhook_at": row.last_webhook_at,
+        "last_webhook_commit": row.last_webhook_commit,
         "last_error": row.last_error,
     }
 

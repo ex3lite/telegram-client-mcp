@@ -39,8 +39,9 @@ from dca.db import (
     TelegramUpdate,
     append_audit,
     enqueue_job,
+    enqueue_repository_sync,
 )
-from dca.domain import JobStatus, KnowledgeAnswer, KnowledgeArtifact, utcnow
+from dca.domain import JobStatus, KnowledgeAnswer, KnowledgeArtifact, RepositoryStatus, utcnow
 from dca.memory import (
     ConversationContext,
     append_conversation_message,
@@ -123,6 +124,7 @@ class Worker:
         self.claude = ClaudeCode(settings)
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}"
         self._last_expiry_sweep = 0.0
+        self._last_repository_reconcile = 0.0
 
     async def run_forever(self) -> None:
         await self.recover_stale_jobs()
@@ -143,6 +145,7 @@ class Worker:
     async def _run_job_loop(self) -> None:
         while True:
             await self._sweep_expired_if_due()
+            await self._reconcile_repositories_if_due()
             job = await self.claim_job()
             if job is None:
                 await asyncio.sleep(self.settings.worker_poll_seconds)
@@ -186,10 +189,49 @@ class Worker:
                         text("SELECT pg_advisory_unlock(:lock_id)"),
                         {"lock_id": TELEGRAM_POLL_LOCK_ID},
                     )
+                except Exception as exc:
+                    log.exception("telegram.poll_lock_release_failed")
+                    await connection.invalidate(exc)
+                else:
                     if released is not True:
                         log.error("telegram.poll_lock_release_failed")
-                except Exception:
-                    log.exception("telegram.poll_lock_release_failed")
+                        await connection.invalidate()
+
+    @asynccontextmanager
+    async def _repository_sync_lock(self, repository_id: UUID) -> AsyncIterator[None]:
+        lock_key = f"dca:repository-sync:{repository_id}"
+        async with self.database.engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+            if acquired is not True:
+                raise ServiceError(
+                    "repository_sync_busy",
+                    "Repository sync is already running",
+                    retryable=True,
+                )
+            try:
+                yield
+            finally:
+                try:
+                    released = await connection.scalar(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": lock_key},
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "repository.sync_lock_release_failed",
+                        repository_id=str(repository_id),
+                    )
+                    await connection.invalidate(exc)
+                else:
+                    if released is not True:
+                        log.error(
+                            "repository.sync_lock_release_failed",
+                            repository_id=str(repository_id),
+                        )
+                        await connection.invalidate()
 
     async def _poll_telegram_forever(self) -> None:
         async with self._telegram_poll_lock():
@@ -336,7 +378,13 @@ class Worker:
                 await self._publish_interaction_error(job, exc.message)
         except ServiceError as exc:
             if exc.retryable:
-                await self._retry(job, exc.code, exc.message)
+                await self._retry(
+                    job,
+                    exc.code,
+                    exc.message,
+                    delay=2 if exc.code == "repository_sync_busy" else None,
+                    consume_attempt=exc.code != "repository_sync_busy",
+                )
             else:
                 await self._fail(job, exc.code, exc.message)
                 if job.kind == "telegram.deliver_agent_message":
@@ -382,7 +430,18 @@ class Worker:
             return await self._publish_interaction(interaction_id)
         if job.kind == "repository.sync":
             repository_id = UUID(job.payload["repository_id"])
-            return await self._sync_repository(repository_id)
+            generation = job.payload.get("generation", 0)
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+                raise ServiceError(
+                    "repository_sync_generation_invalid",
+                    "Repository sync generation is invalid",
+                )
+            return await self._sync_repository(
+                repository_id,
+                generation=generation,
+                requested_commit=job.payload.get("requested_commit"),
+                source=job.payload.get("source", "manual"),
+            )
         raise ServiceError("unknown_job_kind", f"Unsupported job kind: {job.kind}")
 
     async def _deliver_agent_message(self, agent_message_id: UUID) -> dict[str, Any]:
@@ -863,44 +922,170 @@ class Worker:
             "privacy_blocked": blocked,
         }
 
-    async def _sync_repository(self, repository_id: UUID) -> dict[str, Any]:
+    async def _sync_repository(
+        self,
+        repository_id: UUID,
+        *,
+        generation: int = 0,
+        requested_commit: str | None = None,
+        source: str = "manual",
+    ) -> dict[str, Any]:
         async with self.database.session() as session:
-            repository = await session.get(Repository, repository_id)
+            repository = await session.scalar(
+                select(Repository).where(Repository.id == repository_id)
+            )
             if repository is None:
                 raise ServiceError("source_unavailable", "Repository was not found")
-            repository.status = "syncing"
-            await session.flush()
-            session.expunge(repository)
-        try:
-            commit = await self.snapshots.sync(repository)
-            await self.snapshots.materialize(repository, commit)
-        except ClaudeError as exc:
+            if repository.status == RepositoryStatus.DISABLED.value:
+                raise ServiceError("repository_disabled", "Repository synchronization is disabled")
+            if generation < repository.sync_generation:
+                return await self._mark_repository_sync_superseded(
+                    session,
+                    repository,
+                    generation=generation,
+                    source=source,
+                    phase="before_lock",
+                    mark_stale=False,
+                )
+            if generation > repository.sync_generation:
+                raise ServiceError(
+                    "repository_sync_generation_invalid",
+                    "Repository sync generation is ahead of persisted state",
+                )
+
+        async with self._repository_sync_lock(repository_id):
             async with self.database.session() as session:
-                persisted = await session.get(Repository, repository_id)
-                if persisted is not None:
-                    persisted.status = "failed"
+                repository = await session.scalar(
+                    select(Repository).where(Repository.id == repository_id).with_for_update()
+                )
+                if repository is None:
+                    raise ServiceError("source_unavailable", "Repository was not found")
+                if repository.status == RepositoryStatus.DISABLED.value:
+                    raise ServiceError(
+                        "repository_disabled", "Repository synchronization is disabled"
+                    )
+                if generation < repository.sync_generation:
+                    return await self._mark_repository_sync_superseded(
+                        session,
+                        repository,
+                        generation=generation,
+                        source=source,
+                        phase="before_fetch",
+                        mark_stale=repository.status == RepositoryStatus.SYNCING.value,
+                    )
+                if generation != repository.sync_generation:
+                    raise ServiceError(
+                        "repository_sync_generation_invalid",
+                        "Repository sync generation is ahead of persisted state",
+                    )
+                repository.status = RepositoryStatus.SYNCING.value
+                await session.flush()
+                session.expunge(repository)
+            try:
+                commit = await self.snapshots.sync(repository)
+                await self.snapshots.materialize(repository, commit)
+            except ClaudeError as exc:
+                async with self.database.session() as session:
+                    persisted = await session.scalar(
+                        select(Repository)
+                        .where(Repository.id == repository_id)
+                        .with_for_update()
+                    )
+                    if persisted is None:
+                        raise ServiceError(
+                            "source_unavailable", "Repository disappeared"
+                        ) from exc
+                    if generation != persisted.sync_generation:
+                        return await self._mark_repository_sync_superseded(
+                            session,
+                            persisted,
+                            generation=generation,
+                            source=source,
+                            phase="fetch_failed",
+                            mark_stale=True,
+                        )
+                    persisted.status = RepositoryStatus.FAILED.value
                     persisted.last_error = exc.message[:2_000]
-            raise
-        async with self.database.session() as session:
-            persisted = await session.get(Repository, repository_id)
-            if persisted is None:
-                raise ServiceError("source_unavailable", "Repository disappeared")
-            persisted.status = "ready"
-            persisted.current_commit = commit
-            persisted.last_synced_at = utcnow()
-            persisted.last_error = None
-            await append_audit(
-                session,
-                event_type="repository.synced",
-                correlation_id=f"repository:{repository_id}:{commit}",
-                actor_type="system",
-                actor_id="repository-worker",
-                project_id=persisted.project_id,
-                subject_type="repository",
-                subject_id=str(repository_id),
-                payload={"commit": commit},
-            )
-        return {"repository_id": str(repository_id), "commit": commit}
+                raise
+            async with self.database.session() as session:
+                persisted = await session.scalar(
+                    select(Repository).where(Repository.id == repository_id).with_for_update()
+                )
+                if persisted is None:
+                    raise ServiceError("source_unavailable", "Repository disappeared")
+                if generation != persisted.sync_generation:
+                    return await self._mark_repository_sync_superseded(
+                        session,
+                        persisted,
+                        generation=generation,
+                        source=source,
+                        phase="after_materialize",
+                        mark_stale=True,
+                        fetched_commit=commit,
+                    )
+                persisted.status = RepositoryStatus.READY.value
+                persisted.current_commit = commit
+                persisted.last_synced_at = utcnow()
+                persisted.last_error = None
+                await append_audit(
+                    session,
+                    event_type="repository.synced",
+                    correlation_id=f"repository:{repository_id}:{commit}",
+                    actor_type="system",
+                    actor_id="repository-worker",
+                    project_id=persisted.project_id,
+                    subject_type="repository",
+                    subject_id=str(repository_id),
+                    payload={
+                        "commit": commit,
+                        "generation": generation,
+                        "requested_commit": requested_commit,
+                        "source": source,
+                    },
+                )
+            return {
+                "repository_id": str(repository_id),
+                "commit": commit,
+                "generation": generation,
+            }
+
+    @staticmethod
+    async def _mark_repository_sync_superseded(
+        session: Any,
+        repository: Repository,
+        *,
+        generation: int,
+        source: str,
+        phase: str,
+        mark_stale: bool,
+        fetched_commit: str | None = None,
+    ) -> dict[str, Any]:
+        if mark_stale and repository.status != RepositoryStatus.DISABLED.value:
+            repository.status = RepositoryStatus.STALE.value
+        await append_audit(
+            session,
+            event_type="repository.sync_superseded",
+            correlation_id=f"repository:{repository.id}:generation:{generation}",
+            actor_type="system",
+            actor_id="repository-worker",
+            project_id=repository.project_id,
+            subject_type="repository",
+            subject_id=str(repository.id),
+            outcome="superseded",
+            payload={
+                "generation": generation,
+                "current_generation": repository.sync_generation,
+                "fetched_commit": fetched_commit,
+                "phase": phase,
+                "source": source,
+            },
+        )
+        return {
+            "repository_id": str(repository.id),
+            "generation": generation,
+            "current_generation": repository.sync_generation,
+            "superseded": True,
+        }
 
     async def _succeed(self, job: Job, result: dict[str, Any]) -> None:
         async with self.database.session() as session:
@@ -926,24 +1111,28 @@ class Worker:
         detail: str,
         *,
         delay: int | float | None = None,
+        consume_attempt: bool = True,
     ) -> bool:
-        if job.attempts >= job.max_attempts:
+        if consume_attempt and job.attempts >= job.max_attempts:
             await self._fail(job, code, detail)
             return False
         backoff = delay if delay is not None else min(2**job.attempts, 60)
+        values: dict[str, Any] = {
+            "status": JobStatus.RETRY.value,
+            "available_at": utcnow() + timedelta(seconds=backoff),
+            "locked_at": None,
+            "locked_by": None,
+            "last_error_code": code,
+            "last_error_detail": detail[:2_000],
+            "updated_at": utcnow(),
+        }
+        if not consume_attempt:
+            values["attempts"] = Job.attempts - 1
         async with self.database.session() as session:
             await session.execute(
                 update(Job)
                 .where(Job.id == job.id, Job.status == JobStatus.RUNNING.value)
-                .values(
-                    status=JobStatus.RETRY.value,
-                    available_at=utcnow() + timedelta(seconds=backoff),
-                    locked_at=None,
-                    locked_by=None,
-                    last_error_code=code,
-                    last_error_detail=detail[:2_000],
-                    updated_at=utcnow(),
-                )
+                .values(**values)
             )
         log.warning("job.retry", job_id=str(job.id), kind=job.kind, code=code)
         return True
@@ -1052,6 +1241,60 @@ class Worker:
         async with self.database.session() as session:
             for clarification in await list_expired_pending(session):
                 await expire_clarification(session, clarification)
+
+    async def _reconcile_repositories_if_due(self) -> None:
+        loop_now = asyncio.get_running_loop().time()
+        interval = self.settings.repository_reconcile_seconds
+        if loop_now - self._last_repository_reconcile < interval:
+            return
+        self._last_repository_reconcile = loop_now
+        cutoff = utcnow() - timedelta(seconds=interval)
+        bucket = int(utcnow().timestamp()) // interval
+        queued = 0
+        async with self.database.session() as session:
+            repositories = list(
+                await session.scalars(
+                    select(Repository)
+                    .where(
+                        Repository.auto_sync_enabled.is_(True),
+                        Repository.github_repository.is_not(None),
+                        Repository.status != RepositoryStatus.DISABLED.value,
+                        (
+                            Repository.last_synced_at.is_(None)
+                            | (Repository.last_synced_at <= cutoff)
+                        ),
+                    )
+                    .order_by(Repository.id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            for repository in repositories:
+                active_job = await session.scalar(
+                    select(Job)
+                    .where(
+                        Job.kind == "repository.sync",
+                        Job.status.in_(
+                            (
+                                JobStatus.QUEUED.value,
+                                JobStatus.RUNNING.value,
+                                JobStatus.RETRY.value,
+                            )
+                        ),
+                        Job.payload["repository_id"].as_string() == str(repository.id),
+                    )
+                    .limit(1)
+                )
+                if active_job is not None:
+                    continue
+                _, created = await enqueue_repository_sync(
+                    session,
+                    repository=repository,
+                    source="reconcile",
+                    deduplication_key=f"repository:{repository.id}:reconcile:{bucket}",
+                )
+                queued += int(created)
+        if queued:
+            log.info("repository.reconcile_queued", count=queued)
 
     async def _publish_interaction_error(self, job: Job, _message: str) -> None:
         if job.kind != "knowledge.answer":

@@ -69,9 +69,16 @@ export interface Repository {
   ssh_url: string;
   default_branch: string;
   allowed_paths: string[];
+  github_repository: string | null;
+  auto_sync_enabled: boolean;
+  auto_sync_mode: "webhook_reconcile" | "reconcile" | "disabled";
+  github_webhook_url: string;
+  repository_reconcile_seconds: number;
   current_commit: string | null;
   status: "never_synced" | "syncing" | "ready" | "stale" | "failed" | "disabled";
   last_synced_at: string | null;
+  last_webhook_at: string | null;
+  last_webhook_commit: string | null;
   last_error: string | null;
 }
 

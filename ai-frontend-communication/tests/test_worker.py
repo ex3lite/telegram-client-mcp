@@ -22,8 +22,9 @@ from sqlalchemy.exc import SQLAlchemyError
 import dca.worker as worker_module
 from dca.claude import ClaudeError
 from dca.config import Settings
-from dca.db import AgentMessage, Interaction, Job, TelegramChat
+from dca.db import AgentMessage, Interaction, Job, Repository, TelegramChat
 from dca.memory import ConversationContext, ConversationContextMessage
+from dca.service import ServiceError
 from dca.worker import (
     TELEGRAM_EXTERNAL_ACTIONS,
     Worker,
@@ -226,6 +227,158 @@ async def test_polling_refuses_second_consumer() -> None:
     with pytest.raises(RuntimeError, match="already holds the lock"):
         async with worker._telegram_poll_lock():
             pass
+
+
+@pytest.mark.asyncio
+async def test_repository_sync_lock_refuses_busy_repository_without_waiting() -> None:
+    worker = Worker.__new__(Worker)
+    connection = SimpleNamespace(
+        scalar=AsyncMock(return_value=False),
+        invalidate=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def connect():
+        yield connection
+
+    worker.database = SimpleNamespace(engine=SimpleNamespace(connect=connect))
+
+    with pytest.raises(ServiceError) as error:
+        async with worker._repository_sync_lock(uuid4()):
+            pass
+
+    assert error.value.code == "repository_sync_busy"
+    assert error.value.retryable is True
+    assert "pg_try_advisory_lock" in str(connection.scalar.await_args.args[0])
+    connection.invalidate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "unlock_result",
+    [False, RuntimeError("connection lost during unlock")],
+    ids=["unlock-returned-false", "unlock-raised"],
+)
+@pytest.mark.asyncio
+async def test_repository_sync_lock_discards_connection_when_unlock_is_uncertain(
+    unlock_result: bool | Exception,
+) -> None:
+    worker = Worker.__new__(Worker)
+    connection = SimpleNamespace(
+        scalar=AsyncMock(side_effect=[True, unlock_result]),
+        invalidate=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def connect():
+        yield connection
+
+    worker.database = SimpleNamespace(engine=SimpleNamespace(connect=connect))
+
+    async with worker._repository_sync_lock(uuid4()):
+        pass
+
+    if isinstance(unlock_result, Exception):
+        connection.invalidate.assert_awaited_once_with(unlock_result)
+    else:
+        connection.invalidate.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stale_repository_sync_skips_advisory_lock(monkeypatch) -> None:
+    repository = Repository(
+        id=uuid4(),
+        project_id=uuid4(),
+        name="backend_ai",
+        ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+        status="syncing",
+        sync_generation=2,
+    )
+    session_object = SimpleNamespace(scalar=AsyncMock(return_value=repository))
+
+    @asynccontextmanager
+    async def session():
+        yield session_object
+
+    @asynccontextmanager
+    async def unexpected_lock(_: Any):
+        raise AssertionError("stale generation must not contend on the advisory lock")
+        yield
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.snapshots = SimpleNamespace(sync=AsyncMock(), materialize=AsyncMock())
+    worker._repository_sync_lock = unexpected_lock
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+
+    result = await worker._sync_repository(repository.id, generation=1, source="github")
+
+    assert result["superseded"] is True
+    assert result["current_generation"] == 2
+    assert repository.status == "syncing"
+    worker.snapshots.sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disabled_repository_sync_skips_advisory_lock() -> None:
+    repository = Repository(
+        id=uuid4(),
+        project_id=uuid4(),
+        name="backend_ai",
+        ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+        status="disabled",
+        sync_generation=1,
+    )
+    session_object = SimpleNamespace(scalar=AsyncMock(return_value=repository))
+
+    @asynccontextmanager
+    async def session():
+        yield session_object
+
+    @asynccontextmanager
+    async def unexpected_lock(_: Any):
+        raise AssertionError("disabled repository must not acquire the advisory lock")
+        yield
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.snapshots = SimpleNamespace(sync=AsyncMock(), materialize=AsyncMock())
+    worker._repository_sync_lock = unexpected_lock
+
+    with pytest.raises(ServiceError, match="disabled") as error:
+        await worker._sync_repository(repository.id, generation=1, source="admin")
+
+    assert error.value.code == "repository_disabled"
+    worker.snapshots.sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repository_lock_contention_does_not_consume_job_attempt() -> None:
+    worker = Worker.__new__(Worker)
+    worker._dispatch = AsyncMock(
+        side_effect=ServiceError(
+            "repository_sync_busy",
+            "Repository sync is already running",
+            retryable=True,
+        )
+    )
+    worker._retry = AsyncMock(return_value=True)
+    job = Job(
+        id=uuid4(),
+        kind="repository.sync",
+        payload={"repository_id": str(uuid4())},
+        attempts=3,
+        max_attempts=3,
+    )
+
+    await worker.process(job)
+
+    worker._retry.assert_awaited_once_with(
+        job,
+        "repository_sync_busy",
+        "Repository sync is already running",
+        delay=2,
+        consume_attempt=False,
+    )
 
 
 @pytest.mark.asyncio

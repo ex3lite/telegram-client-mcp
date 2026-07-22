@@ -238,12 +238,9 @@ class ClaudeOAuthManager:
         normalized_code = _validate_oauth_code(code)
         session = await self._begin_completion(owner_id, session_id)
         try:
-            # Claude Code's Ink prompt runs the TTY in raw mode. Text and Enter must be
-            # separate input events so React commits the pasted code before submit runs.
-            await _write_pty(
-                session.master_fd,
-                b"\x1b[200~" + normalized_code.encode() + b"\x1b[201~",
-            )
+            # Claude Code reads the prompt in raw mode. Send the exact code, then Enter
+            # as a separate input event after Ink has committed the text.
+            await _write_pty(session.master_fd, normalized_code.encode())
             await asyncio.sleep(0.5)
             await _write_pty(session.master_fd, b"\r")
             provider_value = await self._read_until(

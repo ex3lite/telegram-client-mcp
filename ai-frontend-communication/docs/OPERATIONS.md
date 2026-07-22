@@ -12,6 +12,7 @@ Docker Compose remains a local-development option and is not part of the release
 - The dedicated public URL `https://agency.kakaduai.com`, Telegram bot token, Claude subscription
   token and an HTTP(S) CONNECT proxy.
 - A read-only Git deploy key for every repository exposed to the agent.
+- One random GitHub webhook secret shared only with GitHub and DCA.
 
 On `test_ai`, native PostgreSQL and Redis use `127.0.0.1:5433` and `127.0.0.1:6380` so the
 existing container services on 5432/6379 remain untouched. The edge is the
@@ -313,6 +314,52 @@ The service-account token is printed only when first created; store it immediate
 must open the bot and run `/start` before private delivery is possible. Validate the group ID with
 Bot API `getChat` after adding the bot: supergroup IDs normally have the `-100...` form, and an ID
 that returns `chat not found` must not be seeded.
+
+## Repository snapshots and automatic refresh
+
+Create a dedicated read-only deploy key for the repository, add `github.com` to a dedicated
+`known_hosts` file, and register the source with automatic refresh:
+
+Both files must be regular `root:dca 0640` files; bootstrap rejects unreadable or world-readable
+credentials before writing the repository record.
+
+```bash
+sudo dca-deploy bootstrap add-repository \
+  --project-slug backend \
+  --name backend_ai \
+  --ssh-url git@github.com:Matrena-VPN/backend_ai.git \
+  --branch main \
+  --deploy-key-path /etc/dca/keys/backend_ai \
+  --known-hosts-path /etc/dca/keys/github_known_hosts \
+  --github-repository Matrena-VPN/backend_ai \
+  --auto-sync
+```
+
+Generate `DCA_GITHUB_WEBHOOK_SECRET` with `openssl rand -hex 32`. In the GitHub repository settings,
+create a webhook with payload URL `https://agency.kakaduai.com/webhooks/github`, content type
+`application/json`, the same secret, and only **push** events. DCA verifies
+`X-Hub-Signature-256`, accepts only the configured repository and default branch, and deduplicates
+replays by the signed payload digest. A valid push marks the source stale until the worker has fetched and
+materialized the new immutable commit. Existing interactions stay pinned to their captured commit;
+new interactions use the newly published commit.
+
+Every accepted sync receives a monotonically increasing repository generation under a database row
+lock. Workers also hold a PostgreSQL advisory lock while touching the shared Git mirror. Only the
+latest generation may publish `READY` and `current_commit`; an older completion is audited as
+superseded and cannot roll the repository back.
+
+The worker also reconciles opted-in repositories every `DCA_REPOSITORY_RECONCILE_SECONDS` (five
+minutes by default), so one missed GitHub delivery cannot leave the agent on an old commit forever.
+The **Repositories** page shows webhook/reconcile mode, last delivery, requested commit, materialized
+commit and sync errors. The secret is never returned by the API.
+
+Enable the same mechanism for a repository that already exists in the panel:
+
+```bash
+sudo dca-deploy bootstrap repository-auto-sync \
+  --project-slug backend --name backend_ai \
+  --github-repository Matrena-VPN/backend_ai
+```
 
 ## Release gates
 

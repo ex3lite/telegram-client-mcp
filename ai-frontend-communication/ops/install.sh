@@ -12,7 +12,7 @@ id dca >/dev/null 2>&1 || useradd --system --home-dir /var/lib/dca --create-home
 install -d -m 0750 -o dca -g dca \
   /var/lib/dca /var/lib/dca/repositories /var/lib/dca/snapshots /var/lib/dca/.cache
 install -d -m 0750 -o root -g dca /opt/dca/releases /var/backups/dca
-install -d -m 0700 -o root -g root /etc/dca
+install -d -m 0750 -o root -g dca /etc/dca /etc/dca/keys
 install -m 0644 "$APP_DIR/ops/systemd/dca-api.service" /etc/systemd/system/dca-api.service
 install -m 0644 "$APP_DIR/ops/systemd/dca-worker.service" /etc/systemd/system/dca-worker.service
 ln -sfn "$APP_DIR/ops/deploy.sh" /usr/local/sbin/dca-deploy

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import stat
 from uuid import UUID, uuid4
 
 import anyio
@@ -25,6 +27,7 @@ from dca.db import (
 )
 from dca.domain import utcnow
 from dca.mcp import MCP_TOOL_SCOPES, generate_service_token
+from dca.repositories import github_repository_from_url, normalize_github_repository
 from dca.service import admin_key_fingerprint, validate_admin_access_key
 from dca.telegram import TelegramAdapter
 
@@ -34,6 +37,19 @@ def uuid4_argument(value: str) -> UUID:
         return validate_admin_access_key(UUID(value))
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a UUIDv4") from exc
+
+
+def _repository_credential_file_is_secure(
+    metadata: os.stat_result,
+    *,
+    service_gid: int,
+) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == 0
+        and metadata.st_gid == service_gid
+        and stat.S_IMODE(metadata.st_mode) == 0o640
+    )
 
 
 async def seed(args: argparse.Namespace, settings: Settings) -> None:
@@ -213,9 +229,27 @@ async def add_repository(args: argparse.Namespace, settings: Settings) -> None:
                 raise SystemExit("Repository with this name already exists in the project")
             paths = [anyio.Path(args.deploy_key_path), anyio.Path(args.known_hosts_path)]
             for candidate in paths:
-                if not await candidate.is_file():
-                    raise SystemExit(f"File does not exist: {candidate}")
+                try:
+                    metadata = await candidate.stat()
+                except OSError as exc:
+                    raise SystemExit(f"Repository credential is unavailable: {candidate}") from exc
+                if not _repository_credential_file_is_secure(
+                    metadata,
+                    service_gid=os.getgid(),
+                ):
+                    raise SystemExit(
+                        f"Repository credential must be a root:service-group 0640 file: {candidate}"
+                    )
             deploy_key_path, known_hosts_path = [str(await path.resolve()) for path in paths]
+            github_repository = (
+                normalize_github_repository(args.github_repository)
+                if args.github_repository
+                else github_repository_from_url(args.ssh_url)
+            )
+            if args.auto_sync and github_repository is None:
+                raise SystemExit(
+                    "--auto-sync requires a GitHub SSH/HTTPS URL or --github-repository owner/name"
+                )
             repository = Repository(
                 project_id=project.id,
                 name=args.name,
@@ -224,11 +258,62 @@ async def add_repository(args: argparse.Namespace, settings: Settings) -> None:
                 deploy_key_path=deploy_key_path,
                 known_hosts_path=known_hosts_path,
                 allowed_paths=args.allowed_path,
+                github_repository=github_repository,
+                auto_sync_enabled=args.auto_sync,
             )
             session.add(repository)
             await session.flush()
         print(f"repository_id={repository.id}")
         print(f"Queue synchronization with POST /api/v1/repositories/{repository.id}/sync")
+        if repository.auto_sync_enabled:
+            print(f"github_webhook={settings.github_webhook_url}")
+    finally:
+        await database.close()
+
+
+async def configure_repository_auto_sync(args: argparse.Namespace, settings: Settings) -> None:
+    database = Database(settings)
+    try:
+        async with database.session() as session:
+            repository = await session.scalar(
+                select(Repository)
+                .join(Project, Project.id == Repository.project_id)
+                .where(Project.slug == args.project_slug, Repository.name == args.name)
+                .with_for_update()
+            )
+            if repository is None:
+                raise SystemExit("Repository was not found in the project")
+            github_repository = (
+                normalize_github_repository(args.github_repository)
+                if args.github_repository
+                else repository.github_repository
+                or github_repository_from_url(repository.ssh_url)
+            )
+            if not args.disable and github_repository is None:
+                raise SystemExit(
+                    "GitHub mapping is unavailable; pass --github-repository owner/name"
+                )
+            repository.github_repository = github_repository
+            repository.auto_sync_enabled = not args.disable
+            await append_audit(
+                session,
+                event_type="repository.auto_sync_configured",
+                correlation_id=f"bootstrap:repository-auto-sync:{uuid4().hex}",
+                actor_type="system",
+                actor_id="dca-bootstrap",
+                project_id=repository.project_id,
+                subject_type="repository",
+                subject_id=str(repository.id),
+                payload={
+                    "enabled": repository.auto_sync_enabled,
+                    "github_repository": repository.github_repository,
+                },
+            )
+        print(f"repository_id={repository.id}")
+        print(f"auto_sync_enabled={repository.auto_sync_enabled}")
+        print(f"github_repository={repository.github_repository or ''}")
+        if repository.auto_sync_enabled:
+            print(f"github_webhook={settings.github_webhook_url}")
     finally:
         await database.close()
 
@@ -446,6 +531,14 @@ def build_parser() -> argparse.ArgumentParser:
     repository_parser.add_argument("--deploy-key-path", required=True)
     repository_parser.add_argument("--known-hosts-path", required=True)
     repository_parser.add_argument("--allowed-path", action="append", default=[])
+    repository_parser.add_argument("--github-repository")
+    repository_parser.add_argument("--auto-sync", action="store_true")
+
+    repository_sync_parser = subparsers.add_parser("repository-auto-sync")
+    repository_sync_parser.add_argument("--project-slug", required=True)
+    repository_sync_parser.add_argument("--name", required=True)
+    repository_sync_parser.add_argument("--github-repository")
+    repository_sync_parser.add_argument("--disable", action="store_true")
 
     subparsers.add_parser("telegram-setup")
     return parser
@@ -460,6 +553,8 @@ async def async_main(args: argparse.Namespace, settings: Settings) -> None:
         await link_chat(args, settings)
     elif args.command == "add-repository":
         await add_repository(args, settings)
+    elif args.command == "repository-auto-sync":
+        await configure_repository_auto_sync(args, settings)
     elif args.command == "telegram-setup":
         await setup_telegram(settings)
     elif args.command == "admin-key":

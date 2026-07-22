@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import os
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import orjson
 import pytest
 from argon2 import PasswordHasher
 from httpx import ASGITransport, AsyncClient
@@ -18,6 +21,7 @@ from pydantic import SecretStr
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
 
+import dca.worker as worker_module
 from dca.app import create_app
 from dca.bootstrap import revoke_admin_key, upsert_admin_key
 from dca.config import Settings
@@ -37,8 +41,9 @@ from dca.db import (
     TelegramIdentity,
     TelegramUpdate,
     User,
+    enqueue_repository_sync,
 )
-from dca.domain import AskUserInput, ClarificationStatus, JobStatus, utcnow
+from dca.domain import AskUserInput, ClarificationStatus, JobStatus, RepositoryStatus, utcnow
 from dca.service import (
     ServiceError,
     admin_key_fingerprint,
@@ -48,6 +53,7 @@ from dca.service import (
     require_service_scope,
 )
 from dca.telegram import TelegramAdapter, queue_telegram_update, reserve_telegram_update
+from dca.worker import Worker
 
 pytestmark = pytest.mark.integration
 
@@ -587,7 +593,327 @@ async def test_concurrent_repository_sync_reuses_active_job(
             )
         assert len(active_jobs) == 1
         assert audit_count == 1
+        assert active_jobs[0].payload["generation"] == 1
     finally:
         await app.state.telegram.close()
         await app.state.redis.aclose()
         await app.state.database.close()
+
+
+@pytest.mark.asyncio
+async def test_signed_github_push_is_deduplicated_and_marks_repository_stale(
+    database: Database, tmp_path: Path
+) -> None:
+    async with database.session() as session:
+        project = Project(slug=f"webhook-{uuid4().hex[:8]}", name="Webhook")
+        second_project = Project(slug=f"webhook-{uuid4().hex[:8]}", name="Webhook 2")
+        disabled_project = Project(slug=f"webhook-{uuid4().hex[:8]}", name="Webhook off")
+        session.add_all([project, second_project, disabled_project])
+        await session.flush()
+        repository = Repository(
+            project_id=project.id,
+            name="backend_ai",
+            ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+            github_repository="matrena-vpn/backend_ai",
+            auto_sync_enabled=True,
+            status="ready",
+            current_commit="1" * 40,
+        )
+        second_repository = Repository(
+            project_id=second_project.id,
+            name="backend_ai",
+            ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+            github_repository="matrena-vpn/backend_ai",
+            auto_sync_enabled=True,
+            status="ready",
+            current_commit="1" * 40,
+        )
+        disabled_repository = Repository(
+            project_id=disabled_project.id,
+            name="backend_ai_disabled",
+            ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+            github_repository="matrena-vpn/backend_ai",
+            auto_sync_enabled=True,
+            status=RepositoryStatus.DISABLED.value,
+            current_commit="1" * 40,
+        )
+        session.add_all([repository, second_repository, disabled_repository])
+        await session.flush()
+        repository_id = repository.id
+        second_repository_id = second_repository.id
+        disabled_repository_id = disabled_repository.id
+
+    secret = "g" * 32
+    commit = "2" * 40
+    body = orjson.dumps(
+        {
+            "ref": "refs/heads/main",
+            "after": commit,
+            "deleted": False,
+            "repository": {"full_name": "Matrena-VPN/backend_ai"},
+        }
+    )
+    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    headers = {
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Event": "push",
+        "X-GitHub-Delivery": str(uuid4()),
+        "Content-Type": "application/json",
+    }
+    app = create_app(
+        Settings(
+            public_url="http://testserver",
+            database_url=os.environ["DCA_TEST_DATABASE_URL"],
+            session_secret=SecretStr("integration-session-secret-32-bytes"),
+            cookie_secure=False,
+            github_webhook_secret=SecretStr(secret),
+            repository_root=tmp_path / "repositories",
+            snapshot_root=tmp_path / "snapshots",
+        )
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            first = await client.post("/webhooks/github", content=body, headers=headers)
+            duplicate = await client.post("/webhooks/github", content=body, headers=headers)
+            replay_headers = {**headers, "X-GitHub-Delivery": str(uuid4())}
+            replay = await client.post(
+                "/webhooks/github", content=body, headers=replay_headers
+            )
+
+        assert first.status_code == 202
+        assert first.json()["queued"] is True
+        assert len(first.json()["jobs"]) == 2
+        assert duplicate.status_code == 202
+        assert duplicate.json()["queued"] is False
+        assert {row["job_id"] for row in duplicate.json()["jobs"]} == {
+            row["job_id"] for row in first.json()["jobs"]
+        }
+        assert replay.status_code == 202
+        assert replay.json()["queued"] is False
+        assert {row["job_id"] for row in replay.json()["jobs"]} == {
+            row["job_id"] for row in first.json()["jobs"]
+        }
+        async with database.session() as session:
+            stored = await session.get(Repository, repository_id)
+            second_stored = await session.get(Repository, second_repository_id)
+            disabled_stored = await session.get(Repository, disabled_repository_id)
+            assert stored is not None
+            assert second_stored is not None
+            assert disabled_stored is not None
+            assert stored.status == "stale"
+            assert second_stored.status == "stale"
+            assert stored.sync_generation == 1
+            assert second_stored.sync_generation == 1
+            assert stored.last_webhook_commit == commit
+            assert second_stored.last_webhook_commit == commit
+            assert disabled_stored.status == RepositoryStatus.DISABLED.value
+            assert disabled_stored.sync_generation == 0
+            assert disabled_stored.last_webhook_commit is None
+            jobs = list(
+                await session.scalars(
+                    select(Job).where(Job.kind == "repository.sync")
+                )
+            )
+            assert len(jobs) == 2
+            assert {job.payload["repository_id"] for job in jobs} == {
+                str(repository_id),
+                str(second_repository_id),
+            }
+            assert {job.payload["requested_commit"] for job in jobs} == {commit}
+    finally:
+        await app.state.telegram.close()
+        await app.state.redis.aclose()
+        await app.state.database.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_reconcile_queues_one_fallback_sync(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed_now = datetime(2026, 7, 22, 6, 0, tzinfo=UTC)
+    monkeypatch.setattr(worker_module, "utcnow", lambda: fixed_now)
+    async with database.session() as session:
+        project = Project(slug=f"reconcile-{uuid4().hex[:8]}", name="Reconcile")
+        session.add(project)
+        await session.flush()
+        repository = Repository(
+            project_id=project.id,
+            name="backend_ai",
+            ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+            github_repository="matrena-vpn/backend_ai",
+            auto_sync_enabled=True,
+        )
+        session.add(repository)
+        await session.flush()
+        repository_id = repository.id
+
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace(repository_reconcile_seconds=300)
+    worker.database = database
+    worker._last_repository_reconcile = -1_000_000_000.0
+
+    await worker._reconcile_repositories_if_due()
+
+    async with database.session() as session:
+        job = await session.scalar(
+            select(Job).where(
+                Job.kind == "repository.sync",
+                Job.payload["repository_id"].as_string() == str(repository_id),
+            )
+        )
+        assert job is not None
+        job.status = JobStatus.FAILED.value
+
+    restarted_worker = Worker.__new__(Worker)
+    restarted_worker.settings = SimpleNamespace(repository_reconcile_seconds=300)
+    restarted_worker.database = database
+    restarted_worker._last_repository_reconcile = -1_000_000_000.0
+    await restarted_worker._reconcile_repositories_if_due()
+
+    async with database.session() as session:
+        jobs = list(
+            await session.scalars(
+                select(Job).where(
+                    Job.kind == "repository.sync",
+                    Job.payload["repository_id"].as_string() == str(repository_id),
+                )
+            )
+        )
+    assert len(jobs) == 1
+    assert jobs[0].payload["source"] == "reconcile"
+    assert jobs[0].payload["generation"] == 1
+    async with database.session() as session:
+        repository = await session.get(Repository, repository_id)
+        assert repository is not None
+        assert repository.sync_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_newer_sync_generation_wins_across_two_workers(
+    database: Database, tmp_path: Path
+) -> None:
+    async with database.session() as session:
+        project = Project(slug=f"sync-order-{uuid4().hex[:8]}", name="Sync order")
+        session.add(project)
+        await session.flush()
+        repository = Repository(
+            project_id=project.id,
+            name="backend_ai",
+            ssh_url="git@github.com:Matrena-VPN/backend_ai.git",
+            status="ready",
+            current_commit="0" * 40,
+        )
+        session.add(repository)
+        await session.flush()
+        first_job, created = await enqueue_repository_sync(
+            session,
+            repository=repository,
+            source="github",
+            requested_commit="1" * 40,
+            deduplication_key=f"test:first:{repository.id}",
+        )
+        assert created is True
+        repository_id = repository.id
+        first_generation = first_job.payload["generation"]
+
+    class OrderedSnapshots:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.active = 0
+            self.max_active = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def sync(self, _: Repository) -> str:
+            self.calls += 1
+            call = self.calls
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if call == 1:
+                    self.first_started.set()
+                    await self.release_first.wait()
+                return str(call) * 40
+            finally:
+                self.active -= 1
+
+        async def materialize(self, _: Repository, __: str) -> Path:
+            return tmp_path
+
+    snapshots = OrderedSnapshots()
+    old_worker = Worker.__new__(Worker)
+    old_worker.database = database
+    old_worker.snapshots = snapshots
+    new_worker = Worker.__new__(Worker)
+    new_worker.database = database
+    new_worker.snapshots = snapshots
+
+    old_task = asyncio.create_task(
+        old_worker._sync_repository(
+            repository_id,
+            generation=first_generation,
+            requested_commit="1" * 40,
+            source="github",
+        )
+    )
+    await asyncio.wait_for(snapshots.first_started.wait(), timeout=2)
+
+    async with database.session() as session:
+        repository = await session.scalar(
+            select(Repository).where(Repository.id == repository_id).with_for_update()
+        )
+        assert repository is not None
+        second_job, created = await enqueue_repository_sync(
+            session,
+            repository=repository,
+            source="github",
+            requested_commit="2" * 40,
+            deduplication_key=f"test:second:{repository.id}",
+        )
+        assert created is True
+        second_generation = second_job.payload["generation"]
+
+    with pytest.raises(ServiceError) as busy:
+        await asyncio.wait_for(
+            new_worker._sync_repository(
+                repository_id,
+                generation=second_generation,
+                requested_commit="2" * 40,
+                source="github",
+            ),
+            timeout=2,
+        )
+    assert busy.value.code == "repository_sync_busy"
+    assert busy.value.retryable is True
+    assert snapshots.calls == 1
+
+    snapshots.release_first.set()
+    old_result = await old_task
+    new_result = await new_worker._sync_repository(
+        repository_id,
+        generation=second_generation,
+        requested_commit="2" * 40,
+        source="github",
+    )
+
+    assert old_result["superseded"] is True
+    assert old_result["current_generation"] == second_generation
+    assert new_result["commit"] == "2" * 40
+    assert snapshots.max_active == 1
+    async with database.session() as session:
+        repository = await session.get(Repository, repository_id)
+        assert repository is not None
+        assert repository.status == "ready"
+        assert repository.current_commit == "2" * 40
+        assert repository.sync_generation == second_generation
+        superseded = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(
+                AuditEvent.event_type == "repository.sync_superseded",
+                AuditEvent.subject_id == str(repository_id),
+            )
+        )
+        assert superseded == 1

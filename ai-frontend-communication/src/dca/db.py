@@ -19,7 +19,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
+    select,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -101,7 +103,22 @@ class ProjectAgentSettings(Base, TimestampMixin):
 
 class Repository(Base, TimestampMixin):
     __tablename__ = "repositories"
-    __table_args__ = (UniqueConstraint("project_id", "name"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "name"),
+        UniqueConstraint(
+            "project_id",
+            "github_repository",
+            name="uq_repositories_project_github_repository",
+        ),
+        CheckConstraint(
+            "NOT auto_sync_enabled OR github_repository IS NOT NULL",
+            name="ck_repository_auto_sync_source",
+        ),
+        CheckConstraint(
+            "sync_generation >= 0",
+            name="ck_repository_sync_generation",
+        ),
+    )
 
     id: Mapped[UUID] = uuid_column(primary_key=True)
     project_id: Mapped[UUID] = mapped_column(
@@ -114,11 +131,20 @@ class Repository(Base, TimestampMixin):
     deploy_key_path: Mapped[str | None] = mapped_column(String(1_024))
     known_hosts_path: Mapped[str | None] = mapped_column(String(1_024))
     mirror_path: Mapped[str | None] = mapped_column(String(1_024))
+    github_repository: Mapped[str | None] = mapped_column(String(255))
+    auto_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    sync_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     current_commit: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=RepositoryStatus.NEVER_SYNCED.value
     )
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_webhook_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_webhook_commit: Mapped[str | None] = mapped_column(String(64))
     last_error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -677,3 +703,39 @@ async def enqueue_job(
     session.add(job)
     await session.flush()
     return job
+
+
+async def enqueue_repository_sync(
+    session: AsyncSession,
+    *,
+    repository: Repository,
+    source: str,
+    deduplication_key: str,
+    requested_commit: str | None = None,
+) -> tuple[Job, bool]:
+    """Queue one causally ordered sync, serializing generation allocation in PostgreSQL."""
+    locked_repository = await session.scalar(
+        select(Repository).where(Repository.id == repository.id).with_for_update()
+    )
+    if locked_repository is None:
+        raise RuntimeError("Repository disappeared while queueing synchronization")
+    repository = locked_repository
+    existing = await session.scalar(
+        select(Job).where(Job.deduplication_key == deduplication_key)
+    )
+    if existing is not None:
+        return existing, False
+    repository.sync_generation += 1
+    job = await enqueue_job(
+        session,
+        kind="repository.sync",
+        payload={
+            "repository_id": str(repository.id),
+            "generation": repository.sync_generation,
+            "requested_commit": requested_commit,
+            "source": source,
+        },
+        deduplication_key=deduplication_key,
+        max_attempts=3,
+    )
+    return job, True

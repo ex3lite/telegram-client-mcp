@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     outbound_proxy_url: Secret[AnyHttpUrl] | None = None
     max_telegram_body_bytes: int = Field(default=1_048_576, ge=1_024, le=10_485_760)
 
+    github_webhook_secret: SecretStr = SecretStr("")
+    max_github_webhook_body_bytes: int = Field(default=1_048_576, ge=1_024, le=10_485_760)
+    repository_reconcile_seconds: int = Field(default=300, ge=30, le=86_400)
+
     session_secret: SecretStr = SecretStr("")
     cookie_secure: bool = True
 
@@ -44,9 +48,21 @@ class Settings(BaseSettings):
             raise ValueError("database_url must use postgresql+psycopg")
         return value
 
+    @field_validator("github_webhook_secret")
+    @classmethod
+    def require_strong_github_webhook_secret(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if raw and len(raw) < 32:
+            raise ValueError("github_webhook_secret must contain at least 32 characters")
+        return value
+
     @property
     def telegram_webhook_url(self) -> str:
         return f"{str(self.public_url).rstrip('/')}/webhooks/telegram"
+
+    @property
+    def github_webhook_url(self) -> str:
+        return f"{str(self.public_url).rstrip('/')}/webhooks/github"
 
 
 @lru_cache

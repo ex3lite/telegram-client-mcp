@@ -97,6 +97,10 @@ Repository-key provisioning, user linking, deployment lifecycle, and release gat
 [docs/OPERATIONS.md](docs/OPERATIONS.md). The exact Telegram feature matrix is in
 [docs/TELEGRAM_10_2.md](docs/TELEGRAM_10_2.md).
 
+Repositories can opt into signed GitHub push webhooks. Each accepted default-branch push queues a
+deduplicated sync job; a periodic reconcile covers missed deliveries. Questions remain pinned to
+the immutable commit captured when the interaction was created.
+
 ## Checks
 
 ```bash
