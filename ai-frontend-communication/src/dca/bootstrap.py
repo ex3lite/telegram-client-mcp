@@ -145,6 +145,7 @@ async def link_user(args: argparse.Namespace, settings: Settings) -> None:
                     role=args.role or "developer",
                     department=args.department,
                     stack=args.stack,
+                    preferred_language=args.preferred_language or "ru",
                 )
                 session.add(membership)
             else:
@@ -154,6 +155,8 @@ async def link_user(args: argparse.Namespace, settings: Settings) -> None:
                     membership.department = args.department
                 if args.stack is not None:
                     membership.stack = args.stack
+                if args.preferred_language is not None:
+                    membership.preferred_language = args.preferred_language
             if args.verify:
                 from dca.domain import utcnow
 
@@ -171,6 +174,7 @@ async def link_user(args: argparse.Namespace, settings: Settings) -> None:
                     "role": membership.role,
                     "department": membership.department,
                     "stack": membership.stack,
+                    "preferred_language": membership.preferred_language,
                 },
             )
         print(f"user_id={user.id}")
@@ -286,8 +290,7 @@ async def configure_repository_auto_sync(args: argparse.Namespace, settings: Set
             github_repository = (
                 normalize_github_repository(args.github_repository)
                 if args.github_repository
-                else repository.github_repository
-                or github_repository_from_url(repository.ssh_url)
+                else repository.github_repository or github_repository_from_url(repository.ssh_url)
             )
             if not args.disable and github_repository is None:
                 raise SystemExit(
@@ -515,6 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     user_parser.add_argument("--role")
     user_parser.add_argument("--department")
     user_parser.add_argument("--stack")
+    user_parser.add_argument("--preferred-language", choices=("ru", "en"))
     user_parser.add_argument("--verify", action="store_true")
 
     chat_parser = subparsers.add_parser("link-chat")

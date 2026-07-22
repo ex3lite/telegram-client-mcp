@@ -1,9 +1,11 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 from uuid import uuid4
 
 import pytest
@@ -17,18 +19,21 @@ from aiogram.exceptions import (
 )
 from aiogram.methods import GetUpdates, SendMessage
 from pydantic import ValidationError
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import SQLAlchemyError
 
 import dca.worker as worker_module
-from dca.claude import ClaudeError
+from dca.claude import ClaudeError, compile_agent_policy
 from dca.config import Settings
-from dca.db import AgentMessage, Interaction, Job, Repository, TelegramChat
+from dca.db import AgentMessage, ConversationThread, Interaction, Job, Repository, TelegramChat
+from dca.domain import KnowledgeAnswer, KnowledgeArtifact
 from dca.memory import ConversationContext, ConversationContextMessage
 from dca.service import ServiceError
 from dca.worker import (
     TELEGRAM_EXTERNAL_ACTIONS,
     Worker,
     conversation_prompt_context,
+    sanitize_stream_text,
     trusted_requester_profile,
 )
 
@@ -38,6 +43,14 @@ def test_telegram_mode_is_strict_and_webhook_compatible() -> None:
     assert Settings(telegram_mode="webhook").telegram_mode == "webhook"
     with pytest.raises(ValidationError):
         Settings(telegram_mode="updates")  # type: ignore[arg-type]
+
+
+def test_knowledge_concurrency_defaults_to_five_and_uses_env(monkeypatch) -> None:
+    assert Settings().knowledge_concurrency == 5
+    monkeypatch.setenv("DCA_KNOWLEDGE_CONCURRENCY", "3")
+    assert Settings().knowledge_concurrency == 3
+    with pytest.raises(ValidationError):
+        Settings(knowledge_concurrency=6)
 
 
 def test_prompt_context_keeps_legitimate_latest_historical_user_message() -> None:
@@ -58,6 +71,25 @@ def test_prompt_context_keeps_legitimate_latest_historical_user_message() -> Non
     payload = conversation_prompt_context(context)
 
     assert payload["messages"][0]["content"] == "Предыдущее решение"
+
+
+def test_stream_privacy_holds_unfinished_secret_tokens() -> None:
+    partial, findings = sanitize_stream_text(
+        "Проверяю sk-ant-short",
+        level="strict",
+        location="thinking",
+    )
+    private_key, key_findings = sanitize_stream_text(
+        "До ключа -----BEGIN PRIVATE KEY-----\nsecret-body",
+        level="strict",
+        location="thinking",
+    )
+
+    assert partial == "Проверяю"
+    assert "sk-ant" not in partial
+    assert findings == []
+    assert private_key == "До ключа [REDACTED:private_key]"
+    assert key_findings[0]["kind"] == "private_key"
 
 
 @pytest.mark.asyncio
@@ -101,7 +133,7 @@ async def test_poll_batch_ingests_each_update_before_advancing_offset(monkeypatc
 @pytest.mark.asyncio
 async def test_worker_runs_polling_and_jobs_concurrently() -> None:
     worker = Worker.__new__(Worker)
-    worker.settings = SimpleNamespace(telegram_mode="polling")
+    worker.settings = SimpleNamespace(telegram_mode="polling", knowledge_concurrency=3)
     worker.recover_stale_jobs = AsyncMock()
     worker._run_job_loop = AsyncMock()
     worker._poll_telegram_forever = AsyncMock()
@@ -111,10 +143,40 @@ async def test_worker_runs_polling_and_jobs_concurrently() -> None:
 
     await worker.run_forever()
 
-    worker._run_job_loop.assert_awaited_once_with()
+    assert worker._run_job_loop.await_count == 4
+    assert worker._run_job_loop.await_args_list.count(call(exclude_kind="knowledge.answer")) == 1
+    assert worker._run_job_loop.await_args_list.count(call(only_kind="knowledge.answer")) == 3
     worker._poll_telegram_forever.assert_awaited_once_with()
     worker.telegram.close.assert_awaited_once_with()
     worker.database.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_claim_job_filters_knowledge_pool_with_skip_locked() -> None:
+    statements = []
+
+    class FakeSession:
+        async def scalar(self, statement):
+            statements.append(statement)
+            return None
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+
+    assert await worker.claim_job(only_kind="knowledge.answer") is None
+    assert await worker.claim_job(exclude_kind="knowledge.answer") is None
+
+    only = statements[0].compile(dialect=postgresql.dialect())
+    exclude = statements[1].compile(dialect=postgresql.dialect())
+    assert "FOR UPDATE SKIP LOCKED" in str(only)
+    assert "jobs.kind =" in str(only)
+    assert only.params["kind_1"] == "knowledge.answer"
+    assert "jobs.kind !=" in str(exclude)
+    assert exclude.params["kind_1"] == "knowledge.answer"
 
 
 @pytest.mark.asyncio
@@ -253,6 +315,30 @@ async def test_repository_sync_lock_refuses_busy_repository_without_waiting() ->
     connection.invalidate.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_conversation_context_lock_refuses_busy_thread_without_waiting() -> None:
+    worker = Worker.__new__(Worker)
+    connection = SimpleNamespace(
+        scalar=AsyncMock(return_value=False),
+        invalidate=AsyncMock(),
+    )
+
+    @asynccontextmanager
+    async def connect():
+        yield connection
+
+    worker.database = SimpleNamespace(engine=SimpleNamespace(connect=connect))
+
+    with pytest.raises(ServiceError) as error:
+        async with worker._conversation_context_lock(uuid4()):
+            pass
+
+    assert error.value.code == "conversation_context_busy"
+    assert error.value.retryable is True
+    assert "pg_try_advisory_lock" in str(connection.scalar.await_args.args[0])
+    connection.invalidate.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "unlock_result",
     [False, RuntimeError("connection lost during unlock")],
@@ -382,6 +468,36 @@ async def test_repository_lock_contention_does_not_consume_job_attempt() -> None
 
 
 @pytest.mark.asyncio
+async def test_conversation_lock_contention_does_not_consume_job_attempt() -> None:
+    worker = Worker.__new__(Worker)
+    worker._dispatch = AsyncMock(
+        side_effect=ServiceError(
+            "conversation_context_busy",
+            "Another answer is already using this conversation context",
+            retryable=True,
+        )
+    )
+    worker._retry = AsyncMock(return_value=True)
+    job = Job(
+        id=uuid4(),
+        kind="knowledge.answer",
+        payload={"interaction_id": str(uuid4())},
+        attempts=3,
+        max_attempts=3,
+    )
+
+    await worker.process(job)
+
+    worker._retry.assert_awaited_once_with(
+        job,
+        "conversation_context_busy",
+        "Another answer is already using this conversation context",
+        delay=1,
+        consume_attempt=False,
+    )
+
+
+@pytest.mark.asyncio
 async def test_polling_startup_deletes_webhook_and_keeps_backlog() -> None:
     worker = Worker.__new__(Worker)
 
@@ -405,13 +521,14 @@ def test_trusted_requester_profile_whitelists_telegram_server_metadata() -> None
     interaction = Interaction(
         source="telegram",
         source_ref={
+            "telegram_user_id": 9001,
             "requester_profile": {
                 "display_name": "Бека",
                 "department": "Mobile",
                 "stack": "Android / Kotlin",
                 "unknown": "must not reach Claude",
                 "role": {"invalid": "type"},
-            }
+            },
         },
     )
 
@@ -419,6 +536,7 @@ def test_trusted_requester_profile_whitelists_telegram_server_metadata() -> None
         "display_name": "Бека",
         "department": "Mobile",
         "stack": "Android / Kotlin",
+        "telegram_user_id": 9001,
     }
     interaction.source = "api"
     assert trusted_requester_profile(interaction) is None
@@ -548,7 +666,666 @@ async def test_final_retryable_model_failure_notifies_the_user(monkeypatch) -> N
     await worker.process(job)
 
     retry.assert_awaited_once_with(job, "model_provider_timeout", "Timed out")
-    publish_error.assert_awaited_once_with(job, "Timed out")
+    publish_error.assert_awaited_once_with(job, "model_provider_timeout")
+
+
+@pytest.mark.asyncio
+async def test_publish_interaction_error_keeps_claude_error_code() -> None:
+    interaction = Interaction(id=uuid4(), status="running")
+
+    class FakeSession:
+        async def get(self, model, key):
+            assert model is Interaction
+            assert key == interaction.id
+            return interaction
+
+        async def flush(self) -> None:
+            return None
+
+        def expunge(self, value) -> None:
+            assert value is interaction
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.telegram = SimpleNamespace(publish_knowledge_error=AsyncMock())
+    job = Job(
+        id=uuid4(),
+        kind="knowledge.answer",
+        payload={"interaction_id": str(interaction.id)},
+    )
+
+    await worker._publish_interaction_error(job, "model_provider_timeout")
+
+    assert interaction.status == "failed"
+    assert interaction.error_code == "model_provider_timeout"
+    worker.telegram.publish_knowledge_error.assert_awaited_once_with(interaction)
+
+
+@pytest.mark.asyncio
+async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypatch) -> None:
+    project_id = uuid4()
+    repository = Repository(
+        id=uuid4(),
+        project_id=project_id,
+        name="backend",
+        ssh_url="git@github.com:example/backend.git",
+    )
+    interaction = Interaction(
+        id=uuid4(),
+        project_id=project_id,
+        repository_id=repository.id,
+        correlation_id="tg:test",
+        source="telegram",
+        source_ref={},
+        question="Как подключить аватарки?",
+        commit_sha="a" * 40,
+        status="queued",
+        conversation_thread_id=None,
+    )
+    settings = SimpleNamespace(
+        enabled=True,
+        memory_enabled=False,
+        denied_globs=[],
+        telegram_streaming_enabled=True,
+        privacy_level="balanced",
+        claude_model="sonnet",
+        claude_effort="medium",
+        base_prompt="",
+        answer_style="normal",
+    )
+
+    class FakeSession:
+        async def get(self, model, _key):
+            if model is Interaction:
+                return interaction
+            if model is Repository:
+                return repository
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+        def expunge(self, _value) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    heartbeat_started = asyncio.Event()
+    heartbeat_stopped = asyncio.Event()
+
+    async def heartbeat(
+        _: Interaction,
+        *,
+        policy_guard: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        if policy_guard is not None:
+            await policy_guard()
+        heartbeat_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            heartbeat_stopped.set()
+
+    answer = KnowledgeAnswer(
+        answer_markdown="Используйте endpoint профиля.",
+        artifacts=[KnowledgeArtifact(name="avatar-guide.md", content="# Лишний файл")],
+        change_request={
+            "kind": "integration",
+            "title": "Добавить аватарки",
+            "summary": "Claude ошибочно решил, что нужна backend-заявка.",
+        },
+        context_attestation={
+            "contract_version": "dca-context-v1",
+            "nonce": "1" * 32,
+            "policy_sha256": "2" * 64,
+            "context_sha256": "3" * 64,
+        },
+    )
+
+    async def claude_answer(**kwargs):
+        on_stream = kwargs["on_stream"]
+        assert on_stream is not None
+        await heartbeat_started.wait()
+        await on_stream(
+            "Authorization: Bearer abcdefghijklmnop ",
+            "Проверяю sk-ant-" + "a" * 24 + " ",
+        )
+        await on_stream("Используйте endpoint", "Проверяю API")
+        return SimpleNamespace(
+            answer=answer,
+            accepted_citations=[],
+            rejected_citations=[],
+            cli_version="test",
+            session_id=None,
+            compaction_count=0,
+            context_metadata={"contract_version": "dca-context-v1"},
+        )
+
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace(session_secret=SimpleNamespace(get_secret_value=lambda: "x"))
+    worker.database = SimpleNamespace(session=session)
+    worker.snapshots = SimpleNamespace(materialize=AsyncMock(return_value=Path("/snapshot")))
+    worker.claude = SimpleNamespace(answer=AsyncMock(side_effect=claude_answer))
+    worker.telegram = SimpleNamespace(send_knowledge_stream=AsyncMock())
+    worker._draft_heartbeat = heartbeat
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(return_value=settings),
+    )
+    monkeypatch.setattr(worker_module, "load_system_secret", AsyncMock(return_value="oauth"))
+    monkeypatch.setattr(
+        worker_module,
+        "load_live_requester_profile",
+        AsyncMock(
+            return_value={
+                "role": "frontend",
+                "stack": "JavaScript",
+                "language": "ru",
+                "knowledge_scope": "integration",
+                "can_create_requests": True,
+            }
+        ),
+    )
+    create_request = AsyncMock(
+        side_effect=ServiceError(
+            "request_intent_required",
+            "Explicit backend request intent is required",
+        )
+    )
+    monkeypatch.setattr(worker_module, "create_agent_change_request", create_request)
+    monkeypatch.setattr(worker_module, "enqueue_job", AsyncMock())
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+
+    await worker._answer_interaction(interaction.id)
+
+    assert heartbeat_stopped.is_set()
+    worker.telegram.send_knowledge_stream.assert_awaited_once_with(
+        interaction,
+        answer_markdown="Authorization: [REDACTED:bearer_token]",
+        thinking="Проверяю [REDACTED:anthropic_token]",
+    )
+    assert interaction.artifacts == []
+    assert interaction.provider_metadata["document_requested"] is False
+    assert interaction.provider_metadata["stream_privacy_findings"] == 2
+    assert interaction.provider_metadata["proposal_suppressed"] is True
+    create_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missing_native_session_rotates_once_and_bootstraps_database_memory(
+    monkeypatch,
+) -> None:
+    project_id = uuid4()
+    repository = Repository(
+        id=uuid4(),
+        project_id=project_id,
+        name="backend",
+        ssh_url="git@github.com:example/backend.git",
+        allowed_paths=["src"],
+    )
+    old_session_id = uuid4()
+    thread = ConversationThread(
+        id=uuid4(),
+        project_id=project_id,
+        user_id=uuid4(),
+        chat_id=None,
+        claude_session_id=old_session_id,
+        claude_repository_id=repository.id,
+        claude_commit_sha="a" * 40,
+        claude_compaction_count=0,
+    )
+    interaction = Interaction(
+        id=uuid4(),
+        project_id=project_id,
+        repository_id=repository.id,
+        conversation_thread_id=thread.id,
+        correlation_id="mcp:resume",
+        source="mcp",
+        source_ref={},
+        question="Продолжай интеграцию",
+        commit_sha="a" * 40,
+        status="queued",
+    )
+    settings = SimpleNamespace(
+        enabled=True,
+        memory_enabled=True,
+        memory_recent_messages=24,
+        memory_max_context_chars=24_000,
+        denied_globs=["tmp/**"],
+        telegram_streaming_enabled=False,
+        privacy_level="balanced",
+        claude_model="sonnet",
+        claude_effort="medium",
+        base_prompt="",
+        answer_style="normal",
+    )
+    thread.claude_policy_hash = compile_agent_policy(
+        project_settings=settings,
+        requester_profile=None,
+        delivery_scope="external",
+        repository_allowed_paths=repository.allowed_paths,
+        repository_denied_globs=settings.denied_globs,
+    ).policy_sha256
+
+    class FakeSession:
+        async def get(self, model, _key):
+            if model is Interaction:
+                return interaction
+            if model is Repository:
+                return repository
+            if model is ConversationThread:
+                return thread
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+        def expunge(self, _value) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    context = ConversationContext(
+        thread_id=thread.id,
+        summary="Ранее выбрали endpoint /avatars",
+        facts=(),
+        messages=(),
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def claude_answer(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise ClaudeError(
+                "claude_session_unavailable",
+                "Claude session is missing or expired",
+                retryable=True,
+            )
+        return SimpleNamespace(
+            answer=KnowledgeAnswer(
+                answer_markdown="Используйте /avatars.",
+                context_attestation={
+                    "contract_version": "dca-context-v1",
+                    "nonce": "1" * 32,
+                    "policy_sha256": "2" * 64,
+                    "context_sha256": "3" * 64,
+                },
+            ),
+            accepted_citations=[],
+            rejected_citations=[],
+            cli_version="test",
+            session_id=str(kwargs["session_id"]),
+            compaction_count=0,
+            context_metadata={"contract_version": "dca-context-v1"},
+        )
+
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace(session_secret=SimpleNamespace(get_secret_value=lambda: "x"))
+    worker.database = SimpleNamespace(session=session)
+    worker.snapshots = SimpleNamespace(materialize=AsyncMock(return_value=Path("/snapshot")))
+    worker.claude = SimpleNamespace(answer=AsyncMock(side_effect=claude_answer))
+    worker.telegram = SimpleNamespace()
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(return_value=settings),
+    )
+    monkeypatch.setattr(worker_module, "load_system_secret", AsyncMock(return_value="oauth"))
+    monkeypatch.setattr(
+        worker_module,
+        "load_conversation_context",
+        AsyncMock(return_value=context),
+    )
+    monkeypatch.setattr(worker_module, "append_conversation_message", AsyncMock())
+    monkeypatch.setattr(worker_module, "enqueue_job", AsyncMock())
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+
+    await worker._answer_interaction_impl(interaction.id)
+
+    assert len(calls) == 2
+    assert calls[0]["resume_session"] is True
+    assert calls[0]["session_id"] == old_session_id
+    assert calls[0]["conversation_context"] is None
+    assert calls[1]["resume_session"] is False
+    assert calls[1]["session_id"] != old_session_id
+    assert calls[1]["conversation_context"]["summary"] == context.summary
+    assert thread.claude_session_id == calls[1]["session_id"]
+    assert interaction.provider_metadata["session_rotated_after_resume_failure"] is True
+
+
+@pytest.mark.parametrize("membership_revoked", [False, True])
+@pytest.mark.asyncio
+async def test_changed_live_policy_rejects_answer_before_persist(
+    monkeypatch,
+    membership_revoked: bool,
+) -> None:
+    project_id = uuid4()
+    repository = Repository(
+        id=uuid4(),
+        project_id=project_id,
+        name="backend",
+        ssh_url="git@github.com:example/backend.git",
+        allowed_paths=["src"],
+    )
+    interaction = Interaction(
+        id=uuid4(),
+        project_id=project_id,
+        repository_id=repository.id,
+        correlation_id="mcp:policy-change",
+        source="mcp",
+        source_ref={},
+        question="Как работает API?",
+        commit_sha="a" * 40,
+        status="queued",
+        conversation_thread_id=None,
+    )
+
+    def agent_settings(effort: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            enabled=True,
+            memory_enabled=False,
+            memory_recent_messages=24,
+            memory_max_context_chars=24_000,
+            denied_globs=[],
+            telegram_streaming_enabled=False,
+            privacy_level="balanced",
+            claude_model="sonnet",
+            claude_effort=effort,
+            base_prompt="",
+            answer_style="normal",
+        )
+
+    initial_settings = agent_settings("medium")
+    changed_settings = agent_settings("high")
+
+    class FakeSession:
+        async def get(self, model, _key):
+            if model is Interaction:
+                return interaction
+            if model is Repository:
+                return repository
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+        def expunge(self, _value) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    result = SimpleNamespace(
+        answer=KnowledgeAnswer(
+            answer_markdown="Ответ из уже устаревшего контекста.",
+            context_attestation={
+                "contract_version": "dca-context-v1",
+                "nonce": "1" * 32,
+                "policy_sha256": "2" * 64,
+                "context_sha256": "3" * 64,
+            },
+        ),
+        accepted_citations=[],
+        rejected_citations=[],
+        cli_version="test",
+        session_id=None,
+        compaction_count=0,
+        context_metadata={"contract_version": "dca-context-v1"},
+    )
+    worker = Worker.__new__(Worker)
+    worker.settings = SimpleNamespace(session_secret=SimpleNamespace(get_secret_value=lambda: "x"))
+    worker.database = SimpleNamespace(session=session)
+    worker.snapshots = SimpleNamespace(materialize=AsyncMock(return_value=Path("/snapshot")))
+    worker.claude = SimpleNamespace(answer=AsyncMock(return_value=result))
+    worker.telegram = SimpleNamespace()
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(
+            side_effect=[
+                initial_settings,
+                initial_settings if membership_revoked else changed_settings,
+            ]
+        ),
+    )
+    monkeypatch.setattr(worker_module, "load_system_secret", AsyncMock(return_value="oauth"))
+    if membership_revoked:
+        monkeypatch.setattr(
+            worker_module,
+            "load_live_requester_profile",
+            AsyncMock(
+                side_effect=[
+                    None,
+                    ServiceError(
+                        "project_scope_violation",
+                        "Requester no longer has access to this project",
+                    ),
+                ]
+            ),
+        )
+
+    with pytest.raises(ClaudeError) as error:
+        await worker._answer_interaction_impl(interaction.id)
+
+    assert error.value.code == "context_policy_changed"
+    assert error.value.retryable is True
+    assert interaction.status == "generating"
+    assert interaction.answer_markdown is None
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_attach"),
+    [
+        ("Как подключить аватарки?", False),
+        ("Создай документацию по аватаркам", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_attaches_markdown_only_when_requested(
+    monkeypatch,
+    question: str,
+    expected_attach: bool,
+) -> None:
+    artifact = {"name": "avatars.md", "content": "# Avatars"}
+    project_id = uuid4()
+    repository = Repository(
+        id=uuid4(),
+        project_id=project_id,
+        name="backend",
+        ssh_url="git@github.com:example/backend.git",
+        allowed_paths=[],
+    )
+    settings = SimpleNamespace(
+        enabled=True,
+        telegram_attach_markdown=True,
+        denied_globs=[],
+        claude_model="sonnet",
+        claude_effort="medium",
+        privacy_level="strict",
+        memory_enabled=True,
+        memory_recent_messages=24,
+        memory_max_context_chars=24_000,
+        base_prompt="",
+        answer_style="normal",
+    )
+    live_profile = {
+        "user_id": str(uuid4()),
+        "telegram_user_id": 9001,
+        "display_name": "Frontend developer",
+        "role": "frontend",
+        "department": "Frontend",
+        "stack": "JavaScript",
+        "language": "ru",
+        "knowledge_scope": "integration",
+        "can_create_requests": True,
+    }
+    policy_hash = compile_agent_policy(
+        project_settings=settings,
+        requester_profile=live_profile,
+        delivery_scope="external",
+        repository_allowed_paths=[],
+        repository_denied_globs=[],
+    ).policy_sha256
+    interaction = Interaction(
+        id=uuid4(),
+        project_id=project_id,
+        repository_id=repository.id,
+        correlation_id="tg:publish",
+        source="telegram",
+        source_ref={"telegram_user_id": 9001},
+        question=question,
+        status="answer_ready",
+        answer_markdown="Готовый ответ",
+        artifacts=[artifact],
+        provider_metadata={"native_context": {"policy_sha256": policy_hash}},
+    )
+
+    class FakeSession:
+        async def get(self, model, key):
+            if model is Interaction:
+                assert key == interaction.id
+                return interaction
+            if model is Repository:
+                assert key == repository.id
+                return repository
+            return None
+
+        def expunge(self, value) -> None:
+            assert value is interaction
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    publish = AsyncMock()
+    publish_error = AsyncMock()
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.telegram = SimpleNamespace(
+        publish_knowledge_answer=publish,
+        publish_knowledge_error=publish_error,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(return_value=settings),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_live_requester_profile",
+        AsyncMock(return_value=live_profile),
+    )
+    monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+
+    await worker._publish_interaction(interaction.id)
+
+    publish.assert_awaited_once_with(
+        interaction,
+        "Готовый ответ",
+        artifacts=[artifact] if expected_attach else [],
+        attach_markdown=expected_attach,
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_fails_closed_when_live_policy_changed(monkeypatch) -> None:
+    project_id = uuid4()
+    repository = Repository(
+        id=uuid4(),
+        project_id=project_id,
+        name="backend",
+        ssh_url="git@github.com:example/backend.git",
+        allowed_paths=["src"],
+    )
+
+    def settings(effort: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            enabled=True,
+            telegram_attach_markdown=True,
+            denied_globs=[],
+            claude_model="sonnet",
+            claude_effort=effort,
+            privacy_level="strict",
+            memory_enabled=True,
+            memory_recent_messages=24,
+            memory_max_context_chars=24_000,
+            base_prompt="",
+            answer_style="normal",
+        )
+
+    generated_policy_hash = compile_agent_policy(
+        project_settings=settings("medium"),
+        requester_profile=None,
+        delivery_scope="external",
+        repository_allowed_paths=repository.allowed_paths,
+        repository_denied_globs=[],
+    ).policy_sha256
+    interaction = Interaction(
+        id=uuid4(),
+        project_id=project_id,
+        repository_id=repository.id,
+        correlation_id="tg:stale-publish",
+        source="telegram",
+        source_ref={},
+        question="Как работает API?",
+        status="answer_ready",
+        answer_markdown="Устаревший ответ",
+        artifacts=[],
+        provider_metadata={"native_context": {"policy_sha256": generated_policy_hash}},
+    )
+
+    class FakeSession:
+        async def get(self, model, key):
+            if model is Interaction:
+                assert key == interaction.id
+                return interaction
+            if model is Repository:
+                assert key == repository.id
+                return repository
+            return None
+
+        def expunge(self, value: object) -> None:
+            assert value is interaction
+
+    @asynccontextmanager
+    async def session():
+        yield FakeSession()
+
+    publish = AsyncMock()
+    publish_error = AsyncMock()
+    audit = AsyncMock()
+    worker = Worker.__new__(Worker)
+    worker.database = SimpleNamespace(session=session)
+    worker.telegram = SimpleNamespace(
+        publish_knowledge_answer=publish,
+        publish_knowledge_error=publish_error,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "load_project_agent_settings",
+        AsyncMock(return_value=settings("high")),
+    )
+    monkeypatch.setattr(worker_module, "append_audit", audit)
+
+    result = await worker._publish_interaction(interaction.id)
+
+    assert result["policy_blocked"] is True
+    assert result["accepted_by_telegram"] is True
+    assert interaction.status == "failed"
+    assert interaction.error_code == "context_policy_changed"
+    publish.assert_not_awaited()
+    publish_error.assert_awaited_once_with(interaction)
+    assert audit.await_args.kwargs["event_type"] == "knowledge.answer_publish_policy_blocked"
 
 
 @pytest.mark.parametrize(

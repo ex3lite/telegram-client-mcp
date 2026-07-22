@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import os
 import re
 import secrets
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -57,10 +59,12 @@ from dca.db import (
     Job,
     Project,
     ProjectAgentSettings,
+    ProjectMembership,
     Repository,
     ServiceAccount,
     ServiceAccountProject,
     SystemSecret,
+    TelegramIdentity,
     User,
     append_audit,
     enqueue_repository_sync,
@@ -90,6 +94,51 @@ from dca.worker import configure_logging
 log = structlog.get_logger()
 SESSION_COOKIE = "dca_admin"
 SESSION_MAX_AGE = 180 * 24 * 60 * 60
+
+
+def _purge_claude_session_artifacts(root: Path, session_id: UUID) -> int:
+    """Delete only Claude artifacts whose basename is the exact session UUID."""
+    resolved_root = root.expanduser().resolve()
+    if not resolved_root.exists():
+        return 0
+    if not resolved_root.is_dir() or resolved_root == Path(resolved_root.anchor):
+        raise RuntimeError("unsafe Claude session root")
+
+    session_name = str(session_id)
+    allowed_names = {session_name, f"{session_name}.jsonl"}
+    candidates: list[Path] = []
+    for directory, directory_names, file_names in os.walk(
+        resolved_root, topdown=True, followlinks=False
+    ):
+        parent = Path(directory)
+        candidates.extend(parent / name for name in directory_names if name in allowed_names)
+        candidates.extend(parent / name for name in file_names if name in allowed_names)
+
+    unique_candidates = sorted(set(candidates), key=lambda path: len(path.parts), reverse=True)
+    for candidate in unique_candidates:
+        if candidate.is_symlink():
+            raise RuntimeError("unsafe Claude session artifact symlink")
+        try:
+            candidate.resolve(strict=True).relative_to(resolved_root)
+        except (FileNotFoundError, ValueError) as exc:
+            raise RuntimeError("unsafe Claude session artifact path") from exc
+        if candidate.name == session_name and not candidate.is_dir():
+            raise RuntimeError("invalid Claude session artifact directory")
+        if candidate.name.endswith(".jsonl") and not candidate.is_file():
+            raise RuntimeError("invalid Claude session transcript")
+
+    deleted = 0
+    for candidate in unique_candidates:
+        if not candidate.exists():
+            continue
+        if candidate.is_symlink():
+            raise RuntimeError("unsafe Claude session artifact symlink")
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+        else:
+            candidate.unlink()
+        deleted += 1
+    return deleted
 
 
 async def read_capped_request_body(
@@ -145,6 +194,48 @@ class AdminContext:
 class StatusUpdateInput(BaseModel):
     status: ChangeRequestStatus
     expected_version: int = Field(ge=1)
+
+
+class MemberUpdateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = Field(min_length=1, max_length=160)
+    telegram_user_id: int = Field(gt=0)
+    telegram_username: str | None = Field(default=None, max_length=64)
+    role: str = Field(min_length=1, max_length=40)
+    department: str | None = Field(default=None, max_length=80)
+    stack: str | None = Field(default=None, max_length=160)
+    language: Literal["ru", "en"]
+    knowledge_scope: Literal["integration", "internal"]
+    can_create_requests: bool
+    active: bool
+
+    @field_validator("display_name", "role")
+    @classmethod
+    def normalize_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value cannot be blank")
+        return normalized
+
+    @field_validator("department", "stack")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @field_validator("telegram_username")
+    @classmethod
+    def normalize_telegram_username(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().removeprefix("@")
+        if not normalized:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9_]{1,64}", normalized) is None:
+            raise ValueError("telegram username must contain only letters, digits and underscore")
+        return normalized
 
 
 class AgentSettingsInput(BaseModel):
@@ -624,9 +715,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def github_webhook(
         request: Request,
-        x_hub_signature_256: Annotated[
-            str | None, Header(alias="X-Hub-Signature-256")
-        ] = None,
+        x_hub_signature_256: Annotated[str | None, Header(alias="X-Hub-Signature-256")] = None,
         x_github_event: Annotated[str | None, Header(alias="X-GitHub-Event")] = None,
         x_github_delivery: Annotated[str | None, Header(alias="X-GitHub-Delivery")] = None,
     ) -> dict[str, Any]:
@@ -750,6 +839,130 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 }
                 for project in projects
             ]
+
+    @app.get("/api/v1/members")
+    async def list_members(
+        _: Annotated[AdminContext, Depends(require_admin)],
+        project_id: UUID | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            select(User, ProjectMembership, TelegramIdentity)
+            .join(ProjectMembership, ProjectMembership.user_id == User.id)
+            .outerjoin(TelegramIdentity, TelegramIdentity.user_id == User.id)
+            .order_by(
+                ProjectMembership.project_id,
+                User.display_name,
+                TelegramIdentity.created_at.desc().nullslast(),
+            )
+        )
+        if project_id is not None:
+            query = query.where(ProjectMembership.project_id == project_id)
+        async with database.session() as session:
+            rows = (await session.execute(query)).all()
+        # A user normally has one Telegram identity. If old data contains more,
+        # expose the newest identity once instead of duplicating the membership row.
+        members: dict[tuple[UUID, UUID], dict[str, Any]] = {}
+        for user, membership, identity in rows:
+            key = (membership.project_id, user.id)
+            members.setdefault(key, serialize_member(user, membership, identity))
+        return list(members.values())
+
+    @app.put("/api/v1/projects/{project_id}/members/{user_id}")
+    async def update_member(
+        project_id: UUID,
+        user_id: UUID,
+        payload: MemberUpdateInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        try:
+            async with database.session() as session:
+                row = (
+                    await session.execute(
+                        select(User, ProjectMembership)
+                        .join(ProjectMembership, ProjectMembership.user_id == User.id)
+                        .where(
+                            User.id == user_id,
+                            ProjectMembership.project_id == project_id,
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if row is None:
+                    raise HTTPException(status.HTTP_404_NOT_FOUND, "member_not_found")
+                user, membership = row
+                identity = await session.scalar(
+                    select(TelegramIdentity)
+                    .where(TelegramIdentity.user_id == user_id)
+                    .order_by(TelegramIdentity.created_at.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+                previous_telegram_user_id = (
+                    identity.telegram_user_id if identity is not None else None
+                )
+                previous_telegram_username = identity.username if identity is not None else None
+                telegram_user_id_changed = (
+                    identity is not None and identity.telegram_user_id != payload.telegram_user_id
+                )
+                if identity is None:
+                    identity = TelegramIdentity(
+                        user_id=user_id,
+                        telegram_user_id=payload.telegram_user_id,
+                        username=payload.telegram_username,
+                        reachable=False,
+                    )
+                    session.add(identity)
+                else:
+                    identity.telegram_user_id = payload.telegram_user_id
+                    identity.username = payload.telegram_username
+                    if telegram_user_id_changed:
+                        identity.verified_at = None
+                        identity.reachable = False
+                        identity.private_chat_id = None
+
+                user.display_name = payload.display_name
+                user.active = payload.active
+                membership.role = payload.role
+                membership.department = payload.department
+                membership.stack = payload.stack
+                membership.preferred_language = payload.language
+                membership.knowledge_scope = payload.knowledge_scope
+                membership.can_create_requests = payload.can_create_requests
+                await session.flush()
+                await append_audit(
+                    session,
+                    event_type="project.member_profile_updated",
+                    correlation_id=(
+                        f"member-profile:{project_id}:{user_id}:{secrets.token_hex(8)}"
+                    ),
+                    actor_type="admin",
+                    actor_id=str(admin.principal_id),
+                    project_id=project_id,
+                    subject_type="user",
+                    subject_id=str(user_id),
+                    payload={
+                        "role": membership.role,
+                        "department": membership.department,
+                        "stack": membership.stack,
+                        "language": membership.preferred_language,
+                        "knowledge_scope": membership.knowledge_scope,
+                        "can_create_requests": membership.can_create_requests,
+                        "active": user.active,
+                        "telegram_user_id_previous": previous_telegram_user_id,
+                        "telegram_user_id": identity.telegram_user_id,
+                        "telegram_user_id_changed": telegram_user_id_changed,
+                        "telegram_username_changed": (
+                            previous_telegram_username != identity.username
+                        ),
+                        "telegram_verification_reset": telegram_user_id_changed,
+                    },
+                )
+                return serialize_member(user, membership, identity)
+        except IntegrityError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "telegram_user_id_already_assigned"
+            ) from exc
 
     @app.get("/api/v1/projects/{project_id}/agent-settings")
     async def get_agent_settings(
@@ -997,9 +1210,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             version = await ClaudeCode(settings).probe(oauth_token=token)
         except Exception as exc:
             log.warning("claude.probe_failed", error_type=type(exc).__name__)
-            error_code = (
-                exc.code if isinstance(exc, ClaudeError) else "model_provider_unavailable"
-            )
+            error_code = exc.code if isinstance(exc, ClaudeError) else "model_provider_unavailable"
             outcome = "failure"
         else:
             outcome = "success"
@@ -1350,23 +1561,81 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         admin: Annotated[AdminContext, Depends(require_admin)],
         _: Annotated[None, Depends(require_same_origin)],
     ) -> Response:
-        async with database.session() as session:
-            thread = await session.get(ConversationThread, thread_id)
-            if thread is None:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation_not_found")
-            project_id = thread.project_id
-            await append_audit(
-                session,
-                event_type="conversation.deleted",
-                correlation_id=f"conversation:{thread.id}:{secrets.token_hex(8)}",
-                actor_type="admin",
-                actor_id=str(admin.principal_id),
-                project_id=project_id,
-                subject_type="conversation_thread",
-                subject_id=str(thread.id),
-                payload={"chat_id": str(thread.chat_id) if thread.chat_id else None},
+        lock_key = f"dca:claude-context:{thread_id}"
+        async with database.engine.connect() as lock_connection:
+            acquired = await lock_connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
             )
-            await session.delete(thread)
+            if acquired is not True:
+                raise HTTPException(status.HTTP_409_CONFLICT, "conversation_context_busy")
+            try:
+                async with database.session() as session:
+                    thread = await session.scalar(
+                        select(ConversationThread)
+                        .where(ConversationThread.id == thread_id)
+                        .with_for_update()
+                    )
+                    if thread is None:
+                        raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation_not_found")
+                    project_id = thread.project_id
+                    claude_session_id = thread.claude_session_id
+                    try:
+                        deleted_artifacts = (
+                            await asyncio.to_thread(
+                                _purge_claude_session_artifacts,
+                                settings.claude_session_root,
+                                claude_session_id,
+                            )
+                            if claude_session_id is not None
+                            else 0
+                        )
+                    except RuntimeError as exc:
+                        log.exception(
+                            "conversation.claude_session_cleanup_failed",
+                            thread_id=str(thread.id),
+                        )
+                        raise HTTPException(
+                            status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            "claude_session_cleanup_failed",
+                        ) from exc
+                    await append_audit(
+                        session,
+                        event_type="conversation.deleted",
+                        correlation_id=f"conversation:{thread.id}:{secrets.token_hex(8)}",
+                        actor_type="admin",
+                        actor_id=str(admin.principal_id),
+                        project_id=project_id,
+                        subject_type="conversation_thread",
+                        subject_id=str(thread.id),
+                        payload={
+                            "chat_id": str(thread.chat_id) if thread.chat_id else None,
+                            "claude_session_id": (
+                                str(claude_session_id) if claude_session_id is not None else None
+                            ),
+                            "claude_session_artifacts_deleted": deleted_artifacts,
+                        },
+                    )
+                    await session.delete(thread)
+            finally:
+                try:
+                    released = await lock_connection.scalar(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": lock_key},
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "claude.context_lock_release_failed",
+                        thread_id=str(thread_id),
+                    )
+                    await lock_connection.invalidate(exc)
+                else:
+                    if released is not True:
+                        log.error(
+                            "claude.context_lock_release_failed",
+                            thread_id=str(thread_id),
+                        )
+                        await lock_connection.invalidate()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/v1/interactions")
@@ -1581,6 +1850,29 @@ async def enforce_login_rate_limit(
         return
     if count > 10:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited")
+
+
+def serialize_member(
+    user: User,
+    membership: ProjectMembership,
+    identity: TelegramIdentity | None,
+) -> dict[str, Any]:
+    return {
+        "project_id": str(membership.project_id),
+        "user_id": str(user.id),
+        "display_name": user.display_name,
+        "telegram_user_id": identity.telegram_user_id if identity is not None else None,
+        "telegram_username": identity.username if identity is not None else None,
+        "role": membership.role,
+        "department": membership.department,
+        "stack": membership.stack,
+        "language": membership.preferred_language,
+        "knowledge_scope": membership.knowledge_scope,
+        "can_create_requests": membership.can_create_requests,
+        "active": user.active,
+        "telegram_verified": identity is not None and identity.verified_at is not None,
+        "telegram_reachable": identity is not None and identity.reachable,
+    }
 
 
 def serialize_agent_settings(
@@ -1815,8 +2107,18 @@ def serialize_request(row: ChangeRequest) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "project_id": str(row.project_id),
+        "created_by_user_id": (
+            str(row.created_by_user_id) if row.created_by_user_id is not None else None
+        ),
+        "source_interaction_id": (
+            str(row.source_interaction_id) if row.source_interaction_id is not None else None
+        ),
         "correlation_id": row.correlation_id,
         "source": row.source,
+        "requester_profile": row.requester_profile,
+        "question": row.question,
+        "agent_summary": row.agent_summary,
+        "citations": row.citations,
         "kind": row.kind,
         "title": row.title,
         "description": row.description,
@@ -1841,8 +2143,7 @@ def serialize_repository(row: Repository, settings: Settings) -> dict[str, Any]:
         "auto_sync_enabled": row.auto_sync_enabled,
         "auto_sync_mode": (
             "webhook_reconcile"
-            if row.auto_sync_enabled
-            and bool(settings.github_webhook_secret.get_secret_value())
+            if row.auto_sync_enabled and bool(settings.github_webhook_secret.get_secret_value())
             else "reconcile"
             if row.auto_sync_enabled
             else "disabled"

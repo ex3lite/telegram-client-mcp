@@ -42,6 +42,26 @@ const targets: Record<ChangeRequest["status"], ChangeRequest["status"][]> = {
   done: [],
   rejected: []
 };
+const statusLabels: Record<ChangeRequest["status"], string> = {
+  open: "Открыть",
+  in_progress: "Взять в работу",
+  done: "Завершить",
+  rejected: "Отклонить"
+};
+const kindLabels: Record<ChangeRequest["kind"], string> = {
+  bug: "Ошибка",
+  task: "Задача",
+  feature: "Новая функция",
+  integration: "Интеграция",
+  change: "Доработка",
+  question: "Нужен ответ Backend"
+};
+const priorityLabels: Record<ChangeRequest["priority"], string> = {
+  low: "Низкий",
+  normal: "Обычный",
+  high: "Высокий",
+  urgent: "Срочный"
+};
 
 async function selectRow(id: string) {
   await router.replace({ query: { ...route.query, selected: id } });
@@ -108,25 +128,60 @@ function mutateStatus(row: ChangeRequest, status: ChangeRequest["status"]) {
               <td data-label="ID"><code>{{ shortId(row.id) }}</code></td>
               <td data-label="Заголовок"><strong>{{ row.title }}</strong></td>
               <td data-label="Проект">{{ projectName(projects.data.value, row.project_id) }}</td>
-              <td data-label="Тип">{{ row.kind }}</td>
-              <td data-label="Приоритет">{{ row.priority }}</td>
+              <td data-label="Тип">{{ kindLabels[row.kind] }}</td>
+              <td data-label="Приоритет">{{ priorityLabels[row.priority] }}</td>
               <td data-label="Статус"><StatusBadge :value="row.status" /></td>
               <td data-label="Создана">{{ formatDate(row.created_at) }}</td>
             </tr>
           </tbody>
         </table>
       </div>
-      <aside v-if="selected" class="detail-panel" aria-label="Детали заявки">
+      <aside v-if="selected" class="detail-panel request-detail" aria-label="Детали заявки">
         <button class="detail-panel__close" type="button" @click="closeSelection">Закрыть</button>
         <h2>{{ selected.title }}</h2>
         <StatusBadge :value="selected.status" />
         <dl class="detail-list">
           <dt>ID</dt><dd><code>{{ selected.id }}</code></dd>
+          <dt>Проект</dt><dd>{{ projectName(projects.data.value, selected.project_id) }}</dd>
+          <dt>Тип</dt><dd>{{ kindLabels[selected.kind] }}</dd>
+          <dt>Приоритет</dt><dd>{{ priorityLabels[selected.priority] }}</dd>
+          <dt>Автор</dt><dd>{{ selected.requester_profile.display_name || "Системный запрос" }}</dd>
+          <dt>Профиль</dt>
+          <dd>
+            {{ [selected.requester_profile.role, selected.requester_profile.department, selected.requester_profile.stack].filter(Boolean).join(" · ") || "Не указан" }}
+            <br v-if="selected.requester_profile.language" />
+            <small v-if="selected.requester_profile.language">Язык: {{ selected.requester_profile.language }}</small>
+          </dd>
           <dt>Correlation</dt><dd><code>{{ selected.correlation_id }}</code></dd>
           <dt>Источник</dt><dd>{{ selected.source }}</dd>
-          <dt>Описание</dt><dd>{{ selected.description || "Не указано" }}</dd>
+          <dt v-if="selected.source_interaction_id">Запуск агента</dt>
+          <dd v-if="selected.source_interaction_id">
+            <RouterLink :to="{ name: 'runs', query: { ...route.query, selected: selected.source_interaction_id } }">
+              Открыть исходный запуск
+            </RouterLink>
+          </dd>
           <dt>Создана</dt><dd>{{ formatDate(selected.created_at) }}</dd>
+          <dt>Обновлена</dt><dd>{{ formatDate(selected.updated_at) }}</dd>
         </dl>
+        <section v-if="selected.question" class="run-section">
+          <h3>Исходный вопрос</h3>
+          <p class="markdown-output">{{ selected.question }}</p>
+        </section>
+        <section v-if="selected.agent_summary || selected.description" class="run-section">
+          <h3>{{ selected.agent_summary ? "Резюме агента" : "Описание" }}</h3>
+          <p class="markdown-output">{{ selected.agent_summary || selected.description }}</p>
+        </section>
+        <section v-if="selected.citations.length" class="run-section">
+          <div class="run-section__header">
+            <h3>Подтверждённые источники</h3>
+            <span>{{ selected.citations.length }}</span>
+          </div>
+          <ul class="citation-list">
+            <li v-for="citation in selected.citations" :key="`${citation.path}:${citation.start_line}`">
+              <code>{{ citation.path }}:{{ citation.start_line }}–{{ citation.end_line }}</code>
+            </li>
+          </ul>
+        </section>
         <div v-if="targets[selected.status].length" class="detail-actions">
           <button
             v-for="target in targets[selected.status]"
@@ -135,7 +190,7 @@ function mutateStatus(row: ChangeRequest, status: ChangeRequest["status"]) {
             :disabled="changeStatus.isPending.value"
             @click="mutateStatus(selected, target)"
           >
-            {{ target }}
+            {{ statusLabels[target] }}
           </button>
         </div>
       </aside>

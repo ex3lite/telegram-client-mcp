@@ -30,8 +30,11 @@ from dca.db import (
     AdminPrincipal,
     AdminSession,
     AuditEvent,
+    ChangeRequest,
     Clarification,
+    ConversationThread,
     Database,
+    Interaction,
     Job,
     Project,
     ProjectMembership,
@@ -43,17 +46,25 @@ from dca.db import (
     User,
     enqueue_repository_sync,
 )
-from dca.domain import AskUserInput, ClarificationStatus, JobStatus, RepositoryStatus, utcnow
+from dca.domain import (
+    AgentChangeRequestProposal,
+    AskUserInput,
+    ClarificationStatus,
+    JobStatus,
+    RepositoryStatus,
+    utcnow,
+)
 from dca.service import (
     ServiceError,
     admin_key_fingerprint,
     answer_clarification_from_telegram,
     cancel_clarification,
+    create_agent_change_request,
     create_clarification,
     require_service_scope,
 )
 from dca.telegram import TelegramAdapter, queue_telegram_update, reserve_telegram_update
-from dca.worker import Worker
+from dca.worker import Worker, load_live_requester_profile
 
 pytestmark = pytest.mark.integration
 
@@ -121,6 +132,250 @@ async def seed_scope(database: Database) -> dict[str, Any]:
         "user_id": user.id,
         "account_id": account.id,
     }
+
+
+@pytest.mark.asyncio
+async def test_live_requester_profile_fails_closed_after_telegram_rebind(
+    database: Database,
+) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        thread = ConversationThread(
+            project_id=ids["project_id"],
+            user_id=ids["user_id"],
+        )
+        session.add(thread)
+        await session.flush()
+        interaction = Interaction(
+            project_id=ids["project_id"],
+            conversation_thread_id=thread.id,
+            correlation_id="tg:identity-rebind",
+            source="telegram",
+            source_ref={
+                "telegram_user_id": 9001,
+                "requester_user_id": str(ids["user_id"]),
+            },
+            question="Как работает API?",
+        )
+        session.add(interaction)
+        await session.flush()
+
+        profile = await load_live_requester_profile(session, interaction)
+        assert profile is not None
+        assert profile["user_id"] == str(ids["user_id"])
+        assert profile["telegram_user_id"] == 9001
+
+        identity = await session.scalar(
+            select(TelegramIdentity).where(TelegramIdentity.telegram_user_id == 9001)
+        )
+        assert identity is not None
+        identity.telegram_user_id = 9002
+        identity.verified_at = None
+        await session.flush()
+
+        with pytest.raises(ServiceError) as error:
+            await load_live_requester_profile(session, interaction)
+
+        assert error.value.code == "project_scope_violation"
+
+
+@pytest.mark.asyncio
+async def test_agent_request_uses_trusted_context_and_is_idempotent(database: Database) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        interaction = Interaction(
+            project_id=ids["project_id"],
+            correlation_id="tg:agent-request",
+            source="telegram",
+            source_ref={
+                "telegram_user_id": 9001,
+                "requester_profile": {"role": "admin-from-untrusted-json"},
+            },
+            question="Добавьте endpoint для аватарок",
+            status="published",
+            citations=[{"path": "src/avatar.py", "start_line": 10, "end_line": 20}],
+        )
+        session.add(interaction)
+        await session.flush()
+        proposal = AgentChangeRequestProposal(
+            kind="integration",
+            title="Контракт API аватарок",
+            summary="Frontend нужен контракт загрузки и отображения аватарок.",
+            priority="high",
+        )
+
+        first, first_created = await create_agent_change_request(
+            session,
+            interaction=interaction,
+            proposal=proposal,
+        )
+        second, second_created = await create_agent_change_request(
+            session,
+            interaction=interaction,
+            proposal=proposal,
+        )
+
+        assert first.id == second.id
+        assert first_created is True
+        assert second_created is False
+        assert first.created_by_user_id == ids["user_id"]
+        assert first.requester_profile == {
+            "display_name": "Developer",
+            "role": "developer",
+            "department": None,
+            "stack": None,
+            "language": "ru",
+            "knowledge_scope": "integration",
+            "can_create_requests": True,
+        }
+        assert first.question == interaction.question
+        assert first.agent_summary == proposal.summary
+        assert first.citations == interaction.citations
+
+
+@pytest.mark.asyncio
+async def test_agent_request_model_proposal_cannot_replace_user_intent(
+    database: Database,
+) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        interaction = Interaction(
+            project_id=ids["project_id"],
+            correlation_id="tg:no-request-intent",
+            source="telegram",
+            source_ref={"telegram_user_id": 9001},
+            question="Как внедрить аватарки?",
+            status="published",
+            citations=[],
+        )
+        session.add(interaction)
+        await session.flush()
+
+        with pytest.raises(ServiceError, match="does not explicitly request") as error:
+            await create_agent_change_request(
+                session,
+                interaction=interaction,
+                proposal=AgentChangeRequestProposal(
+                    kind="feature",
+                    title="Добавить аватарки",
+                    summary="Модель решила создать заявку.",
+                ),
+            )
+
+        assert error.value.code == "request_intent_required"
+        assert await session.scalar(select(func.count()).select_from(ChangeRequest)) == 0
+        assert await session.scalar(select(func.count()).select_from(AuditEvent)) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization_failure", ["inactive", "disabled", "unverified"])
+async def test_agent_request_rechecks_live_requester_authorization(
+    database: Database,
+    authorization_failure: str,
+) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        if authorization_failure == "inactive":
+            user = await session.get(User, ids["user_id"])
+            assert user is not None
+            user.active = False
+        elif authorization_failure == "disabled":
+            membership = await session.get(
+                ProjectMembership,
+                (ids["project_id"], ids["user_id"]),
+            )
+            assert membership is not None
+            membership.can_create_requests = False
+        else:
+            identity = await session.scalar(
+                select(TelegramIdentity).where(TelegramIdentity.telegram_user_id == 9001)
+            )
+            assert identity is not None
+            identity.verified_at = None
+
+        interaction = Interaction(
+            project_id=ids["project_id"],
+            correlation_id=f"tg:forbidden-{authorization_failure}",
+            source="telegram",
+            source_ref={"telegram_user_id": 9001},
+            question="Создай заявку: добавьте endpoint для аватарок",
+            status="published",
+            citations=[],
+        )
+        session.add(interaction)
+        await session.flush()
+
+        with pytest.raises(ServiceError) as error:
+            await create_agent_change_request(
+                session,
+                interaction=interaction,
+                proposal=AgentChangeRequestProposal(
+                    kind="feature",
+                    title="Добавить аватарки",
+                    summary="Нужна backend-доработка.",
+                ),
+            )
+
+        assert error.value.code == "forbidden"
+        assert await session.scalar(select(func.count()).select_from(ChangeRequest)) == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_request_rejects_telegram_identity_mismatching_thread_author(
+    database: Database,
+) -> None:
+    ids = await seed_scope(database)
+    async with database.session() as session:
+        other_user = User(display_name="Other developer")
+        session.add(other_user)
+        await session.flush()
+        session.add_all(
+            [
+                ProjectMembership(
+                    project_id=ids["project_id"],
+                    user_id=other_user.id,
+                    role="developer",
+                ),
+                TelegramIdentity(
+                    user_id=other_user.id,
+                    telegram_user_id=9002,
+                    verified_at=utcnow(),
+                    reachable=True,
+                ),
+            ]
+        )
+        thread = ConversationThread(
+            project_id=ids["project_id"],
+            user_id=ids["user_id"],
+        )
+        session.add(thread)
+        await session.flush()
+        interaction = Interaction(
+            project_id=ids["project_id"],
+            conversation_thread_id=thread.id,
+            correlation_id="tg:mismatched-author",
+            source="telegram",
+            source_ref={"telegram_user_id": 9002},
+            question="Создай заявку: добавьте endpoint для аватарок",
+            status="published",
+            citations=[],
+        )
+        session.add(interaction)
+        await session.flush()
+
+        with pytest.raises(ServiceError) as error:
+            await create_agent_change_request(
+                session,
+                interaction=interaction,
+                proposal=AgentChangeRequestProposal(
+                    kind="feature",
+                    title="Добавить аватарки",
+                    summary="Нужна backend-доработка.",
+                ),
+            )
+
+        assert error.value.code == "forbidden"
+        assert await session.scalar(select(func.count()).select_from(ChangeRequest)) == 0
 
 
 @pytest.mark.asyncio
@@ -678,9 +933,7 @@ async def test_signed_github_push_is_deduplicated_and_marks_repository_stale(
             first = await client.post("/webhooks/github", content=body, headers=headers)
             duplicate = await client.post("/webhooks/github", content=body, headers=headers)
             replay_headers = {**headers, "X-GitHub-Delivery": str(uuid4())}
-            replay = await client.post(
-                "/webhooks/github", content=body, headers=replay_headers
-            )
+            replay = await client.post("/webhooks/github", content=body, headers=replay_headers)
 
         assert first.status_code == 202
         assert first.json()["queued"] is True
@@ -711,11 +964,7 @@ async def test_signed_github_push_is_deduplicated_and_marks_repository_stale(
             assert disabled_stored.status == RepositoryStatus.DISABLED.value
             assert disabled_stored.sync_generation == 0
             assert disabled_stored.last_webhook_commit is None
-            jobs = list(
-                await session.scalars(
-                    select(Job).where(Job.kind == "repository.sync")
-                )
-            )
+            jobs = list(await session.scalars(select(Job).where(Job.kind == "repository.sync")))
             assert len(jobs) == 2
             assert {job.payload["repository_id"] for job in jobs} == {
                 str(repository_id),
@@ -917,3 +1166,262 @@ async def test_newer_sync_generation_wins_across_two_workers(
             )
         )
         assert superseded == 1
+
+
+@pytest.mark.asyncio
+async def test_admin_lists_and_updates_project_member_profile(
+    database: Database, tmp_path: Path
+) -> None:
+    secret = "member-admin-session-secret-32-bytes"  # noqa: S105 - synthetic credential
+    async with database.session() as session:
+        project = Project(slug=f"members-{uuid4().hex[:8]}", name="Backend")
+        other_project = Project(slug=f"members-other-{uuid4().hex[:8]}", name="Other")
+        user = User(display_name="Бека")
+        conflicting_user = User(display_name="Чужой аккаунт")
+        principal = AdminPrincipal(name=f"member-admin-{uuid4().hex[:8]}")
+        session.add_all([project, other_project, user, conflicting_user, principal])
+        await session.flush()
+        membership = ProjectMembership(
+            project_id=project.id,
+            user_id=user.id,
+            role="developer",
+            department="Mobile",
+            stack="Android / Kotlin",
+        )
+        identity = TelegramIdentity(
+            user_id=user.id,
+            telegram_user_id=1_118_192_318,
+            username="beka",
+            private_chat_id=1_118_192_318,
+            verified_at=utcnow(),
+            reachable=True,
+        )
+        conflicting_identity = TelegramIdentity(
+            user_id=conflicting_user.id,
+            telegram_user_id=999_000_111,
+            verified_at=utcnow(),
+            reachable=True,
+        )
+        admin_key = AdminAccessKey(
+            principal_id=principal.id,
+            fingerprint=admin_key_fingerprint(uuid4(), secret),
+        )
+        session.add_all([membership, identity, conflicting_identity, admin_key])
+        await session.flush()
+        admin_session = AdminSession(
+            access_key_id=admin_key.id,
+            expires_at=utcnow() + timedelta(days=1),
+        )
+        session.add(admin_session)
+        await session.flush()
+        project_id = project.id
+        user_id = user.id
+        admin_session_id = admin_session.id
+
+    app = create_app(
+        Settings(
+            public_url="http://testserver",
+            database_url=os.environ["DCA_TEST_DATABASE_URL"],
+            session_secret=SecretStr(secret),
+            cookie_secure=False,
+            repository_root=tmp_path / "repositories",
+            snapshot_root=tmp_path / "snapshots",
+        )
+    )
+    cookie = URLSafeTimedSerializer(secret, salt="dca-admin-session-v2").dumps(
+        {"session_id": str(admin_session_id)}
+    )
+    profile_payload = {
+        "display_name": "Бека Android",
+        "telegram_user_id": 1_118_192_318,
+        "telegram_username": "@beka_android",
+        "role": "android",
+        "department": "Mobile",
+        "stack": "Kotlin",
+        "language": "en",
+        "knowledge_scope": "internal",
+        "can_create_requests": False,
+        "active": False,
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+            cookies={"dca_admin": cookie},
+        ) as client:
+            listed = await client.get("/api/v1/members", params={"project_id": project_id})
+            updated = await client.put(
+                f"/api/v1/projects/{project_id}/members/{user_id}",
+                headers={"Origin": "http://testserver"},
+                json=profile_payload,
+            )
+            conflict = await client.put(
+                f"/api/v1/projects/{project_id}/members/{user_id}",
+                headers={"Origin": "http://testserver"},
+                json={**profile_payload, "telegram_user_id": 999_000_111},
+            )
+            preserved = await client.get("/api/v1/members", params={"project_id": project_id})
+            rebound = await client.put(
+                f"/api/v1/projects/{project_id}/members/{user_id}",
+                headers={"Origin": "http://testserver"},
+                json={**profile_payload, "telegram_user_id": 1_118_192_319},
+            )
+
+        assert listed.status_code == 200
+        assert len(listed.json()) == 1
+        assert listed.json()[0]["project_id"] == str(project_id)
+        assert listed.json()[0]["telegram_reachable"] is True
+        assert updated.status_code == 200
+        assert updated.json()["display_name"] == "Бека Android"
+        assert updated.json()["telegram_username"] == "beka_android"
+        assert updated.json()["language"] == "en"
+        assert updated.json()["knowledge_scope"] == "internal"
+        assert updated.json()["can_create_requests"] is False
+        assert updated.json()["active"] is False
+        assert updated.json()["telegram_verified"] is True
+        assert updated.json()["telegram_reachable"] is True
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"] == "telegram_user_id_already_assigned"
+        assert preserved.status_code == 200
+        assert preserved.json()[0]["telegram_user_id"] == 1_118_192_318
+        assert preserved.json()[0]["telegram_verified"] is True
+        assert preserved.json()[0]["telegram_reachable"] is True
+        assert rebound.status_code == 200
+        assert rebound.json()["telegram_user_id"] == 1_118_192_319
+        assert rebound.json()["telegram_verified"] is False
+        assert rebound.json()["telegram_reachable"] is False
+
+        async with database.session() as session:
+            stored_user = await session.get(User, user_id)
+            stored_membership = await session.get(ProjectMembership, (project_id, user_id))
+            stored_identity = await session.scalar(
+                select(TelegramIdentity).where(TelegramIdentity.user_id == user_id)
+            )
+            audits = list(
+                await session.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.event_type == "project.member_profile_updated",
+                        AuditEvent.project_id == project_id,
+                        AuditEvent.subject_id == str(user_id),
+                    )
+                )
+            )
+        assert stored_user is not None and stored_user.active is False
+        assert stored_membership is not None
+        assert stored_membership.role == "android"
+        assert stored_membership.preferred_language == "en"
+        assert stored_membership.knowledge_scope == "internal"
+        assert stored_identity is not None and stored_identity.username == "beka_android"
+        assert stored_identity.telegram_user_id == 1_118_192_319
+        assert stored_identity.verified_at is None
+        assert stored_identity.reachable is False
+        assert stored_identity.private_chat_id is None
+        assert len(audits) == 2
+        preserved_audit = next(
+            audit for audit in audits if not audit.payload["telegram_user_id_changed"]
+        )
+        rebound_audit = next(audit for audit in audits if audit.payload["telegram_user_id_changed"])
+        assert preserved_audit.actor_type == "admin"
+        assert preserved_audit.payload["telegram_username_changed"] is True
+        assert preserved_audit.payload["telegram_verification_reset"] is False
+        assert rebound_audit.payload["telegram_user_id_previous"] == 1_118_192_318
+        assert rebound_audit.payload["telegram_user_id"] == 1_118_192_319
+        assert rebound_audit.payload["telegram_verification_reset"] is True
+    finally:
+        await app.state.telegram.close()
+        await app.state.redis.aclose()
+        await app.state.database.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_delete_conversation_purges_exact_claude_session_artifacts(
+    database: Database, tmp_path: Path
+) -> None:
+    secret = "conversation-admin-session-secret"  # noqa: S105 - synthetic credential
+    claude_session_id = uuid4()
+    session_root = tmp_path / "claude-sessions"
+    project_artifacts = session_root / "projects" / "snapshot"
+    project_artifacts.mkdir(parents=True)
+    transcript = project_artifacts / f"{claude_session_id}.jsonl"
+    transcript.write_text("private transcript")
+    session_directory = session_root / "session-env" / str(claude_session_id)
+    session_directory.mkdir(parents=True)
+    (session_directory / "environment").write_text("private environment")
+    decoy = project_artifacts / f"copy-{claude_session_id}.jsonl"
+    decoy.write_text("keep")
+
+    async with database.session() as session:
+        project = Project(slug=f"conversation-{uuid4().hex[:8]}", name="Backend")
+        user = User(display_name="Developer")
+        principal = AdminPrincipal(name=f"conversation-admin-{uuid4().hex[:8]}")
+        session.add_all([project, user, principal])
+        await session.flush()
+        session.add(ProjectMembership(project_id=project.id, user_id=user.id, role="developer"))
+        await session.flush()
+        thread = ConversationThread(
+            project_id=project.id,
+            user_id=user.id,
+            claude_session_id=claude_session_id,
+        )
+        admin_key = AdminAccessKey(
+            principal_id=principal.id,
+            fingerprint=admin_key_fingerprint(uuid4(), secret),
+        )
+        session.add_all([thread, admin_key])
+        await session.flush()
+        admin_session = AdminSession(
+            access_key_id=admin_key.id,
+            expires_at=utcnow() + timedelta(days=1),
+        )
+        session.add(admin_session)
+        await session.flush()
+        thread_id = thread.id
+        project_id = project.id
+        admin_session_id = admin_session.id
+
+    app = create_app(
+        Settings(
+            public_url="http://testserver",
+            database_url=os.environ["DCA_TEST_DATABASE_URL"],
+            session_secret=SecretStr(secret),
+            cookie_secure=False,
+            repository_root=tmp_path / "repositories",
+            snapshot_root=tmp_path / "snapshots",
+            claude_session_root=session_root,
+        )
+    )
+    cookie = URLSafeTimedSerializer(secret, salt="dca-admin-session-v2").dumps(
+        {"session_id": str(admin_session_id)}
+    )
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+            cookies={"dca_admin": cookie},
+        ) as client:
+            response = await client.delete(
+                f"/api/v1/conversations/{thread_id}",
+                headers={"Origin": "http://testserver"},
+            )
+
+        assert response.status_code == 204
+        assert not transcript.exists()
+        assert not session_directory.exists()
+        assert decoy.read_text() == "keep"
+        async with database.session() as session:
+            stored_thread = await session.get(ConversationThread, thread_id)
+            audit = await session.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.event_type == "conversation.deleted",
+                    AuditEvent.project_id == project_id,
+                    AuditEvent.subject_id == str(thread_id),
+                )
+            )
+        assert stored_thread is None
+        assert audit is not None
+        assert audit.payload["claude_session_id"] == str(claude_session_id)
+        assert audit.payload["claude_session_artifacts_deleted"] == 2
+    finally:
+        await app.state.telegram.close()
+        await app.state.redis.aclose()
+        await app.state.database.close()

@@ -34,11 +34,13 @@ class Settings(BaseSettings):
     cookie_secure: bool = True
 
     claude_bin: str = "claude"
+    claude_session_root: Path = Path("runtime/claude-sessions")
     repository_root: Path = Path("runtime/repositories")
     snapshot_root: Path = Path("runtime/snapshots")
 
     worker_poll_seconds: float = Field(default=2, gt=0, le=60)
     worker_max_attempts: int = Field(default=5, ge=1, le=20)
+    knowledge_concurrency: int = Field(default=5, ge=1, le=5)
     log_level: str = "INFO"
 
     @field_validator("database_url")

@@ -4,11 +4,11 @@ import asyncio
 import os
 import random
 import socket
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
-from typing import Any, cast
-from uuid import UUID
+from typing import Any, Literal, cast
+from uuid import UUID, uuid4
 
 import structlog
 from aiogram.exceptions import (
@@ -24,7 +24,12 @@ from aiogram.exceptions import (
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from dca.claude import ClaudeCode, ClaudeError, RepositorySnapshots
+from dca.claude import (
+    ClaudeCode,
+    ClaudeError,
+    RepositorySnapshots,
+    compile_agent_policy,
+)
 from dca.config import Settings, get_settings
 from dca.db import (
     AgentMessage,
@@ -37,11 +42,19 @@ from dca.db import (
     TelegramChat,
     TelegramIdentity,
     TelegramUpdate,
+    User,
     append_audit,
     enqueue_job,
     enqueue_repository_sync,
 )
-from dca.domain import JobStatus, KnowledgeAnswer, KnowledgeArtifact, RepositoryStatus, utcnow
+from dca.domain import (
+    AgentChangeRequestProposal,
+    JobStatus,
+    KnowledgeAnswer,
+    KnowledgeArtifact,
+    RepositoryStatus,
+    utcnow,
+)
 from dca.memory import (
     ConversationContext,
     append_conversation_message,
@@ -53,12 +66,14 @@ from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
 from dca.service import (
     SYSTEM_SECRET_CLAUDE_OAUTH,
     ServiceError,
+    create_agent_change_request,
     expire_clarification,
     list_expired_pending,
     load_project_agent_settings,
     load_system_secret,
+    project_member_profile,
 )
-from dca.telegram import TelegramAdapter, ingest_telegram_update
+from dca.telegram import TelegramAdapter, document_requested, ingest_telegram_update
 
 log = structlog.get_logger()
 TELEGRAM_EXTERNAL_ACTIONS = {
@@ -78,22 +93,134 @@ TELEGRAM_POLL_FATAL_ERRORS = (
     TelegramForbiddenError,
     TelegramUnauthorizedError,
 )
+KNOWLEDGE_STREAM_INTERVAL_SECONDS = 1.0
 
 
 def _poll_retry_delay(base_delay: float) -> float:
     return base_delay + random.uniform(0, base_delay * 0.2)  # noqa: S311 - retry jitter
 
 
-def trusted_requester_profile(interaction: Interaction) -> dict[str, str] | None:
+def trusted_requester_profile(interaction: Interaction) -> dict[str, Any] | None:
+    """Return the queue-time audit snapshot; never use it as authorization authority."""
     raw_profile = interaction.source_ref.get("requester_profile")
     if interaction.source != "telegram" or not isinstance(raw_profile, dict):
         return None
-    profile = {
+    profile: dict[str, Any] = {
         key: value
-        for key in ("display_name", "role", "department", "stack")
-        if isinstance((value := raw_profile.get(key)), str)
+        for key in (
+            "display_name",
+            "role",
+            "department",
+            "stack",
+            "language",
+            "knowledge_scope",
+            "can_create_requests",
+        )
+        if isinstance((value := raw_profile.get(key)), (str, bool))
     }
+    telegram_user_id = interaction.source_ref.get("telegram_user_id")
+    if isinstance(telegram_user_id, int) and not isinstance(telegram_user_id, bool):
+        profile["telegram_user_id"] = telegram_user_id
     return profile or None
+
+
+async def load_live_requester_profile(
+    session: Any,
+    interaction: Interaction,
+) -> dict[str, Any] | None:
+    if interaction.source != "telegram":
+        return None
+    telegram_user_id = interaction.source_ref.get("telegram_user_id")
+    if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+        raise ServiceError(
+            "project_scope_violation",
+            "Requester Telegram identity is missing or no longer verified",
+        )
+    identity = await session.scalar(
+        select(TelegramIdentity).where(
+            TelegramIdentity.telegram_user_id == telegram_user_id,
+            TelegramIdentity.verified_at.is_not(None),
+        )
+    )
+    if identity is None:
+        raise ServiceError(
+            "project_scope_violation",
+            "Requester Telegram identity is missing or no longer verified",
+        )
+
+    requester_user_id: UUID | None = None
+    if interaction.conversation_thread_id is not None:
+        requester_user_id = await session.scalar(
+            select(ConversationThread.user_id).where(
+                ConversationThread.id == interaction.conversation_thread_id,
+                ConversationThread.project_id == interaction.project_id,
+            )
+        )
+    if requester_user_id is None:
+        raw_user_id = interaction.source_ref.get("requester_user_id")
+        if isinstance(raw_user_id, str):
+            with suppress(ValueError):
+                requester_user_id = UUID(raw_user_id)
+    if requester_user_id is not None and requester_user_id != identity.user_id:
+        raise ServiceError(
+            "project_scope_violation",
+            "Requester Telegram identity no longer matches the conversation author",
+        )
+    requester_user_id = identity.user_id
+    row = (
+        await session.execute(
+            select(User, ProjectMembership)
+            .join(ProjectMembership, ProjectMembership.user_id == User.id)
+            .where(
+                User.id == requester_user_id,
+                User.active.is_(True),
+                ProjectMembership.project_id == interaction.project_id,
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise ServiceError(
+            "project_scope_violation",
+            "Requester no longer has access to this project",
+        )
+    profile = project_member_profile(*row)
+    profile["user_id"] = str(requester_user_id)
+    profile["telegram_user_id"] = telegram_user_id
+    return profile
+
+
+def interaction_delivery_scope(
+    interaction: Interaction,
+) -> Literal["private", "group", "external"]:
+    delivery = interaction.source_ref.get("delivery")
+    if interaction.source != "telegram" or not isinstance(delivery, dict):
+        return "external"
+    return "group" if delivery.get("kind") == "group_message" else "private"
+
+
+def sanitize_stream_text(
+    value: str,
+    *,
+    level: PrivacyLevel,
+    location: str,
+) -> tuple[str, list[PrivacyFinding]]:
+    """Redact complete findings and hold the unfinished token at the stream edge."""
+    result = sanitize_text(value, level=level, location=location)
+    private_key_start = value.find("-----BEGIN")
+    if (
+        not result.findings
+        and private_key_start >= 0
+        and "PRIVATE" in value[private_key_start:].upper()
+    ):
+        return (
+            f"{value[:private_key_start]}[REDACTED:private_key]",
+            [{"kind": "private_key", "location": location, "action": "redacted"}],
+        )
+    boundary = max(result.text.rfind(" "), result.text.rfind("\n"), result.text.rfind("\t"))
+    return (
+        result.text[: boundary + 1].rstrip() if boundary >= 0 else "",
+        result.findings,
+    )
 
 
 def conversation_prompt_context(context: ConversationContext) -> dict[str, Any]:
@@ -135,18 +262,26 @@ class Worker:
         )
         try:
             async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(self._run_job_loop())
+                tasks.create_task(self._run_job_loop(exclude_kind="knowledge.answer"))
+                for _ in range(self.settings.knowledge_concurrency):
+                    tasks.create_task(self._run_job_loop(only_kind="knowledge.answer"))
                 if self.settings.telegram_mode == "polling":
                     tasks.create_task(self._poll_telegram_forever())
         finally:
             await self.telegram.close()
             await self.database.close()
 
-    async def _run_job_loop(self) -> None:
+    async def _run_job_loop(
+        self,
+        *,
+        only_kind: str | None = None,
+        exclude_kind: str | None = None,
+    ) -> None:
         while True:
-            await self._sweep_expired_if_due()
-            await self._reconcile_repositories_if_due()
-            job = await self.claim_job()
+            if only_kind is None:
+                await self._sweep_expired_if_due()
+                await self._reconcile_repositories_if_due()
+            job = await self.claim_job(only_kind=only_kind, exclude_kind=exclude_kind)
             if job is None:
                 await asyncio.sleep(self.settings.worker_poll_seconds)
                 continue
@@ -230,6 +365,42 @@ class Worker:
                         log.error(
                             "repository.sync_lock_release_failed",
                             repository_id=str(repository_id),
+                        )
+                        await connection.invalidate()
+
+    @asynccontextmanager
+    async def _conversation_context_lock(self, thread_id: UUID) -> AsyncIterator[None]:
+        lock_key = f"dca:claude-context:{thread_id}"
+        async with self.database.engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+            if acquired is not True:
+                raise ServiceError(
+                    "conversation_context_busy",
+                    "Another answer is already using this conversation context",
+                    retryable=True,
+                )
+            try:
+                yield
+            finally:
+                try:
+                    released = await connection.scalar(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                        {"lock_key": lock_key},
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "claude.context_lock_release_failed",
+                        thread_id=str(thread_id),
+                    )
+                    await connection.invalidate(exc)
+                else:
+                    if released is not True:
+                        log.error(
+                            "claude.context_lock_release_failed",
+                            thread_id=str(thread_id),
                         )
                         await connection.invalidate()
 
@@ -322,9 +493,14 @@ class Worker:
             else:
                 retry_delay = 1.0
 
-    async def claim_job(self) -> Job | None:
+    async def claim_job(
+        self,
+        *,
+        only_kind: str | None = None,
+        exclude_kind: str | None = None,
+    ) -> Job | None:
         async with self.database.session() as session:
-            job = await session.scalar(
+            statement = (
                 select(Job)
                 .where(
                     Job.status.in_([JobStatus.QUEUED.value, JobStatus.RETRY.value]),
@@ -334,6 +510,11 @@ class Worker:
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )
+            if only_kind is not None:
+                statement = statement.where(Job.kind == only_kind)
+            if exclude_kind is not None:
+                statement = statement.where(Job.kind != exclude_kind)
+            job = await session.scalar(statement)
             if job is None:
                 return None
             job.status = JobStatus.RUNNING.value
@@ -372,18 +553,22 @@ class Worker:
             if exc.retryable:
                 retry_scheduled = await self._retry(job, exc.code, exc.message)
                 if not retry_scheduled:
-                    await self._publish_interaction_error(job, exc.message)
+                    await self._publish_interaction_error(job, exc.code)
             else:
                 await self._fail(job, exc.code, exc.message)
-                await self._publish_interaction_error(job, exc.message)
+                await self._publish_interaction_error(job, exc.code)
         except ServiceError as exc:
             if exc.retryable:
+                contention_delay = {
+                    "repository_sync_busy": 2,
+                    "conversation_context_busy": 1,
+                }.get(exc.code)
                 await self._retry(
                     job,
                     exc.code,
                     exc.message,
-                    delay=2 if exc.code == "repository_sync_busy" else None,
-                    consume_attempt=exc.code != "repository_sync_busy",
+                    delay=contention_delay,
+                    consume_attempt=contention_delay is None,
                 )
             else:
                 await self._fail(job, exc.code, exc.message)
@@ -614,7 +799,22 @@ class Worker:
             }
 
     async def _answer_interaction(self, interaction_id: UUID) -> dict[str, Any]:
+        async with self.database.session() as session:
+            interaction = await session.get(Interaction, interaction_id)
+            if interaction is None:
+                raise ServiceError("request_not_found", "Interaction is missing")
+            thread_id = interaction.conversation_thread_id
+        if thread_id is None:
+            return await self._answer_interaction_impl(interaction_id)
+        async with self._conversation_context_lock(thread_id):
+            return await self._answer_interaction_impl(interaction_id)
+
+    async def _answer_interaction_impl(self, interaction_id: UUID) -> dict[str, Any]:
         prompt_memory: dict[str, Any] | None = None
+        claude_prompt_memory: dict[str, Any] | None = None
+        native_session_id: UUID | None = None
+        resume_session = False
+        profile_changed_since_queue = False
         async with self.database.session() as session:
             interaction = await session.get(Interaction, interaction_id)
             if interaction is None:
@@ -639,11 +839,28 @@ class Worker:
             agent_settings = await load_project_agent_settings(session, interaction.project_id)
             if not agent_settings.enabled:
                 raise ServiceError("agent_disabled", "Agent is disabled for this project")
+            if agent_settings.privacy_level not in {"strict", "balanced"}:
+                raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
             oauth_token = await load_system_secret(
                 session,
                 SYSTEM_SECRET_CLAUDE_OAUTH,
                 self.settings.session_secret.get_secret_value(),
             )
+            requester_profile = await load_live_requester_profile(session, interaction)
+            queued_profile = trusted_requester_profile(interaction)
+            if requester_profile is not None and queued_profile is not None:
+                profile_changed_since_queue = any(
+                    requester_profile.get(key) != queued_profile.get(key) for key in queued_profile
+                )
+            delivery_scope = interaction_delivery_scope(interaction)
+            compiled_policy = compile_agent_policy(
+                project_settings=agent_settings,
+                requester_profile=requester_profile,
+                delivery_scope=delivery_scope,
+                repository_allowed_paths=repository.allowed_paths or [],
+                repository_denied_globs=agent_settings.denied_globs or [],
+            )
+            thread: ConversationThread | None = None
             if agent_settings.memory_enabled and interaction.conversation_thread_id is not None:
                 thread = await session.get(
                     ConversationThread,
@@ -666,6 +883,14 @@ class Worker:
                     before=interaction.created_at,
                 )
                 prompt_memory = conversation_prompt_context(context)
+                resume_session = bool(
+                    thread.claude_session_id is not None
+                    and thread.claude_repository_id == repository.id
+                    and thread.claude_commit_sha == interaction.commit_sha
+                    and thread.claude_policy_hash == compiled_policy.policy_sha256
+                )
+                native_session_id = thread.claude_session_id if resume_session else uuid4()
+            claude_prompt_memory = None if resume_session else prompt_memory
             interaction.status = "generating"
             await session.flush()
             session.expunge(interaction)
@@ -676,30 +901,170 @@ class Worker:
             interaction.commit_sha,
             denied_globs=agent_settings.denied_globs,
         )
+        wants_document = document_requested(interaction.question)
+        policy_stale = asyncio.Event()
+
+        async def ensure_policy_current() -> None:
+            if policy_stale.is_set():
+                raise ClaudeError(
+                    "context_policy_changed",
+                    "Requester access or agent context changed during generation",
+                    retryable=True,
+                )
+            try:
+                async with self.database.session() as session:
+                    live_interaction = await session.get(Interaction, interaction_id)
+                    if (
+                        live_interaction is None
+                        or live_interaction.repository_id != repository.id
+                        or live_interaction.commit_sha != interaction.commit_sha
+                    ):
+                        raise ClaudeError(
+                            "context_policy_changed",
+                            "Interaction repository context changed during generation",
+                            retryable=True,
+                        )
+                    live_repository = await session.get(Repository, repository.id)
+                    if live_repository is None:
+                        raise ClaudeError(
+                            "context_policy_changed",
+                            "Repository access changed during generation",
+                            retryable=True,
+                        )
+                    live_settings = await load_project_agent_settings(
+                        session, live_interaction.project_id
+                    )
+                    if not live_settings.enabled:
+                        raise ClaudeError(
+                            "context_policy_changed",
+                            "Agent access changed during generation",
+                            retryable=True,
+                        )
+                    live_profile = await load_live_requester_profile(session, live_interaction)
+                    live_policy = compile_agent_policy(
+                        project_settings=live_settings,
+                        requester_profile=live_profile,
+                        delivery_scope=interaction_delivery_scope(live_interaction),
+                        repository_allowed_paths=live_repository.allowed_paths or [],
+                        repository_denied_globs=live_settings.denied_globs or [],
+                    )
+            except ClaudeError as exc:
+                policy_stale.set()
+                if exc.code == "context_policy_changed":
+                    raise
+                raise ClaudeError(
+                    "context_policy_changed",
+                    "Requester access or agent context changed during generation",
+                    retryable=True,
+                ) from exc
+            except ServiceError as exc:
+                policy_stale.set()
+                raise ClaudeError(
+                    "context_policy_changed",
+                    "Requester access or agent context changed during generation",
+                    retryable=True,
+                ) from exc
+            if live_policy.policy_sha256 != compiled_policy.policy_sha256:
+                policy_stale.set()
+                raise ClaudeError(
+                    "context_policy_changed",
+                    "Requester access or agent context changed during generation",
+                    retryable=True,
+                )
+
         heartbeat = (
-            asyncio.create_task(self._draft_heartbeat(interaction))
+            asyncio.create_task(
+                self._draft_heartbeat(interaction, policy_guard=ensure_policy_current)
+            )
             if agent_settings.telegram_streaming_enabled
             else None
         )
-        try:
-            result = await self.claude.answer(
+        last_stream_at = float("-inf")
+        stream_privacy_findings: set[tuple[str, str]] = set()
+
+        async def stream_answer(answer_markdown: str, thinking: str) -> None:
+            nonlocal heartbeat, last_stream_at
+            now = asyncio.get_running_loop().time()
+            if now - last_stream_at < KNOWLEDGE_STREAM_INTERVAL_SECONDS:
+                return
+            await ensure_policy_current()
+            safe_answer_stream, answer_stream_findings = sanitize_stream_text(
+                answer_markdown,
+                level=cast(PrivacyLevel, agent_settings.privacy_level),
+                location="stream.answer_markdown",
+            )
+            safe_thinking_stream, thinking_stream_findings = sanitize_stream_text(
+                thinking,
+                level=cast(PrivacyLevel, agent_settings.privacy_level),
+                location="stream.thinking",
+            )
+            stream_privacy_findings.update(
+                (finding["kind"], finding["location"])
+                for finding in (*answer_stream_findings, *thinking_stream_findings)
+            )
+            if not safe_answer_stream and not safe_thinking_stream:
+                last_stream_at = now
+                return
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+                heartbeat = None
+            last_stream_at = now
+            try:
+                await self.telegram.send_knowledge_stream(
+                    interaction,
+                    answer_markdown=safe_answer_stream,
+                    thinking=safe_thinking_stream,
+                )
+            except Exception:
+                log.warning(
+                    "telegram.stream_failed",
+                    interaction_id=str(interaction.id),
+                    exc_info=True,
+                )
+
+        async def ask_claude(*, should_resume: bool, memory: dict[str, Any] | None) -> Any:
+            return await self.claude.answer(
                 snapshot=snapshot,
                 question=interaction.question,
                 project_settings=agent_settings,
-                requester_profile=trusted_requester_profile(interaction),
-                conversation_context=prompt_memory,
+                requester_profile=requester_profile,
+                conversation_context=memory,
                 oauth_token=oauth_token,
+                on_stream=(stream_answer if agent_settings.telegram_streaming_enabled else None),
+                delivery_scope=delivery_scope,
+                session_id=native_session_id,
+                resume_session=should_resume,
+                compiled_policy=compiled_policy,
             )
+
+        session_rotated = False
+        try:
+            try:
+                result = await ask_claude(
+                    should_resume=resume_session,
+                    memory=claude_prompt_memory,
+                )
+            except ClaudeError as exc:
+                if not resume_session or exc.code != "claude_session_unavailable":
+                    raise
+                native_session_id = uuid4()
+                resume_session = False
+                session_rotated = True
+                result = await ask_claude(should_resume=False, memory=prompt_memory)
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
                 with suppress(asyncio.CancelledError):
                     await heartbeat
 
-        if agent_settings.privacy_level not in {"strict", "balanced"}:
-            raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
+        await ensure_policy_current()
+        answer = (
+            result.answer if wants_document else result.answer.model_copy(update={"artifacts": []})
+        )
         safe_answer, privacy_findings, privacy_blocked = sanitize_knowledge_answer(
-            result.answer,
+            answer,
             level=cast(PrivacyLevel, agent_settings.privacy_level),
         )
         accepted = [check.citation.model_dump(mode="json") for check in result.accepted_citations]
@@ -740,23 +1105,45 @@ class Worker:
                 "privacy_blocked": True,
                 "findings": len(privacy_findings),
             }
-        rendered = render_answer(
-            answer_markdown=safe_answer.answer_markdown,
-            citations=accepted,
-            commit_sha=interaction.commit_sha,
-            uncertainty=safe_answer.uncertainty,
-        )
+        change_request_id: UUID | None = None
+        proposal_suppressed = False
         async with self.database.session() as session:
             persisted = await session.get(Interaction, interaction_id)
             if persisted is None:
                 raise ServiceError("request_not_found", "Interaction disappeared")
             persisted.status = "answer_ready"
-            persisted.answer_markdown = rendered
             persisted.artifacts = serialize_artifacts(safe_answer.artifacts)
             persisted.privacy_findings = [dict(finding) for finding in privacy_findings]
             persisted.citations = accepted
             persisted.rejected_citations = rejected
             persisted.uncertainty = safe_answer.uncertainty
+            answer_markdown = safe_answer.answer_markdown
+            if (
+                safe_answer.change_request is not None
+                and compiled_policy.requester["can_create_requests"] is True
+            ):
+                try:
+                    change_request, _ = await create_agent_change_request(
+                        session,
+                        interaction=persisted,
+                        proposal=safe_answer.change_request,
+                    )
+                except ServiceError as exc:
+                    if exc.code != "request_intent_required":
+                        raise
+                    proposal_suppressed = True
+                else:
+                    change_request_id = change_request.id
+                    answer_markdown = (
+                        f"{answer_markdown.rstrip()}\n\n"
+                        f"📥 Создал заявку `{str(change_request.id)[:8]}` для backend-отдела."
+                    )
+            persisted.answer_markdown = render_answer(
+                answer_markdown=answer_markdown,
+                citations=accepted,
+                commit_sha=interaction.commit_sha,
+                uncertainty=safe_answer.uncertainty,
+            )
             persisted.provider_metadata = {
                 "provider": "claude-code-cli",
                 "cli_version": result.cli_version,
@@ -767,6 +1154,15 @@ class Worker:
                 "memory_summary_updated": bool(
                     persisted.conversation_thread_id is not None and safe_answer.memory_summary
                 ),
+                "document_requested": wants_document,
+                "profile_changed_since_queue": profile_changed_since_queue,
+                "session_rotated_after_resume_failure": session_rotated,
+                "stream_privacy_findings": len(stream_privacy_findings),
+                "native_context": result.context_metadata,
+                "change_request_id": (
+                    str(change_request_id) if change_request_id is not None else None
+                ),
+                "proposal_suppressed": proposal_suppressed,
             }
             if agent_settings.memory_enabled and persisted.conversation_thread_id is not None:
                 thread = await session.get(
@@ -778,6 +1174,15 @@ class Worker:
                         "conversation_scope_unavailable",
                         "Interaction conversation is unavailable",
                     )
+                if native_session_id is not None and result.session_id == str(native_session_id):
+                    thread.claude_session_id = native_session_id
+                    thread.claude_repository_id = persisted.repository_id
+                    thread.claude_commit_sha = persisted.commit_sha
+                    thread.claude_policy_hash = compiled_policy.policy_sha256
+                    thread.claude_context_validated_at = utcnow()
+                    if result.compaction_count:
+                        thread.claude_compaction_count += result.compaction_count
+                        thread.claude_last_compacted_at = utcnow()
                 await append_conversation_message(
                     session,
                     project_id=persisted.project_id,
@@ -849,6 +1254,39 @@ class Worker:
                     "cli_version": result.cli_version,
                 },
             )
+            await append_audit(
+                session,
+                event_type="claude.context_validated",
+                correlation_id=persisted.correlation_id,
+                actor_type="system",
+                actor_id="claude-worker",
+                project_id=persisted.project_id,
+                subject_type="interaction",
+                subject_id=str(persisted.id),
+                payload={
+                    "contract_version": result.context_metadata.get("contract_version"),
+                    "policy_sha256": compiled_policy.policy_sha256,
+                    "session_id": result.session_id,
+                    "resumed": resume_session,
+                    "compaction_count": result.compaction_count,
+                    "profile_changed_since_queue": profile_changed_since_queue,
+                },
+            )
+            if result.compaction_count:
+                await append_audit(
+                    session,
+                    event_type="claude.context_compacted",
+                    correlation_id=persisted.correlation_id,
+                    actor_type="system",
+                    actor_id="claude-worker",
+                    project_id=persisted.project_id,
+                    subject_type="interaction",
+                    subject_id=str(persisted.id),
+                    payload={
+                        "count": result.compaction_count,
+                        "context_attested_after_compaction": True,
+                    },
+                )
             if privacy_findings:
                 await append_audit(
                     session,
@@ -861,10 +1299,56 @@ class Worker:
                     subject_id=str(persisted.id),
                     payload=privacy_audit_payload(privacy_findings),
                 )
-        return {"interaction_id": str(interaction_id), "citations": len(accepted)}
+            if proposal_suppressed:
+                await append_audit(
+                    session,
+                    event_type="knowledge.change_request_proposal_suppressed",
+                    correlation_id=persisted.correlation_id,
+                    actor_type="system",
+                    actor_id="request-intent-gate",
+                    project_id=persisted.project_id,
+                    subject_type="interaction",
+                    subject_id=str(persisted.id),
+                    outcome="suppressed",
+                    payload={"reason": "request_intent_required"},
+                )
+            if stream_privacy_findings:
+                await append_audit(
+                    session,
+                    event_type="knowledge.stream_privacy_redacted",
+                    correlation_id=persisted.correlation_id,
+                    actor_type="system",
+                    actor_id="privacy-filter",
+                    project_id=persisted.project_id,
+                    subject_type="interaction",
+                    subject_id=str(persisted.id),
+                    payload={
+                        "findings": len(stream_privacy_findings),
+                        "kinds": sorted(kind for kind, _ in stream_privacy_findings),
+                        "locations": sorted(location for _, location in stream_privacy_findings),
+                    },
+                )
+        return {
+            "interaction_id": str(interaction_id),
+            "citations": len(accepted),
+            "change_request_id": (
+                str(change_request_id) if change_request_id is not None else None
+            ),
+        }
 
-    async def _draft_heartbeat(self, interaction: Interaction) -> None:
+    async def _draft_heartbeat(
+        self,
+        interaction: Interaction,
+        *,
+        policy_guard: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        interval = 4 if interaction_delivery_scope(interaction) == "group" else 20
         while True:
+            if policy_guard is not None:
+                try:
+                    await policy_guard()
+                except (ClaudeError, ServiceError):
+                    return
             try:
                 await self.telegram.send_knowledge_progress(interaction)
             except Exception:
@@ -873,9 +1357,10 @@ class Worker:
                     interaction_id=str(interaction.id),
                     exc_info=True,
                 )
-            await asyncio.sleep(20)
+            await asyncio.sleep(interval)
 
     async def _publish_interaction(self, interaction_id: UUID) -> dict[str, Any]:
+        policy_blocked = False
         async with self.database.session() as session:
             interaction = await session.get(Interaction, interaction_id)
             if interaction is None:
@@ -884,16 +1369,77 @@ class Worker:
             if not blocked and interaction.answer_markdown is None:
                 raise ServiceError("request_not_found", "Generated answer is unavailable")
             agent_settings = await load_project_agent_settings(session, interaction.project_id)
+            if not blocked:
+                native_context = (
+                    interaction.provider_metadata.get("native_context")
+                    if isinstance(interaction.provider_metadata, dict)
+                    else None
+                )
+                expected_policy_hash = (
+                    native_context.get("policy_sha256")
+                    if isinstance(native_context, dict)
+                    else None
+                )
+                repository = (
+                    await session.get(Repository, interaction.repository_id)
+                    if interaction.repository_id is not None
+                    else None
+                )
+                live_policy_hash: str | None = None
+                try:
+                    if repository is not None and agent_settings.enabled:
+                        live_profile = await load_live_requester_profile(session, interaction)
+                        live_policy_hash = compile_agent_policy(
+                            project_settings=agent_settings,
+                            requester_profile=live_profile,
+                            delivery_scope=interaction_delivery_scope(interaction),
+                            repository_allowed_paths=repository.allowed_paths or [],
+                            repository_denied_globs=agent_settings.denied_globs or [],
+                        ).policy_sha256
+                except (ClaudeError, ServiceError):
+                    live_policy_hash = None
+                if (
+                    not isinstance(expected_policy_hash, str)
+                    or live_policy_hash != expected_policy_hash
+                ):
+                    interaction.status = "failed"
+                    interaction.error_code = "context_policy_changed"
+                    await append_audit(
+                        session,
+                        event_type="knowledge.answer_publish_policy_blocked",
+                        correlation_id=interaction.correlation_id,
+                        actor_type="system",
+                        actor_id="policy-revalidator",
+                        project_id=interaction.project_id,
+                        subject_type="interaction",
+                        subject_id=str(interaction.id),
+                        outcome="blocked",
+                        payload={
+                            "expected_policy_sha256": expected_policy_hash,
+                            "live_policy_sha256": live_policy_hash,
+                        },
+                    )
+                    policy_blocked = True
             session.expunge(interaction)
+        if policy_blocked:
+            await self.telegram.publish_knowledge_error(interaction)
+            return {
+                "interaction_id": str(interaction_id),
+                "accepted_by_telegram": True,
+                "privacy_blocked": False,
+                "policy_blocked": True,
+            }
         if blocked:
             await self.telegram.publish_knowledge_error(interaction)
         else:
+            attach_markdown = agent_settings.telegram_attach_markdown and document_requested(
+                interaction.question
+            )
             await self.telegram.publish_knowledge_answer(
                 interaction,
                 interaction.answer_markdown or "",
-                artifacts=interaction.artifacts,
-                attach_markdown=agent_settings.telegram_attach_markdown,
-                stream=agent_settings.telegram_streaming_enabled,
+                artifacts=interaction.artifacts if attach_markdown else [],
+                attach_markdown=attach_markdown,
             )
         async with self.database.session() as session:
             persisted = await session.get(Interaction, interaction_id)
@@ -987,14 +1533,10 @@ class Worker:
             except ClaudeError as exc:
                 async with self.database.session() as session:
                     persisted = await session.scalar(
-                        select(Repository)
-                        .where(Repository.id == repository_id)
-                        .with_for_update()
+                        select(Repository).where(Repository.id == repository_id).with_for_update()
                     )
                     if persisted is None:
-                        raise ServiceError(
-                            "source_unavailable", "Repository disappeared"
-                        ) from exc
+                        raise ServiceError("source_unavailable", "Repository disappeared") from exc
                     if generation != persisted.sync_generation:
                         return await self._mark_repository_sync_superseded(
                             session,
@@ -1296,7 +1838,7 @@ class Worker:
         if queued:
             log.info("repository.reconcile_queued", count=queued)
 
-    async def _publish_interaction_error(self, job: Job, _message: str) -> None:
+    async def _publish_interaction_error(self, job: Job, error_code: str) -> None:
         if job.kind != "knowledge.answer":
             return
         interaction_id_value = job.payload.get("interaction_id")
@@ -1308,7 +1850,7 @@ class Worker:
             if interaction is None:
                 return
             interaction.status = "failed"
-            interaction.error_code = "answer_failed"
+            interaction.error_code = error_code
             await session.flush()
             session.expunge(interaction)
         try:
@@ -1345,12 +1887,32 @@ def sanitize_knowledge_answer(
         findings.extend(result.findings)
         blocked = blocked or result.blocked
 
+    change_request: AgentChangeRequestProposal | None = None
+    if answer.change_request is not None:
+        title_result = sanitize_text(
+            answer.change_request.title,
+            level=level,
+            location="change_request.title",
+        )
+        summary_result = sanitize_text(
+            answer.change_request.summary,
+            level=level,
+            location="change_request.summary",
+        )
+        findings.extend(title_result.findings)
+        findings.extend(summary_result.findings)
+        blocked = blocked or title_result.blocked or summary_result.blocked
+        change_request = answer.change_request.model_copy(
+            update={"title": title_result.text, "summary": summary_result.text}
+        )
+
     return (
         answer.model_copy(
             update={
                 "answer_markdown": answer_result.text,
                 "uncertainty": uncertainty,
                 "artifacts": artifacts,
+                "change_request": change_request,
             }
         ),
         findings,

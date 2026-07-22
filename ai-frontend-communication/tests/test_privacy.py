@@ -83,6 +83,12 @@ def test_clarification_privacy_covers_nested_expected_answer() -> None:
 def test_strict_blocks_secret_in_markdown_artifact() -> None:
     answer = KnowledgeAnswer(
         answer_markdown="Safe summary",
+        context_attestation={
+            "contract_version": "dca-context-v1",
+            "nonce": "1" * 32,
+            "policy_sha256": "2" * 64,
+            "context_sha256": "3" * 64,
+        },
         artifacts=[
             KnowledgeArtifact(name="runbook.md", content="AWS_ACCESS_KEY=AKIA1234567890ABCDEF")
         ],

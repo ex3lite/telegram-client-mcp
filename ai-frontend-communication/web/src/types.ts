@@ -5,6 +5,26 @@ export interface Project {
   enabled: boolean;
 }
 
+export type MemberLanguage = "ru" | "en";
+export type MemberKnowledgeScope = "integration" | "internal";
+
+export interface ProjectMember {
+  project_id: string;
+  user_id: string;
+  display_name: string;
+  telegram_user_id: number | null;
+  telegram_username: string | null;
+  role: string;
+  department: string | null;
+  stack: string | null;
+  language: MemberLanguage;
+  knowledge_scope: MemberKnowledgeScope;
+  can_create_requests: boolean;
+  active: boolean;
+  telegram_verified: boolean;
+  telegram_reachable: boolean;
+}
+
 export interface AdminIdentity {
   principal_id: string;
   name: string;
@@ -50,9 +70,21 @@ export interface Clarification {
 export interface ChangeRequest {
   id: string;
   project_id: string;
+  created_by_user_id: string | null;
+  source_interaction_id: string | null;
   correlation_id: string;
   source: string;
-  kind: "bug" | "task" | "feature";
+  requester_profile: {
+    display_name?: string | null;
+    role?: string | null;
+    department?: string | null;
+    stack?: string | null;
+    language?: string | null;
+  };
+  question: string;
+  agent_summary: string;
+  citations: Citation[];
+  kind: "bug" | "task" | "feature" | "integration" | "change" | "question";
   title: string;
   description: string;
   priority: "low" | "normal" | "high" | "urgent";

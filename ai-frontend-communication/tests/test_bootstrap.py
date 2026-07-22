@@ -42,11 +42,14 @@ def test_link_user_accepts_project_profile() -> None:
             "Mobile",
             "--stack",
             "Android / Kotlin",
+            "--preferred-language",
+            "ru",
         ]
     )
 
     assert args.department == "Mobile"
     assert args.stack == "Android / Kotlin"
+    assert args.preferred_language == "ru"
     assert args.role is None
 
 

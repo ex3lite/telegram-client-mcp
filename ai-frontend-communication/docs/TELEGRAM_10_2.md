@@ -9,21 +9,27 @@ The authoritative references are the [Bot API changelog](https://core.telegram.o
 
 | User path | Initial response | Completion | Visibility |
 | --- | --- | --- | --- |
-| Private `/ask` | Controlled Rich Thinking heartbeat | After privacy filtering, 4-8 `sendMessageDraft` prefixes with the same draft ID, then permanent `sendRichMessage` | User and bot |
-| Group `/ask` | Ordinary placeholder message | `editMessageText` with `rich_message`; oversized output also arrives as `answer.md` | Group |
+| Private `/ask` | Native `sendRichMessageDraft` with a stable draft ID and Thinking block | Privacy-redacted live deltas, then permanent `sendRichMessage`; long ordinary answers continue in lossless Rich Message chunks | User and bot |
+| Group `/ask` | Ordinary placeholder plus `sendChatAction(typing)` | `editMessageText` with `rich_message`; additional lossless Rich Message chunks only when needed | Group |
 | Group `/ask_private` | Ephemeral reply bound to the incoming `ephemeral_message_id` | `editEphemeralMessageText` with `receiver_user_id` | Invoking user and bot |
 | Group `/request` | Ephemeral acknowledgement when Telegram supplies ephemeral context | The request is durable in PostgreSQL/admin | Invoking user and bot |
 | Guest query | Immediate `answerGuestQuery` publishes a rich placeholder and returns an inline message ID | `editMessageText` updates that inline message | Invoking chat |
 
-When `telegram_streaming_enabled` is on, private generation refreshes a server-controlled Rich
-Thinking block. Its deterministic, non-zero signed 31-bit draft ID comes from the interaction UUID.
-After the complete answer passes the full privacy filter, the worker replaces that draft with 4-8
-progressively longer `sendMessageDraft` prefixes using the same ID, then persists the answer with
-`sendRichMessage`. Raw Claude deltas never reach Telegram. A draft API failure is logged but cannot
-block the permanent answer. Group answers intentionally use one placeholder plus one edit; they are
-not streamed. The application keeps the durable interaction/job before background generation,
-except the Guest Mode placeholder, which must be answered immediately so Telegram returns the
-inline message ID needed for later editing.
+When `telegram_streaming_enabled` is on, private generation refreshes one native Rich Message draft
+through `sendRichMessageDraft`. Its deterministic, non-zero signed 31-bit draft ID comes from the
+interaction UUID, so Telegram animates one draft instead of creating message spam. Thinking is sent
+as `InputRichBlockThinking`; once structured answer text appears, the draft carries both the
+`<tg-thinking>` block and the growing rich answer. Every draft is checked against the current live
+member policy and privacy-redacted before delivery. A draft API failure is logged but cannot block
+the permanent answer. Telegram drafts are private-chat only, so groups receive the official typing
+action and one final rich answer. The application keeps the durable interaction/job before
+background generation, except the Guest Mode placeholder, which must be answered immediately so
+Telegram returns the inline message ID needed for later editing.
+
+The permanent answer is not a replayed fake animation: it is published only after Claude's context
+receipt, exact-snapshot citations, live authorization and final privacy checks pass. Ordinary long
+answers are split on paragraphs/newlines without losing text. `.md` is generated and attached only
+when the user explicitly asks for documentation, a specification, guide, runbook, report or file.
 
 ## Command and update transport setup
 

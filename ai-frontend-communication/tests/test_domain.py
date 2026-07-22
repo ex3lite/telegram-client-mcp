@@ -6,11 +6,13 @@ import pytest
 from pydantic import ValidationError
 
 from dca.domain import (
+    AgentChangeRequestProposal,
     ChangeRequestStatus,
     Citation,
     ClarificationStatus,
     InvalidStateTransition,
     ensure_transition,
+    has_explicit_backend_request_intent,
     parse_service_token,
     validate_citation,
 )
@@ -25,6 +27,50 @@ def test_clarification_state_machine_is_terminal_after_answer() -> None:
 def test_change_request_cannot_skip_in_progress() -> None:
     with pytest.raises(InvalidStateTransition):
         ensure_transition(ChangeRequestStatus.OPEN, ChangeRequestStatus.DONE)
+
+
+def test_agent_change_request_cannot_override_trusted_context() -> None:
+    with pytest.raises(ValidationError):
+        AgentChangeRequestProposal.model_validate(
+            {
+                "kind": "integration",
+                "title": "Подключить аватарки",
+                "summary": "Нужен контракт Backend API.",
+                "priority": "normal",
+                "project_id": "00000000-0000-0000-0000-000000000000",
+            }
+        )
+
+    proposal = AgentChangeRequestProposal(
+        kind="integration",
+        title="  Подключить аватарки  ",
+        summary="  Нужен контракт Backend API.  ",
+    )
+    assert proposal.title == "Подключить аватарки"
+    assert proposal.summary == "Нужен контракт Backend API."
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("Создай заявку для backend", True),
+        ("Передай в backend", True),
+        ("Нужна доработка API", True),
+        ("Добавьте endpoint для аватарок", True),
+        ("fix backend bug", True),
+        ("Can you add an API endpoint?", True),
+        ("Как внедрить аватарки?", False),
+        ("Агентик, как внедрить аватарки?", False),
+        ("Как работает API?", False),
+        ("How to fix backend bug?", False),
+        ("Можно ли добавить endpoint?", False),
+    ],
+)
+def test_agent_request_requires_explicit_backend_intent(
+    question: str,
+    expected: bool,
+) -> None:
+    assert has_explicit_backend_request_intent(question) is expected
 
 
 @pytest.mark.parametrize(

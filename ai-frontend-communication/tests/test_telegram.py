@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ChatType
+from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.methods import SendMessage
-from aiogram.types import User
+from aiogram.types import InputRichBlockThinking, User
 
 import dca.telegram as telegram_module
 from dca.config import Settings
@@ -20,12 +19,14 @@ from dca.db import Database
 from dca.telegram import (
     MAX_RICH_MESSAGE_CHARS,
     TelegramAdapter,
-    answer_draft_parts,
+    document_requested,
     draft_id_for_interaction,
+    extract_bot_call,
     extract_bot_mention,
     extract_project_prefix,
     ingest_telegram_update,
     markdown_documents,
+    rich_answer_chunks,
     split_rich_answer,
 )
 
@@ -64,11 +65,94 @@ def test_bot_mention_is_exact_and_case_insensitive() -> None:
     assert extract_bot_mention("Привет @DcaBot", "dcabot") is None
 
 
+def test_bot_call_accepts_username_name_and_alias_only_at_the_start() -> None:
+    assert (
+        extract_bot_call(
+            "@DcaBot, project:backend Вопрос",
+            username="dcabot",
+            first_name="Kakadu AI Agent",
+        )
+        == "project:backend Вопрос"
+    )
+    assert (
+        extract_bot_call(
+            "Kakadu AI Agent: как работает auth?",
+            username="dcabot",
+            first_name="Kakadu AI Agent",
+        )
+        == "как работает auth?"
+    )
+    assert (
+        extract_bot_call(
+            "Агентик, как работает auth?",
+            username=None,
+            first_name="Kakadu AI Agent",
+        )
+        == "как работает auth?"
+    )
+    assert (
+        extract_bot_call(
+            "АгентикExtra, вопрос",
+            username="dcabot",
+            first_name="Kakadu AI Agent",
+        )
+        is None
+    )
+    assert (
+        extract_bot_call(
+            "Привет, Агентик",
+            username="dcabot",
+            first_name="Kakadu AI Agent",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Создай документацию по интеграции",
+        "Подготовь README.md с примером запуска",
+        "Документацию по API оформи отдельным файлом",
+        "Create a runbook for this deployment",
+    ],
+)
+def test_document_requested_requires_explicit_creation_intent(question: str) -> None:
+    assert document_requested(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Как работает интеграция?",
+        "Где лежит README.md?",
+        "Объясни существующую документацию",
+        "Как создать .md файл?",
+    ],
+)
+def test_document_requested_rejects_explanations_and_existing_files(question: str) -> None:
+    assert not document_requested(question)
+
+
 def test_long_rich_answer_falls_back_to_markdown_attachment() -> None:
     original = "x" * (MAX_RICH_MESSAGE_CHARS + 100)
     preview, attachment = split_rich_answer(original)
     assert len(preview) <= MAX_RICH_MESSAGE_CHARS
     assert attachment == original
+
+
+def test_long_answer_chunks_preserve_text_and_prefer_paragraph_breaks() -> None:
+    first = "a" * (MAX_RICH_MESSAGE_CHARS - 10)
+    second = "b" * 100
+    third = "c" * (MAX_RICH_MESSAGE_CHARS + 10)
+    original = f"{first}\n\n{second}\n{third}"
+
+    chunks = rich_answer_chunks(original)
+
+    assert "".join(chunks) == original
+    assert all(0 < len(chunk) <= MAX_RICH_MESSAGE_CHARS for chunk in chunks)
+    assert chunks[0] == f"{first}\n\n"
+    assert chunks[1] == f"{second}\n"
 
 
 def test_explicit_markdown_artifacts_do_not_duplicate_long_answer() -> None:
@@ -107,17 +191,6 @@ async def test_adapter_uses_configured_outbound_proxy() -> None:
         await database.close()
 
 
-def test_final_answer_draft_parts_are_progressive_and_bounded() -> None:
-    answer = "x" * 8_000
-    parts = answer_draft_parts(answer)
-
-    assert 4 <= len(parts) <= 8
-    assert parts[-1] == answer[:4_096]
-    assert all(answer.startswith(part) for part in parts)
-    assert all(len(left) <= len(right) for left, right in pairwise(parts))
-    assert answer_draft_parts("ОК") == ["О", "ОК"]
-
-
 @pytest.mark.asyncio
 async def test_controlled_thinking_heartbeat_uses_the_interaction_draft_id(
     adapter: TelegramAdapter,
@@ -140,20 +213,19 @@ async def test_controlled_thinking_heartbeat_uses_the_interaction_draft_id(
     calls = adapter.bot.send_rich_message_draft.await_args_list
     assert len(calls) == 2
     assert {call.kwargs["draft_id"] for call in calls} == {draft_id_for_interaction(interaction.id)}
-    assert all(call.kwargs["rich_message"].blocks is not None for call in calls)
+    for call in calls:
+        blocks = call.kwargs["rich_message"].blocks
+        assert blocks is not None
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], InputRichBlockThinking)
+        assert blocks[0].text == telegram_module.KNOWLEDGE_PROGRESS_TEXT
 
 
 @pytest.mark.asyncio
-async def test_private_final_streams_safe_parts_with_one_stable_draft_id(
+async def test_private_stream_uses_thinking_block_and_one_stable_draft_id(
     adapter: TelegramAdapter,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter.bot.send_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
-    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
-        return_value=SimpleNamespace(chat=SimpleNamespace(id=42))
-    )
-    sleep = AsyncMock()
-    monkeypatch.setattr(telegram_module.asyncio, "sleep", sleep)
+    adapter.bot.send_rich_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
     interaction = SimpleNamespace(
         id=uuid4(),
         source_ref={
@@ -164,54 +236,89 @@ async def test_private_final_streams_safe_parts_with_one_stable_draft_id(
             }
         },
     )
-    safe_answer = "Проверенный ответ. " * 100
 
-    await adapter.publish_knowledge_answer(interaction, safe_answer, stream=True)
+    await adapter.send_knowledge_stream(
+        interaction,
+        answer_markdown="",
+        thinking="Проверяю реализацию",
+    )
+    await adapter.send_knowledge_stream(
+        interaction,
+        answer_markdown="**Проверенный ответ**",
+        thinking="Проверяю реализацию",
+    )
 
-    calls = adapter.bot.send_message_draft.await_args_list
-    assert 4 <= len(calls) <= 8
-    draft_ids = {call.kwargs["draft_id"] for call in calls}
-    assert draft_ids == {draft_id_for_interaction(interaction.id)}
-    assert [call.kwargs["text"] for call in calls] == answer_draft_parts(safe_answer)
+    calls = adapter.bot.send_rich_message_draft.await_args_list
+    assert len(calls) == 2
+    assert {call.kwargs["draft_id"] for call in calls} == {draft_id_for_interaction(interaction.id)}
     assert all(call.kwargs["chat_id"] == 42 for call in calls)
     assert all(call.kwargs["message_thread_id"] == 7 for call in calls)
-    assert sleep.await_count == len(calls) - 1
-    adapter.bot.send_rich_message.assert_awaited_once()
+    first_rich = calls[0].kwargs["rich_message"]
+    assert first_rich.blocks is not None
+    assert isinstance(first_rich.blocks[0], InputRichBlockThinking)
+    assert first_rich.blocks[0].text == "Проверяю реализацию"
+    second_markdown = calls[1].kwargs["rich_message"].markdown
+    assert second_markdown is not None
+    assert "<tg-thinking>Проверяю реализацию</tg-thinking>" in second_markdown
+    assert "**Проверенный ответ**" in second_markdown
 
 
 @pytest.mark.asyncio
-async def test_draft_failure_does_not_block_permanent_rich_answer(
+async def test_thinking_draft_falls_back_to_native_empty_draft(
     adapter: TelegramAdapter,
 ) -> None:
-    adapter.bot.send_message_draft = AsyncMock(  # type: ignore[method-assign]
+    adapter.bot.send_rich_message_draft = AsyncMock(  # type: ignore[method-assign]
         side_effect=bad_rich_message()
     )
-    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
-        return_value=SimpleNamespace(chat=SimpleNamespace(id=42))
-    )
+    adapter.bot.send_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
     interaction = SimpleNamespace(
-        id=uuid4(), source_ref={"delivery": {"kind": "private_draft", "chat_id": 42}}
+        id=uuid4(),
+        source_ref={"delivery": {"kind": "private_draft", "chat_id": 42}},
     )
 
-    await adapter.publish_knowledge_answer(interaction, "Безопасный финальный ответ", stream=True)
+    await adapter.send_knowledge_progress(interaction)
 
-    adapter.bot.send_message_draft.assert_awaited_once()
-    rich = adapter.bot.send_rich_message.await_args.kwargs["rich_message"]
-    assert rich.markdown == "Безопасный финальный ответ"
+    adapter.bot.send_message_draft.assert_awaited_once_with(
+        chat_id=42,
+        message_thread_id=None,
+        draft_id=draft_id_for_interaction(interaction.id),
+        text="",
+    )
 
 
 @pytest.mark.asyncio
-async def test_group_final_never_uses_private_draft_stream(adapter: TelegramAdapter) -> None:
+async def test_group_progress_and_stream_use_typing_action(adapter: TelegramAdapter) -> None:
+    adapter.bot.send_chat_action = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    adapter.bot.send_rich_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
     adapter.bot.send_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
-    adapter.bot.edit_message_text = AsyncMock(return_value=True)  # type: ignore[method-assign]
     interaction = SimpleNamespace(
-        source_ref={"delivery": {"kind": "group_message", "chat_id": -100, "message_id": 9}}
+        id=uuid4(),
+        source_ref={
+            "delivery": {
+                "kind": "group_message",
+                "chat_id": -100,
+                "message_id": 9,
+                "message_thread_id": 7,
+            }
+        },
     )
 
-    await adapter.publish_knowledge_answer(interaction, "Готово", stream=True)
+    await adapter.send_knowledge_progress(interaction)
+    await adapter.send_knowledge_stream(
+        interaction,
+        answer_markdown="Промежуточный ответ",
+        thinking="Проверяю",
+    )
 
+    assert adapter.bot.send_chat_action.await_count == 2
+    for call in adapter.bot.send_chat_action.await_args_list:
+        assert call.kwargs == {
+            "chat_id": -100,
+            "message_thread_id": 7,
+            "action": ChatAction.TYPING,
+        }
+    adapter.bot.send_rich_message_draft.assert_not_awaited()
     adapter.bot.send_message_draft.assert_not_awaited()
-    adapter.bot.edit_message_text.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -239,6 +346,87 @@ async def test_private_final_retries_as_plain_html_without_losing_answer(
     assert len(calls) == 2
     assert calls[0].kwargs["rich_message"].markdown == answer
     assert calls[1].kwargs["rich_message"].html == ("Ответ &lt;важный&gt; &amp; проверенный")
+
+
+@pytest.mark.asyncio
+async def test_private_long_answer_publishes_every_chunk_without_document(
+    adapter: TelegramAdapter,
+) -> None:
+    sent = SimpleNamespace(chat=SimpleNamespace(id=42))
+    answer = f"{'a' * (MAX_RICH_MESSAGE_CHARS - 2)}\n\n{'b' * 100}"
+    chunks = rich_answer_chunks(answer)
+    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[bad_rich_message(), sent, bad_rich_message(), sent]
+    )
+    adapter.bot.send_document = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    interaction = SimpleNamespace(
+        source_ref={
+            "delivery": {
+                "kind": "private_draft",
+                "chat_id": 42,
+                "message_thread_id": 7,
+            }
+        }
+    )
+
+    await adapter.publish_knowledge_answer(
+        interaction,
+        answer,
+        attach_markdown=False,
+    )
+
+    calls = adapter.bot.send_rich_message.await_args_list
+    assert len(chunks) == 2
+    assert [calls[0].kwargs["rich_message"].markdown, calls[2].kwargs["rich_message"].markdown] == (
+        chunks
+    )
+    assert calls[1].kwargs["rich_message"].html == telegram_module.html.escape(chunks[0])
+    assert calls[3].kwargs["rich_message"].html == telegram_module.html.escape(chunks[1])
+    assert all(call.kwargs["message_thread_id"] == 7 for call in calls)
+    adapter.bot.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_long_answer_edits_first_chunk_and_sends_the_rest(
+    adapter: TelegramAdapter,
+) -> None:
+    sent = SimpleNamespace(chat=SimpleNamespace(id=-100))
+    answer = f"{'a' * (MAX_RICH_MESSAGE_CHARS - 2)}\n\n{'b' * 100}"
+    chunks = rich_answer_chunks(answer)
+    adapter.bot.edit_message_text = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[bad_rich_message(), True]
+    )
+    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[bad_rich_message(), sent]
+    )
+    adapter.bot.send_document = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    interaction = SimpleNamespace(
+        source_ref={
+            "delivery": {
+                "kind": "group_message",
+                "chat_id": -100,
+                "message_id": 9,
+                "message_thread_id": 7,
+            }
+        }
+    )
+
+    await adapter.publish_knowledge_answer(
+        interaction,
+        answer,
+        attach_markdown=False,
+    )
+
+    edit_calls = adapter.bot.edit_message_text.await_args_list
+    send_calls = adapter.bot.send_rich_message.await_args_list
+    assert len(chunks) == 2
+    assert edit_calls[0].kwargs["rich_message"].markdown == chunks[0]
+    assert edit_calls[1].kwargs["rich_message"].html == telegram_module.html.escape(chunks[0])
+    assert send_calls[0].kwargs["rich_message"].markdown == chunks[1]
+    assert send_calls[1].kwargs["rich_message"].html == telegram_module.html.escape(chunks[1])
+    assert all(call.kwargs["chat_id"] == -100 for call in send_calls)
+    assert all(call.kwargs["message_thread_id"] == 7 for call in send_calls)
+    adapter.bot.send_document.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -519,12 +707,27 @@ async def test_group_and_ephemeral_questions_create_scoped_placeholders(
         assert delivery["message_id"] == 15
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@DcaBot project:backend Где проверяется токен?",
+        "Агентик, project:backend Где проверяется токен?",
+        "Kakadu AI Agent: project:backend Где проверяется токен?",
+    ],
+    ids=["username", "alias", "bot-name"],
+)
 @pytest.mark.asyncio
-async def test_group_mention_queues_question_with_explicit_project(
+async def test_group_bot_call_queues_question_with_explicit_project(
     adapter: TelegramAdapter,
+    text: str,
 ) -> None:
     adapter.bot.me = AsyncMock(  # type: ignore[method-assign]
-        return_value=User(id=999, is_bot=True, first_name="DCA", username="DcaBot")
+        return_value=User(
+            id=999,
+            is_bot=True,
+            first_name="Kakadu AI Agent",
+            username="DcaBot",
+        )
     )
     adapter._queue_code_question = AsyncMock()  # type: ignore[method-assign]
     payload = {
@@ -534,7 +737,7 @@ async def test_group_mention_queues_question_with_explicit_project(
             "date": 0,
             "chat": {"id": -100, "type": "supergroup", "title": "Developers"},
             "from": {"id": 777, "is_bot": False, "first_name": "Dev"},
-            "text": "@DcaBot project:backend Где проверяется токен?",
+            "text": text,
         },
     }
 
@@ -551,6 +754,14 @@ async def test_group_mention_queues_question_with_explicit_project(
 async def test_plain_text_uses_all_messages_mode_without_command_path(
     adapter: TelegramAdapter,
 ) -> None:
+    adapter.bot.me = AsyncMock(  # type: ignore[method-assign]
+        return_value=User(
+            id=999,
+            is_bot=True,
+            first_name="Kakadu AI Agent",
+            username="DcaBot",
+        )
+    )
     adapter._queue_code_question = AsyncMock()  # type: ignore[method-assign]
     payload = {
         "update_id": 18,
@@ -631,3 +842,51 @@ async def test_private_group_command_stays_silent_when_dm_is_forbidden(
 
     adapter.bot.send_message.assert_awaited_once()
     assert adapter.bot.send_message.await_args.kwargs["chat_id"] == 777
+
+
+@pytest.mark.asyncio
+async def test_private_start_verifies_rebound_identity(
+    adapter: TelegramAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = SimpleNamespace(
+        telegram_user_id=777,
+        private_chat_id=None,
+        reachable=False,
+        verified_at=None,
+        username=None,
+    )
+
+    class FakeSession:
+        async def scalar(self, _statement: object) -> object:
+            return identity
+
+    @asynccontextmanager
+    async def session() -> AsyncIterator[FakeSession]:
+        yield FakeSession()
+
+    monkeypatch.setattr(adapter.database, "session", session)
+    adapter.bot.session = AsyncMock(return_value=SimpleNamespace())  # type: ignore[assignment]
+    payload = {
+        "update_id": 24,
+        "message": {
+            "message_id": 6,
+            "date": 0,
+            "chat": {"id": 777, "type": "private", "first_name": "Dev"},
+            "from": {
+                "id": 777,
+                "is_bot": False,
+                "first_name": "Dev",
+                "username": "frontend_dev",
+            },
+            "text": "/start",
+            "entities": [{"type": "bot_command", "offset": 0, "length": 6}],
+        },
+    }
+
+    await adapter.process_raw_update(payload)
+
+    assert identity.private_chat_id == 777
+    assert identity.reachable is True
+    assert identity.verified_at is not None
+    assert identity.username == "frontend_dev"

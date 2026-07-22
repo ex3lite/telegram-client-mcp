@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -146,12 +146,87 @@ class KnowledgeArtifact(BaseModel):
         return value
 
 
+class AgentContextAttestation(BaseModel):
+    contract_version: Literal["dca-context-v1"]
+    nonce: str = Field(pattern=r"^[a-f0-9]{32}$")
+    policy_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    context_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class AgentChangeRequestProposal(BaseModel):
+    """The only ticket fields Claude may control."""
+
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["bug", "feature", "integration", "change", "question"]
+    title: str = Field(min_length=3, max_length=200)
+    summary: str = Field(min_length=1, max_length=16_000)
+    priority: Literal["low", "normal", "high", "urgent"] = "normal"
+
+    @field_validator("title", "summary")
+    @classmethod
+    def normalize_agent_request_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("agent request text cannot be blank")
+        return normalized
+
+
+_AGENT_REQUEST_INFO_RE = re.compile(
+    r"^(?:(?:@?[\w.-]+)[,:!]\s*)?"
+    r"(?:как\b|почему\b|зачем\b|что\s+такое\b|можно\s+ли\b|"
+    r"how(?:\s+to)?\b|why\b|what\s+(?:is|are)\b|can\s+(?:i|we)\b)"
+)
+_AGENT_TICKET_REQUEST_RE = re.compile(
+    r"\b(?:созда(?:й|йте|ть)|завед(?:и|ите|сти)|оформ(?:и|ите|ить))\b.{0,80}"
+    r"\b(?:заявк\w*|задач\w*|тикет\w*|issue|request)\b|"
+    r"\b(?:переда(?:й|йте|ть)|отправ(?:ь|ьте|ить)|эскалиру(?:й|йте|овать))\b.{0,80}"
+    r"\b(?:backend|back-end|б[еэ]кенд\w*|бэкэнд\w*)\b|"
+    r"\b(?:create|file|open)\b.{0,40}\b(?:ticket|issue|request)\b|"
+    r"\b(?:send|escalate)\b.{0,40}\b(?:backend|back-end|backend\s+team)\b"
+)
+_AGENT_BACKEND_CHANGE_RE = re.compile(
+    r"\b(?:добав(?:ь|ьте)|реализу(?:й|йте)|почин(?:и|ите)|исправ(?:ь|ьте)|"
+    r"доработа(?:й|йте)|измен(?:и|ите)|внедр(?:и|ите)|обнов(?:и|ите))\b.{0,100}"
+    r"\b(?:api|апи|backend|back-end|б[еэ]кенд\w*|бэкэнд\w*|сервер\w*|"
+    r"endpoint|эндпоинт\w*|webhook|вебхук\w*|контракт\w*|фич\w*|feature|bug|баг\w*)\b|"
+    r"\b(?:нужн\w*|надо|необходим\w*|требуется|прошу|мож(?:ешь|ете))\b.{0,60}"
+    r"\b(?:добавить|реализовать|починить|исправить|доработать|изменить|внедрить|обновить|"
+    r"доработк\w*|изменени\w*|исправлени\w*)\b.{0,100}"
+    r"\b(?:api|апи|backend|back-end|б[еэ]кенд\w*|бэкэнд\w*|сервер\w*|"
+    r"endpoint|эндпоинт\w*|webhook|вебхук\w*|контракт\w*|фич\w*|feature|bug|баг\w*)\b|"
+    r"\b(?:please\s+)?(?:add|implement|fix|change|update|extend|build)\b.{0,100}"
+    r"\b(?:api|backend|back-end|server|endpoint|webhook|contract|feature|bug)\b|"
+    r"\b(?:we\s+need|need|please|can\s+you|could\s+you)\b.{0,60}"
+    r"\b(?:add|implement|fix|change|update|extend|build)\b.{0,100}"
+    r"\b(?:api|backend|back-end|server|endpoint|webhook|contract|feature|bug)\b|"
+    r"\b(?:нужн\w*|необходим\w*|требуется)\b.{0,80}"
+    r"\bнов\w+\s+(?:endpoint|эндпоинт\w*|api|апи|backend|б[еэ]кенд\w*)\b|"
+    r"\bneed\b.{0,80}\b(?:api|backend|server|endpoint|webhook|feature)\s+"
+    r"(?:change|fix|addition|update)\b"
+)
+
+
+def has_explicit_backend_request_intent(question: str) -> bool:
+    """Accept only an explicit user request to hand work to the backend team."""
+    normalized = " ".join(question.casefold().replace("ё", "е").split())
+    if not normalized:
+        return False
+    if _AGENT_TICKET_REQUEST_RE.search(normalized):
+        return True
+    if _AGENT_REQUEST_INFO_RE.search(normalized):
+        return False
+    return _AGENT_BACKEND_CHANGE_RE.search(normalized) is not None
+
+
 class KnowledgeAnswer(BaseModel):
     answer_markdown: str = Field(min_length=1, max_length=200_000)
     citations: list[Citation] = Field(default_factory=list, max_length=100)
     uncertainty: list[str] = Field(default_factory=list, max_length=50)
     artifacts: list[KnowledgeArtifact] = Field(default_factory=list, max_length=8)
     memory_summary: str | None = Field(default=None, max_length=16_000)
+    context_attestation: AgentContextAttestation
+    change_request: AgentChangeRequestProposal | None = None
 
     @model_validator(mode="after")
     def artifact_names_are_unique(self) -> KnowledgeAnswer:
@@ -192,7 +267,10 @@ class ClarificationResult(BaseModel):
 
 class ChangeRequestCreate(BaseModel):
     project_id: UUID
-    kind: str = Field(default="task", pattern=r"^(bug|task|feature)$")
+    kind: str = Field(
+        default="task",
+        pattern=r"^(bug|task|feature|integration|change|question)$",
+    )
     title: str = Field(min_length=3, max_length=200)
     description: str = Field(default="", max_length=16_000)
     priority: str = Field(default="normal", pattern=r"^(low|normal|high|urgent)$")

@@ -9,13 +9,26 @@ from dca.app import (
     AgentSettingsInput,
     McpAccountCreateInput,
     McpAccountPatchInput,
+    MemberUpdateInput,
+    _purge_claude_session_artifacts,
     claude_integration_status,
     create_app,
     serialize_interaction_summary,
     serialize_mcp_account,
+    serialize_member,
+    serialize_request,
 )
 from dca.config import Settings
-from dca.db import AgentMessage, Interaction, ProjectAgentSettings, ServiceAccount
+from dca.db import (
+    AgentMessage,
+    ChangeRequest,
+    Interaction,
+    ProjectAgentSettings,
+    ProjectMembership,
+    ServiceAccount,
+    TelegramIdentity,
+    User,
+)
 from dca.mcp import MCP_TOOL_SCOPES
 from dca.service import (
     ServiceError,
@@ -287,6 +300,118 @@ def test_control_plane_inputs_reject_unsafe_values() -> None:
     assert "telegram.ask_user" in MCP_TOOL_SCOPES
 
 
+def test_member_input_normalizes_profile_and_rejects_untrusted_enums() -> None:
+    values = {
+        "display_name": "  Бека  ",
+        "telegram_user_id": 1_118_192_318,
+        "telegram_username": " @beka_android ",
+        "role": " android ",
+        "department": " Mobile ",
+        "stack": " Kotlin ",
+        "language": "ru",
+        "knowledge_scope": "integration",
+        "can_create_requests": True,
+        "active": True,
+    }
+
+    profile = MemberUpdateInput.model_validate(values)
+
+    assert profile.display_name == "Бека"
+    assert profile.telegram_username == "beka_android"
+    assert profile.role == "android"
+    assert profile.department == "Mobile"
+    assert profile.stack == "Kotlin"
+    with pytest.raises(ValidationError):
+        MemberUpdateInput.model_validate({**values, "language": "auto"})
+    with pytest.raises(ValidationError):
+        MemberUpdateInput.model_validate({**values, "knowledge_scope": "everything"})
+    with pytest.raises(ValidationError):
+        MemberUpdateInput.model_validate({**values, "telegram_username": "bad username"})
+
+
+def test_member_serialization_combines_user_membership_and_telegram_identity() -> None:
+    user_id = uuid4()
+    project_id = uuid4()
+    user = User(id=user_id, display_name="Игорь", active=True)
+    membership = ProjectMembership(
+        project_id=project_id,
+        user_id=user_id,
+        role="ios",
+        department="Mobile",
+        stack="Swift",
+        preferred_language="ru",
+        knowledge_scope="integration",
+        can_create_requests=True,
+    )
+    identity = TelegramIdentity(
+        user_id=user_id,
+        telegram_user_id=719_969_066,
+        username="igor_ios",
+        verified_at=datetime.now(UTC),
+        reachable=True,
+    )
+
+    result = serialize_member(user, membership, identity)
+
+    assert result == {
+        "project_id": str(project_id),
+        "user_id": str(user_id),
+        "display_name": "Игорь",
+        "telegram_user_id": 719_969_066,
+        "telegram_username": "igor_ios",
+        "role": "ios",
+        "department": "Mobile",
+        "stack": "Swift",
+        "language": "ru",
+        "knowledge_scope": "integration",
+        "can_create_requests": True,
+        "active": True,
+        "telegram_verified": True,
+        "telegram_reachable": True,
+    }
+
+
+def test_claude_session_purge_deletes_only_exact_uuid_artifacts(tmp_path: Path) -> None:
+    session_id = uuid4()
+    root = tmp_path / "claude-sessions"
+    project = root / "projects" / "snapshot"
+    project.mkdir(parents=True)
+    transcript = project / f"{session_id}.jsonl"
+    transcript.write_text("transcript")
+    session_directory = root / "session-env" / str(session_id)
+    session_directory.mkdir(parents=True)
+    (session_directory / "environment").write_text("safe")
+    decoy = project / f"prefix-{session_id}.jsonl"
+    decoy.write_text("keep")
+    backup = project / f"{session_id}.jsonl.backup"
+    backup.write_text("keep")
+
+    assert _purge_claude_session_artifacts(root, session_id) == 2
+    assert not transcript.exists()
+    assert not session_directory.exists()
+    assert decoy.read_text() == "keep"
+    assert backup.read_text() == "keep"
+
+
+def test_claude_session_purge_fails_closed_for_exact_name_symlink(tmp_path: Path) -> None:
+    session_id = uuid4()
+    root = tmp_path / "claude-sessions"
+    project = root / "projects" / "snapshot"
+    project.mkdir(parents=True)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("keep")
+    (project / f"{session_id}.jsonl").symlink_to(outside)
+    legitimate = root / "session-env" / str(session_id)
+    legitimate.mkdir(parents=True)
+    (legitimate / "environment").write_text("keep")
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        _purge_claude_session_artifacts(root, session_id)
+
+    assert outside.read_text() == "keep"
+    assert legitimate.is_dir()
+
+
 @pytest.mark.parametrize(
     "unsafe_glob",
     [
@@ -425,6 +550,46 @@ def test_interaction_summary_omits_heavy_and_sensitive_fields() -> None:
     assert "privacy_findings" not in result
 
 
+def test_request_serialization_exposes_safe_inbox_context() -> None:
+    user_id = uuid4()
+    interaction_id = uuid4()
+    request = ChangeRequest(
+        id=uuid4(),
+        project_id=uuid4(),
+        created_by_user_id=user_id,
+        source_interaction_id=interaction_id,
+        correlation_id="tg:42",
+        source="agent",
+        source_ref={"delivery": {"chat_id": 123}},
+        requester_profile={
+            "display_name": "Бека",
+            "department": "Mobile",
+            "stack": "Android / Kotlin",
+            "language": "ru",
+        },
+        question="Как внедрить аватарки?",
+        agent_summary="Нужен публичный контракт API.",
+        citations=[{"path": "src/avatar.py", "start_line": 10, "end_line": 20}],
+        kind="integration",
+        title="Контракт API аватарок",
+        description="",
+        priority="normal",
+        status="open",
+        version=1,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    result = serialize_request(request)
+
+    assert result["created_by_user_id"] == str(user_id)
+    assert result["source_interaction_id"] == str(interaction_id)
+    assert result["requester_profile"]["language"] == "ru"
+    assert result["question"] == "Как внедрить аватарки?"
+    assert result["citations"][0]["path"] == "src/avatar.py"
+    assert "source_ref" not in result
+
+
 def test_claude_integration_status_never_exposes_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,6 +623,8 @@ async def test_control_plane_routes_are_registered(tmp_path: Path) -> None:
     )
     try:
         paths = app.openapi()["paths"]
+        assert set(paths["/api/v1/members"]) == {"get"}
+        assert set(paths["/api/v1/projects/{project_id}/members/{user_id}"]) == {"put"}
         assert set(paths["/api/v1/projects/{project_id}/agent-settings"]) == {"get", "put"}
         assert set(paths["/api/v1/integrations/claude"]) == {"get", "put", "delete"}
         assert set(paths["/api/v1/integrations/claude/check"]) == {"post"}

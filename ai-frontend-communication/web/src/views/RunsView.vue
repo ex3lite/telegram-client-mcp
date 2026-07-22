@@ -42,6 +42,21 @@ const selected = useQuery({
   refetchInterval: 30_000
 });
 
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+const nativeContext = computed(() =>
+  record(selected.data.value?.provider_metadata.native_context)
+);
+const contextRequester = computed(() => record(nativeContext.value?.requester));
+
+function textValue(value: unknown, fallback = "—"): string {
+  return typeof value === "string" && value.length ? value : fallback;
+}
+
 async function selectRun(id: string) {
   await router.replace({ query: { ...route.query, selected: id } });
 }
@@ -179,6 +194,27 @@ function downloadArtifact(artifact: KnowledgeArtifact) {
               <ul><li v-for="item in selected.data.value.uncertainty" :key="item">{{ item }}</li></ul>
             </section>
 
+            <section v-if="nativeContext" class="run-section">
+              <div class="run-section__header">
+                <h3>Контекст и права</h3>
+                <span>{{ nativeContext.attested === true ? "Контекст подтверждён" : "Не подтверждён" }}</span>
+              </div>
+              <dl class="detail-list detail-list--compact">
+                <dt>Пользователь</dt><dd>{{ textValue(contextRequester?.display_name) }}</dd>
+                <dt>Профиль</dt>
+                <dd>{{ [contextRequester?.role, contextRequester?.department, contextRequester?.stack].filter(Boolean).join(" · ") || "—" }}</dd>
+                <dt>Язык</dt><dd>{{ textValue(contextRequester?.language) }}</dd>
+                <dt>Доступ к знаниям</dt><dd><code>{{ textValue(contextRequester?.knowledge_scope) }}</code></dd>
+                <dt>Канал</dt><dd><code>{{ textValue(contextRequester?.delivery_scope) }}</code></dd>
+                <dt>Код</dt><dd><code>{{ textValue(contextRequester?.code_access) }}</code></dd>
+                <dt>Время контекста</dt><dd><code>{{ textValue(nativeContext.turn_started_at_utc) }}</code></dd>
+                <dt>Policy</dt><dd><code>{{ textValue(nativeContext.policy_sha256).slice(0, 16) }}</code></dd>
+                <dt>Сессия</dt><dd><code>{{ textValue(nativeContext.session_id).slice(0, 12) }}</code></dd>
+                <dt>Compaction</dt><dd>{{ Number(nativeContext.compaction_count ?? 0) }}</dd>
+                <dt>После compaction</dt><dd>{{ nativeContext.context_attested_after_compaction === true ? "Контекст подтверждён" : "Не требовалось" }}</dd>
+              </dl>
+            </section>
+
             <dl class="detail-list detail-list--compact">
               <dt>Проект</dt><dd>{{ projectName(projects.data.value, selected.data.value.project_id) }}</dd>
               <dt>Commit</dt><dd><code>{{ selected.data.value.commit_sha ?? "Нет" }}</code></dd>
@@ -186,7 +222,7 @@ function downloadArtifact(artifact: KnowledgeArtifact) {
                 <dt>Память</dt><dd><RouterLink :to="{ name: 'memory', query: { project: selected.data.value.project_id, selected: selected.data.value.conversation_thread_id } }">Открыть диалог →</RouterLink></dd>
               </template>
               <dt>Correlation</dt><dd><code>{{ selected.data.value.correlation_id }}</code></dd>
-              <dt>Provider</dt><dd><pre>{{ JSON.stringify(selected.data.value.provider_metadata, null, 2) }}</pre></dd>
+              <dt>Provider</dt><dd><details><summary>Технические данные</summary><pre>{{ JSON.stringify(selected.data.value.provider_metadata, null, 2) }}</pre></details></dd>
             </dl>
           </template>
         </PageState>

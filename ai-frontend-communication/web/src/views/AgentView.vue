@@ -686,18 +686,18 @@ const disconnectClaude = useMutation({
         <div class="form-grid form-grid--four">
           <label class="field field--wide">
             <span>Модель</span>
-            <input v-model="claudeModelInput" list="claude-models" placeholder="default" />
-            <datalist id="claude-models">
-              <option value="sonnet"></option>
-              <option value="opus"></option>
-              <option value="fable"></option>
-            </datalist>
-            <small>Пустое поле использует модель Claude CLI по умолчанию.</small>
+            <select v-model="claudeModelInput">
+              <option value="">По умолчанию</option>
+              <option value="fable">Fable</option>
+              <option value="sonnet">Sonnet</option>
+              <option value="opus">Opus</option>
+            </select>
+            <small>«По умолчанию» использует модель, выбранную Claude CLI.</small>
           </label>
           <label class="field">
             <span>Усилие</span>
             <select v-model="form.claude_effort">
-              <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">XHigh</option><option value="max">Max</option>
+              <option value="low">Низкое</option><option value="medium">Среднее</option><option value="high">Высокое</option><option value="xhigh">Очень высокое</option><option value="max">Максимальное</option>
             </select>
           </label>
           <label class="field">
@@ -765,7 +765,7 @@ const disconnectClaude = useMutation({
           <div>
             <span class="eyebrow">Контекст диалога</span>
             <h2 id="memory-settings-title">Память</h2>
-            <p>Агент помнит недавние сообщения и устойчивые факты отдельно для каждого диалога.</p>
+            <p>Claude ведёт отдельную native-сессию для каждого пользователя и безопасно восстанавливает её из БД после ротации.</p>
           </div>
           <label class="switch-control">
             <input v-model="form.memory_enabled" type="checkbox" />
@@ -776,15 +776,15 @@ const disconnectClaude = useMutation({
           <label class="field">
             <span>Недавних сообщений</span>
             <input v-model.number="form.memory_recent_messages" type="number" min="4" max="100" required :disabled="!form.memory_enabled" />
-            <small>Сколько последних реплик передавать Claude дословно.</small>
+            <small>Сколько реплик загрузить из БД при создании или восстановлении native-сессии.</small>
           </label>
           <label class="field">
             <span>Лимит контекста, символов</span>
             <input v-model.number="form.memory_max_context_chars" type="number" min="3000" max="100000" step="1000" required :disabled="!form.memory_enabled" />
-            <small>Общий предел истории и сохранённых фактов в одном запросе.</small>
+            <small>Предел bootstrap-контекста из БД; внутри активной сессии Claude использует native compaction.</small>
           </label>
         </div>
-        <p class="muted-note">Отключение памяти не удаляет историю. Диалоги можно просмотреть и удалить на отдельном экране «Память».</p>
+        <p class="muted-note">Отключение памяти не удаляет историю. Удаление диалога на экране «Память» очищает и БД, и native transcript Claude.</p>
       </section>
 
       <section class="settings-card" aria-labelledby="telegram-title">
@@ -810,11 +810,11 @@ const disconnectClaude = useMutation({
           </label>
           <label class="switch-control switch-control--standalone">
             <input v-model="form.telegram_streaming_enabled" type="checkbox" />
-            <span><strong>Нативный AI-stream</strong><small>Показывать Thinking draft через Bot API до безопасного финального ответа.</small></span>
+            <span><strong>Нативный AI-stream</strong><small>Показывать Thinking и вживую обновлять форматированный ответ через Bot API.</small></span>
           </label>
           <label class="switch-control switch-control--standalone">
             <input v-model="form.telegram_attach_markdown" type="checkbox" />
-            <span><strong>Прикладывать Markdown</strong><small>Отправлять созданные `.md`-артефакты вместе с ответом.</small></span>
+            <span><strong>Markdown по запросу</strong><small>Прикладывать `.md`-артефакты, только когда пользователь явно просит создать документацию или файл.</small></span>
           </label>
         </div>
       </section>

@@ -21,7 +21,10 @@ The panel at `/` is the working control plane, not only a health dashboard. Per 
 the Claude model, effort, timeout, budget, base prompt, answer style, bounded conversation memory,
 Telegram response modes, native AI drafts and Markdown attachments. Claude OAuth can be completed
 from a guided panel flow; the resulting credential is encrypted at rest and is never returned to
-the browser. An environment credential remains a supported fallback.
+the browser. An environment credential remains a supported fallback. The **Участники** screen
+controls each member's role, stack, answer language, disclosure scope and permission to create a
+backend request; successful runs expose the effective profile, policy hash, session and compaction
+receipt without exposing credentials or the full system prompt.
 
 Privacy is enforced after model output and before every MCP-originated Telegram delivery. `strict`
 blocks suspected credentials before persistence or delivery, while `balanced` persists and sends
@@ -38,13 +41,18 @@ scoped project member or chat.
 
 PostgreSQL stores isolated conversation threads, redacted messages, rolling summaries and durable
 facts. Private conversations are scoped by project and employee; group conversations additionally
-include the configured internal chat. Before each Claude run the worker injects a bounded summary
-and recent history as untrusted data, then persists the privacy-checked answer and updated summary.
-The panel's **Память** screen lets administrators inspect or delete a complete thread.
+include the configured internal chat. A new or rotated Claude native session is bootstrapped from a
+bounded summary and recent history as untrusted data; later turns resume the same native session.
+The server revalidates the live member profile and policy before every draft, final persistence and
+publication. A policy, repository scope or commit change rotates the session, while Claude
+compaction boundaries and context receipts are persisted for audit. The panel's **Память** screen
+lets administrators inspect a thread or delete both its database history and native transcript.
 
 Private Telegram chats use Bot API Rich Message drafts with a stable non-zero draft ID and a
-server-controlled Thinking block. Raw model deltas are never published before the privacy filter;
-the permanent Rich Message is sent only after the final answer has passed policy checks.
+native Thinking block. Streaming deltas are privacy-redacted before each ephemeral draft; the
+permanent Rich Message is sent only after context attestation, citation validation, live policy
+revalidation and the final privacy check. Ordinary long answers are sent losslessly in multiple
+Rich Messages; a Markdown document is attached only after an explicit document request.
 
 ## Local quick start
 

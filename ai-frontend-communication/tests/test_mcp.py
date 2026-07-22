@@ -17,6 +17,9 @@ def test_member_profile_exposes_project_department_and_stack() -> None:
         "role": "developer",
         "department": "Mobile",
         "stack": "iOS / Swift",
+        "language": "ru",
+        "knowledge_scope": "integration",
+        "can_create_requests": True,
     }
 
 

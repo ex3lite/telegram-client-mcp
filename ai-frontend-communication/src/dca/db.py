@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -195,6 +196,12 @@ class AdminSession(Base, TimestampMixin):
 
 class ProjectMembership(Base):
     __tablename__ = "project_memberships"
+    __table_args__ = (
+        CheckConstraint(
+            "knowledge_scope IN ('integration', 'internal')",
+            name="ck_project_membership_knowledge_scope",
+        ),
+    )
 
     project_id: Mapped[UUID] = mapped_column(
         PGUUID(as_uuid=True),
@@ -209,6 +216,9 @@ class ProjectMembership(Base):
     role: Mapped[str] = mapped_column(String(40), nullable=False, default="developer")
     department: Mapped[str | None] = mapped_column(String(80))
     stack: Mapped[str | None] = mapped_column(String(160))
+    preferred_language: Mapped[str] = mapped_column(String(16), nullable=False, default="ru")
+    knowledge_scope: Mapped[str] = mapped_column(String(24), nullable=False, default="integration")
+    can_create_requests: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
 class TelegramIdentity(Base, TimestampMixin):
@@ -274,6 +284,10 @@ class ConversationThread(Base, TimestampMixin):
             "chat_id IS NOT NULL OR user_id IS NOT NULL",
             name="ck_conversation_thread_target",
         ),
+        CheckConstraint(
+            "claude_compaction_count >= 0",
+            name="ck_conversation_thread_compaction_count",
+        ),
         Index("ix_conversation_thread_project_recent", "project_id", "last_message_at"),
     )
 
@@ -284,6 +298,17 @@ class ConversationThread(Base, TimestampMixin):
     chat_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     user_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claude_session_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    claude_repository_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("repositories.id", ondelete="SET NULL")
+    )
+    claude_commit_sha: Mapped[str | None] = mapped_column(String(64))
+    claude_policy_hash: Mapped[str | None] = mapped_column(CHAR(64))
+    claude_compaction_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    claude_last_compacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claude_context_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ConversationMessage(Base, TimestampMixin):
@@ -545,7 +570,21 @@ class Clarification(Base, TimestampMixin):
 
 class ChangeRequest(Base, TimestampMixin):
     __tablename__ = "change_requests"
-    __table_args__ = (Index("ix_change_request_project_status", "project_id", "status"),)
+    __table_args__ = (
+        Index("ix_change_request_project_status", "project_id", "status"),
+        UniqueConstraint(
+            "source_interaction_id",
+            name="uq_change_request_source_interaction",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(requester_profile) = 'object'",
+            name="ck_change_request_requester_profile",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(citations) = 'array'",
+            name="ck_change_request_citations",
+        ),
+    )
 
     id: Mapped[UUID] = uuid_column(primary_key=True)
     project_id: Mapped[UUID] = mapped_column(
@@ -554,9 +593,16 @@ class ChangeRequest(Base, TimestampMixin):
     created_by_user_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+    source_interaction_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("interactions.id", ondelete="SET NULL")
+    )
     correlation_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     source_ref: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    requester_profile: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    question: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    agent_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -720,9 +766,7 @@ async def enqueue_repository_sync(
     if locked_repository is None:
         raise RuntimeError("Repository disappeared while queueing synchronization")
     repository = locked_repository
-    existing = await session.scalar(
-        select(Job).where(Job.deduplication_key == deduplication_key)
-    )
+    existing = await session.scalar(select(Job).where(Job.deduplication_key == deduplication_key))
     if existing is not None:
         return existing, False
     repository.sync_generation += 1

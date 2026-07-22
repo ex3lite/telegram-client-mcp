@@ -17,6 +17,8 @@ from dca.db import (
     AgentMessage,
     ChangeRequest,
     Clarification,
+    ConversationThread,
+    Interaction,
     ProjectAgentSettings,
     ProjectMembership,
     ServiceAccount,
@@ -29,13 +31,16 @@ from dca.db import (
     enqueue_job,
 )
 from dca.domain import (
+    AgentChangeRequestProposal,
     AskUserInput,
     ChangeRequestCreate,
     ChangeRequestStatus,
+    Citation,
     ClarificationResult,
     ClarificationStatus,
     InvalidStateTransition,
     ensure_transition,
+    has_explicit_backend_request_intent,
     utcnow,
 )
 from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
@@ -110,12 +115,15 @@ def _system_secret_cipher(server_secret: str) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(digest))
 
 
-def project_member_profile(user: User, membership: ProjectMembership) -> dict[str, str | None]:
+def project_member_profile(user: User, membership: ProjectMembership) -> dict[str, Any]:
     return {
         "display_name": user.display_name,
         "role": membership.role,
         "department": membership.department,
         "stack": membership.stack,
+        "language": membership.preferred_language or "ru",
+        "knowledge_scope": membership.knowledge_scope or "integration",
+        "can_create_requests": membership.can_create_requests is not False,
     }
 
 
@@ -887,12 +895,31 @@ async def create_change_request(
     source_ref: dict[str, Any],
     created_by_user_id: UUID | None,
 ) -> ChangeRequest:
+    requester_profile: dict[str, Any] = {}
+    if created_by_user_id is not None:
+        profile_row = (
+            await session.execute(
+                select(User, ProjectMembership)
+                .join(ProjectMembership, ProjectMembership.user_id == User.id)
+                .where(
+                    User.id == created_by_user_id,
+                    ProjectMembership.project_id == request.project_id,
+                )
+            )
+        ).one_or_none()
+        if profile_row is not None:
+            requester_profile = project_member_profile(*profile_row)
+    question = "\n\n".join(part for part in (request.title, request.description) if part)
     change_request = ChangeRequest(
         project_id=request.project_id,
         created_by_user_id=created_by_user_id,
         correlation_id=correlation_id,
         source=source,
         source_ref=source_ref,
+        requester_profile=requester_profile,
+        question=question,
+        agent_summary="",
+        citations=[],
         kind=request.kind,
         title=request.title,
         description=request.description,
@@ -912,6 +939,153 @@ async def create_change_request(
         payload={"kind": request.kind, "priority": request.priority, "source": source},
     )
     return change_request
+
+
+async def create_agent_change_request(
+    session: AsyncSession,
+    *,
+    interaction: Interaction,
+    proposal: AgentChangeRequestProposal,
+) -> tuple[ChangeRequest, bool]:
+    """Create one inbox item per interaction from trusted server-side context."""
+    if not has_explicit_backend_request_intent(interaction.question):
+        raise ServiceError(
+            "request_intent_required",
+            "The current user question does not explicitly request backend work",
+        )
+
+    requester_user_id: UUID | None = None
+    if interaction.conversation_thread_id is not None:
+        requester_user_id = await session.scalar(
+            select(ConversationThread.user_id).where(
+                ConversationThread.id == interaction.conversation_thread_id,
+                ConversationThread.project_id == interaction.project_id,
+            )
+        )
+    if interaction.source == "telegram":
+        telegram_user_id = interaction.source_ref.get("telegram_user_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise ServiceError(
+                "forbidden",
+                "A verified Telegram identity is required to create a backend request",
+            )
+        verified_user_id = await session.scalar(
+            select(TelegramIdentity.user_id).where(
+                TelegramIdentity.telegram_user_id == telegram_user_id,
+                TelegramIdentity.verified_at.is_not(None),
+            )
+        )
+        if verified_user_id is None or (
+            requester_user_id is not None and verified_user_id != requester_user_id
+        ):
+            raise ServiceError(
+                "forbidden",
+                "Telegram identity does not match the request author",
+            )
+        requester_user_id = verified_user_id
+
+    requester_profile: dict[str, Any] = {}
+    if requester_user_id is not None:
+        profile_row = (
+            await session.execute(
+                select(User, ProjectMembership)
+                .join(ProjectMembership, ProjectMembership.user_id == User.id)
+                .where(
+                    User.id == requester_user_id,
+                    User.active.is_(True),
+                    ProjectMembership.project_id == interaction.project_id,
+                )
+            )
+        ).one_or_none()
+        if profile_row is not None:
+            if profile_row[1].can_create_requests is not True:
+                raise ServiceError(
+                    "forbidden",
+                    "Requester is not allowed to create backend requests",
+                )
+            requester_profile = project_member_profile(*profile_row)
+    if not requester_profile:
+        raise ServiceError(
+            "forbidden",
+            "A trusted project member is required to create a backend request",
+        )
+
+    existing = await session.scalar(
+        select(ChangeRequest).where(ChangeRequest.source_interaction_id == interaction.id)
+    )
+    if existing is not None:
+        return existing, False
+
+    title = sanitize_text(
+        proposal.title,
+        level="balanced",
+        location="change_request.title",
+    ).text
+    summary = sanitize_text(
+        proposal.summary,
+        level="balanced",
+        location="change_request.agent_summary",
+    ).text
+    citations = [
+        Citation.model_validate(citation).model_dump(mode="json")
+        for citation in interaction.citations
+    ]
+    request_id = uuid4()
+    created_id = await session.scalar(
+        insert(ChangeRequest)
+        .values(
+            id=request_id,
+            project_id=interaction.project_id,
+            created_by_user_id=requester_user_id,
+            source_interaction_id=interaction.id,
+            correlation_id=interaction.correlation_id,
+            source="agent",
+            source_ref={
+                "interaction_id": str(interaction.id),
+                "origin_source": interaction.source,
+            },
+            requester_profile=requester_profile,
+            question=interaction.question,
+            agent_summary=summary,
+            citations=citations,
+            kind=proposal.kind,
+            title=title,
+            description="",
+            priority=proposal.priority,
+            status=ChangeRequestStatus.OPEN.value,
+            version=1,
+        )
+        .on_conflict_do_nothing(constraint="uq_change_request_source_interaction")
+        .returning(ChangeRequest.id)
+    )
+    if created_id is None:
+        raced = await session.scalar(
+            select(ChangeRequest).where(ChangeRequest.source_interaction_id == interaction.id)
+        )
+        if raced is None:
+            raise ServiceError("request_create_failed", "Change request could not be created")
+        return raced, False
+
+    change_request = await session.get(ChangeRequest, created_id)
+    if change_request is None:
+        raise ServiceError("request_create_failed", "Change request could not be loaded")
+    await append_audit(
+        session,
+        event_type="request.created",
+        correlation_id=interaction.correlation_id,
+        actor_type="agent",
+        actor_id="claude-code",
+        project_id=interaction.project_id,
+        subject_type="change_request",
+        subject_id=str(change_request.id),
+        payload={
+            "kind": proposal.kind,
+            "priority": proposal.priority,
+            "source": "agent",
+            "interaction_id": str(interaction.id),
+        },
+    )
+    return change_request, True
 
 
 async def update_change_request_status(

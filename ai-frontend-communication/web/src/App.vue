@@ -38,6 +38,7 @@ const navigation = [
 
 const workNavigation = [
   { name: "requests", label: "Заявки" },
+  { name: "members", label: "Участники" },
   { name: "clarifications", label: "Уточнения" }
 ] as const;
 

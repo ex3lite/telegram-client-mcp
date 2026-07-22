@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import html
-import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -10,7 +8,7 @@ from uuid import UUID, uuid4
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ChatType
+from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, Filter
 from aiogram.types import (
@@ -67,10 +65,21 @@ from dca.service import (
 
 MAX_RICH_MESSAGE_CHARS = 32_768
 MAX_EPHEMERAL_CHARS = 4_096
-DRAFT_STEP_DELAY_SECONDS = 0.12
+MAX_THINKING_DRAFT_CHARS = 8_000
 KNOWLEDGE_PROGRESS_TEXT = "Проверяю код и подтверждаю ссылки"
 PROJECT_PREFIX_RE = re.compile(r"^project:([a-z0-9][a-z0-9-]{0,79})\s+", re.IGNORECASE)
-log = logging.getLogger(__name__)
+BOT_NAME_ALIASES = ("агентик агент", "агентик", "kakadu ai agent", "kakadu ai")
+DOCUMENT_ACTION_RE = re.compile(
+    r"\b(?:создай|сделай|подготовь|напиши|сгенерируй|оформи|выгрузи|"
+    r"create|write|generate|prepare|export)\b",
+    re.IGNORECASE,
+)
+DOCUMENT_SUBJECT_RE = re.compile(
+    r"(?:\b(?:документац\w*|инструкц\w*|спецификац\w*|гайд\w*|отч[её]т\w*|"
+    r"readme(?:\.md)?|runbook|markdown|md[- ]?файл\w*|documentation|guide|"
+    r"specification|report)\b|\b[\w.-]+\.md\b)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +87,8 @@ class MessageContext:
     project: Project
     user_id: UUID
     chat_id: UUID | None
-    requester_profile: dict[str, str | None]
+    requester_profile: dict[str, Any]
+    telegram_user_id: int
 
 
 class BotMention(Filter):
@@ -86,12 +96,12 @@ class BotMention(Filter):
         if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
             return False
         text = message.text or ""
-        if not text.startswith("@"):
-            return False
-        username = (await bot.me()).username
-        if username is None:
-            return False
-        mention_text = extract_bot_mention(text, username)
+        bot_user = await bot.me()
+        mention_text = extract_bot_call(
+            text,
+            username=bot_user.username,
+            first_name=bot_user.first_name,
+        )
         return False if mention_text is None else {"mention_text": mention_text}
 
 
@@ -294,7 +304,15 @@ class TelegramAdapter:
 
     async def send_knowledge_progress(self, interaction: Interaction) -> None:
         delivery = interaction.source_ref.get("delivery", {})
-        if delivery.get("kind") != "private_draft":
+        kind = delivery.get("kind")
+        if kind == "group_message":
+            await self.bot.send_chat_action(
+                chat_id=int(delivery["chat_id"]),
+                message_thread_id=delivery.get("message_thread_id"),
+                action=ChatAction.TYPING,
+            )
+            return
+        if kind != "private_draft":
             return
         kwargs = {
             "chat_id": int(delivery["chat_id"]),
@@ -310,7 +328,56 @@ class TelegramAdapter:
                 ),
             )
         except TelegramBadRequest:
-            await self.bot.send_message_draft(**kwargs, text=KNOWLEDGE_PROGRESS_TEXT)
+            await self.bot.send_message_draft(**kwargs, text="")
+
+    async def send_knowledge_stream(
+        self,
+        interaction: Interaction,
+        *,
+        answer_markdown: str,
+        thinking: str,
+    ) -> None:
+        delivery = interaction.source_ref.get("delivery", {})
+        kind = delivery.get("kind")
+        if kind == "group_message":
+            await self.bot.send_chat_action(
+                chat_id=int(delivery["chat_id"]),
+                message_thread_id=delivery.get("message_thread_id"),
+                action=ChatAction.TYPING,
+            )
+            return
+        if kind != "private_draft":
+            return
+        kwargs = {
+            "chat_id": int(delivery["chat_id"]),
+            "message_thread_id": delivery.get("message_thread_id"),
+            "draft_id": draft_id_for_interaction(interaction.id),
+        }
+        thinking_preview = thinking[-MAX_THINKING_DRAFT_CHARS:]
+        if thinking_preview and not answer_markdown:
+            rich_message = InputRichMessage(
+                blocks=[InputRichBlockThinking(text=thinking_preview)],
+                skip_entity_detection=True,
+            )
+        else:
+            prefix = (
+                f"<tg-thinking>{html.escape(thinking_preview)}</tg-thinking>\n\n"
+                if thinking_preview
+                else ""
+            )
+            answer_limit = max(0, MAX_RICH_MESSAGE_CHARS - len(prefix) - 64)
+            rich_message = InputRichMessage(
+                markdown=prefix + answer_markdown[:answer_limit],
+                skip_entity_detection=True,
+            )
+        try:
+            await self.bot.send_rich_message_draft(**kwargs, rich_message=rich_message)
+        except TelegramBadRequest:
+            plain = ""
+            if thinking_preview:
+                plain = f"💭 {thinking_preview}\n\n"
+            plain += answer_markdown
+            await self.bot.send_message_draft(**kwargs, text=plain[:MAX_EPHEMERAL_CHARS])
 
     async def publish_knowledge_answer(
         self,
@@ -319,7 +386,6 @@ class TelegramAdapter:
         *,
         artifacts: list[dict[str, Any]] | None = None,
         attach_markdown: bool = True,
-        stream: bool = False,
     ) -> None:
         delivery = interaction.source_ref.get("delivery", {})
         kind = delivery.get("kind")
@@ -327,35 +393,49 @@ class TelegramAdapter:
             answer_markdown,
             attach_markdown=attach_markdown,
         )
+        chunks = (
+            rich_answer_chunks(answer_markdown)
+            if not attach_markdown and kind in {"private_draft", "group_message"}
+            else [short_answer]
+        )
         documents = markdown_documents(artifacts or [], attachment=attachment)
-        rich = InputRichMessage(markdown=short_answer, skip_entity_detection=True)
         if kind == "private_draft":
-            if stream:
-                try:
-                    await self._stream_knowledge_answer(interaction.id, delivery, short_answer)
-                except Exception:
-                    log.warning("telegram draft stream failed", exc_info=True)
             kwargs = {
                 "chat_id": int(delivery["chat_id"]),
                 "message_thread_id": delivery.get("message_thread_id"),
             }
-            try:
-                sent = await self.bot.send_rich_message(**kwargs, rich_message=rich)
-            except TelegramBadRequest:
-                sent = await self.bot.send_rich_message(
-                    **kwargs,
-                    rich_message=plain_rich_message(short_answer),
-                )
+            sent_chat_id = int(delivery["chat_id"])
+            for chunk in chunks:
+                try:
+                    sent = await self.bot.send_rich_message(
+                        **kwargs,
+                        rich_message=InputRichMessage(
+                            markdown=chunk,
+                            skip_entity_detection=True,
+                        ),
+                    )
+                except TelegramBadRequest:
+                    sent = await self.bot.send_rich_message(
+                        **kwargs,
+                        rich_message=plain_rich_message(chunk),
+                    )
+                sent_chat_id = sent.chat.id
             if attach_markdown:
                 await self._send_markdown_documents(
-                    chat_id=sent.chat.id,
+                    chat_id=sent_chat_id,
                     message_thread_id=delivery.get("message_thread_id"),
                     documents=documents,
                 )
         elif kind == "guest":
             kwargs = {"inline_message_id": str(delivery["inline_message_id"])}
             try:
-                await self.bot.edit_message_text(**kwargs, rich_message=rich)
+                await self.bot.edit_message_text(
+                    **kwargs,
+                    rich_message=InputRichMessage(
+                        markdown=short_answer,
+                        skip_entity_detection=True,
+                    ),
+                )
             except TelegramBadRequest:
                 await self.bot.edit_message_text(
                     **kwargs,
@@ -373,39 +453,44 @@ class TelegramAdapter:
                 "chat_id": int(delivery["chat_id"]),
                 "message_id": int(delivery["message_id"]),
             }
+            first_chunk, *remaining_chunks = chunks
             try:
-                await self.bot.edit_message_text(**kwargs, rich_message=rich)
+                await self.bot.edit_message_text(
+                    **kwargs,
+                    rich_message=InputRichMessage(
+                        markdown=first_chunk,
+                        skip_entity_detection=True,
+                    ),
+                )
             except TelegramBadRequest:
                 await self.bot.edit_message_text(
                     **kwargs,
-                    rich_message=plain_rich_message(short_answer),
+                    rich_message=plain_rich_message(first_chunk),
                 )
+            for chunk in remaining_chunks:
+                send_kwargs = {
+                    "chat_id": int(delivery["chat_id"]),
+                    "message_thread_id": delivery.get("message_thread_id"),
+                }
+                try:
+                    await self.bot.send_rich_message(
+                        **send_kwargs,
+                        rich_message=InputRichMessage(
+                            markdown=chunk,
+                            skip_entity_detection=True,
+                        ),
+                    )
+                except TelegramBadRequest:
+                    await self.bot.send_rich_message(
+                        **send_kwargs,
+                        rich_message=plain_rich_message(chunk),
+                    )
             if attach_markdown:
                 await self._send_markdown_documents(
                     chat_id=int(delivery["chat_id"]),
                     message_thread_id=delivery.get("message_thread_id"),
                     documents=documents,
                 )
-
-    async def _stream_knowledge_answer(
-        self,
-        interaction_id: UUID,
-        delivery: dict[str, Any],
-        answer: str,
-    ) -> None:
-        draft_id = draft_id_for_interaction(interaction_id)
-        parts = answer_draft_parts(answer)
-        for index, part in enumerate(parts):
-            sent = await self.bot.send_message_draft(
-                chat_id=int(delivery["chat_id"]),
-                message_thread_id=delivery.get("message_thread_id"),
-                draft_id=draft_id,
-                text=part,
-            )
-            if not sent:
-                return
-            if index + 1 < len(parts):
-                await asyncio.sleep(DRAFT_STEP_DELAY_SECONDS)
 
     async def _send_markdown_documents(
         self,
@@ -472,6 +557,7 @@ class TelegramAdapter:
                     return
                 identity.private_chat_id = message.chat.id
                 identity.reachable = True
+                identity.verified_at = utcnow()
                 identity.username = message.from_user.username
                 await message.answer(
                     "Связь подтверждена. Теперь вы можете получать адресные вопросы "
@@ -918,9 +1004,33 @@ def extract_bot_mention(value: str, username: str) -> str | None:
     if not value.casefold().startswith(mention.casefold()):
         return None
     remainder = value[len(mention) :]
-    if remainder and not remainder[0].isspace():
+    if remainder and not (remainder[0].isspace() or remainder[0] in ",.:;!?—-"):
         return None
-    return remainder.strip()
+    return remainder.lstrip(" \t,.:;!?—-")
+
+
+def extract_bot_call(value: str, *, username: str | None, first_name: str) -> str | None:
+    if username:
+        mention = extract_bot_mention(value, username)
+        if mention is not None:
+            return mention
+    aliases = sorted({first_name.strip(), *BOT_NAME_ALIASES}, key=len, reverse=True)
+    normalized = value.casefold()
+    for alias in aliases:
+        if not alias or not normalized.startswith(alias.casefold()):
+            continue
+        remainder = value[len(alias) :]
+        if remainder and not (remainder[0].isspace() or remainder[0] in ",.:;!?—-"):
+            continue
+        return remainder.lstrip(" \t,.:;!?—-")
+    return None
+
+
+def document_requested(question: str) -> bool:
+    return (
+        DOCUMENT_ACTION_RE.search(question) is not None
+        and DOCUMENT_SUBJECT_RE.search(question) is not None
+    )
 
 
 async def _message_context(
@@ -928,6 +1038,8 @@ async def _message_context(
     project: Project,
     user_id: UUID,
     message: Message,
+    *,
+    telegram_user_id: int,
 ) -> MessageContext:
     row = (
         await session.execute(
@@ -935,6 +1047,7 @@ async def _message_context(
             .join(ProjectMembership, ProjectMembership.user_id == User.id)
             .where(
                 User.id == user_id,
+                User.active.is_(True),
                 ProjectMembership.project_id == project.id,
             )
         )
@@ -960,6 +1073,7 @@ async def _message_context(
         user_id=user_id,
         chat_id=chat_id,
         requester_profile=project_member_profile(user, membership),
+        telegram_user_id=telegram_user_id,
     )
 
 
@@ -996,7 +1110,13 @@ async def resolve_context(
         )
         if project is None:
             raise ServiceError("project_scope_violation", "Project is unavailable to this user")
-        return await _message_context(session, project, identity.user_id, message)
+        return await _message_context(
+            session,
+            project,
+            identity.user_id,
+            message,
+            telegram_user_id=telegram_user_id,
+        )
 
     project = await session.scalar(
         select(Project)
@@ -1018,7 +1138,13 @@ async def resolve_context(
         .order_by(TelegramChat.message_thread_id.desc().nullslast())
     )
     if project is not None:
-        return await _message_context(session, project, identity.user_id, message)
+        return await _message_context(
+            session,
+            project,
+            identity.user_id,
+            message,
+            telegram_user_id=telegram_user_id,
+        )
 
     projects = list(
         await session.scalars(
@@ -1032,7 +1158,13 @@ async def resolve_context(
         )
     )
     if len(projects) == 1:
-        return await _message_context(session, projects[0], identity.user_id, message)
+        return await _message_context(
+            session,
+            projects[0],
+            identity.user_id,
+            message,
+            telegram_user_id=telegram_user_id,
+        )
     raise ServiceError(
         "project_required",
         "Укажите проект в начале команды: project:slug",
@@ -1094,6 +1226,8 @@ async def queue_interaction(
         source="telegram",
         source_ref={
             **source_ref,
+            "telegram_user_id": context.telegram_user_id,
+            "requester_user_id": str(context.user_id),
             "requester_profile": context.requester_profile,
             "question_privacy_findings": [dict(finding) for finding in question_result.findings],
         },
@@ -1130,6 +1264,26 @@ async def queue_interaction(
     return interaction
 
 
+def rich_answer_chunks(answer: str) -> list[str]:
+    if len(answer) <= MAX_RICH_MESSAGE_CHARS:
+        return [answer]
+
+    chunks: list[str] = []
+    offset = 0
+    while len(answer) - offset > MAX_RICH_MESSAGE_CHARS:
+        hard_end = offset + MAX_RICH_MESSAGE_CHARS
+        paragraph_break = answer.rfind("\n\n", offset, hard_end)
+        if paragraph_break > offset:
+            end = paragraph_break + 2
+        else:
+            line_break = answer.rfind("\n", offset, hard_end)
+            end = line_break + 1 if line_break > offset else hard_end
+        chunks.append(answer[offset:end])
+        offset = end
+    chunks.append(answer[offset:])
+    return chunks
+
+
 def split_rich_answer(answer: str, *, attach_markdown: bool = True) -> tuple[str, str | None]:
     if len(answer) <= MAX_RICH_MESSAGE_CHARS:
         return answer, None
@@ -1164,11 +1318,3 @@ def plain_rich_message(text: str) -> InputRichMessage:
 
 def draft_id_for_interaction(interaction_id: UUID) -> int:
     return interaction_id.int % 2_147_483_647 or 1
-
-
-def answer_draft_parts(answer: str) -> list[str]:
-    preview = answer[:MAX_EPHEMERAL_CHARS]
-    if not preview:
-        return []
-    steps = min(len(preview), 8, max(4, (len(preview) + 511) // 512))
-    return [preview[: (len(preview) * step + steps - 1) // steps] for step in range(1, steps + 1)]

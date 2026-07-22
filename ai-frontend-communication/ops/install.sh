@@ -11,6 +11,7 @@ APP_DIR="$SOURCE_DIR/ai-frontend-communication"
 id dca >/dev/null 2>&1 || useradd --system --home-dir /var/lib/dca --create-home --shell /usr/sbin/nologin dca
 install -d -m 0750 -o dca -g dca \
   /var/lib/dca /var/lib/dca/repositories /var/lib/dca/snapshots /var/lib/dca/.cache
+install -d -m 0700 -o dca -g dca /var/lib/dca/claude-sessions
 install -d -m 0750 -o root -g dca /opt/dca/releases /var/backups/dca
 install -d -m 0750 -o root -g dca /etc/dca /etc/dca/keys
 install -m 0644 "$APP_DIR/ops/systemd/dca-api.service" /etc/systemd/system/dca-api.service
