@@ -9,16 +9,21 @@ The authoritative references are the [Bot API changelog](https://core.telegram.o
 
 | User path | Initial response | Completion | Visibility |
 | --- | --- | --- | --- |
-| Private `/ask` | `sendRichMessageDraft` with a thinking block while work runs | `sendRichMessage` with verified Markdown; oversized output also arrives as `answer.md` | User and bot |
+| Private `/ask` | Controlled Rich Thinking heartbeat | After privacy filtering, 4-8 `sendMessageDraft` prefixes with the same draft ID, then permanent `sendRichMessage` | User and bot |
 | Group `/ask` | Ordinary placeholder message | `editMessageText` with `rich_message`; oversized output also arrives as `answer.md` | Group |
 | Group `/ask_private` | Ephemeral reply bound to the incoming `ephemeral_message_id` | `editEphemeralMessageText` with `receiver_user_id` | Invoking user and bot |
 | Group `/request` | Ephemeral acknowledgement when Telegram supplies ephemeral context | The request is durable in PostgreSQL/admin | Invoking user and bot |
 | Guest query | Immediate `answerGuestQuery` publishes a rich placeholder and returns an inline message ID | `editMessageText` updates that inline message | Invoking chat |
 
-Private rich drafts are the actual incremental AI progress path. Group answers intentionally use one
-placeholder plus one edit; this is not token-by-token group streaming. The application keeps the
-durable interaction/job before background generation, except the Guest Mode placeholder, which
-must be answered immediately so Telegram returns the inline message ID needed for later editing.
+When `telegram_streaming_enabled` is on, private generation refreshes a server-controlled Rich
+Thinking block. Its deterministic, non-zero signed 31-bit draft ID comes from the interaction UUID.
+After the complete answer passes the full privacy filter, the worker replaces that draft with 4-8
+progressively longer `sendMessageDraft` prefixes using the same ID, then persists the answer with
+`sendRichMessage`. Raw Claude deltas never reach Telegram. A draft API failure is logged but cannot
+block the permanent answer. Group answers intentionally use one placeholder plus one edit; they are
+not streamed. The application keeps the durable interaction/job before background generation,
+except the Guest Mode placeholder, which must be answered immediately so Telegram returns the
+inline message ID needed for later editing.
 
 ## Command and update transport setup
 

@@ -25,6 +25,9 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi import (
+    Path as ApiPath,
+)
 from fastapi.responses import FileResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -32,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from dca.claude import ClaudeCode
+from dca.claude import ClaudeCode, ClaudeError, ClaudeOAuthManager
 from dca.config import Settings, get_settings
 from dca.db import (
     AdminAccessKey,
@@ -41,6 +44,9 @@ from dca.db import (
     AuditEvent,
     ChangeRequest,
     Clarification,
+    ConversationMemory,
+    ConversationMessage,
+    ConversationThread,
     Database,
     Interaction,
     Job,
@@ -50,6 +56,7 @@ from dca.db import (
     ServiceAccount,
     ServiceAccountProject,
     SystemSecret,
+    User,
     append_audit,
     enqueue_job,
 )
@@ -123,8 +130,12 @@ class AgentSettingsInput(BaseModel):
     answer_style: Literal["brief", "normal", "detailed"]
     privacy_level: Literal["strict", "balanced"]
     denied_globs: list[str] = Field(max_length=200)
+    memory_enabled: bool
+    memory_recent_messages: int = Field(ge=4, le=100)
+    memory_max_context_chars: int = Field(ge=3_000, le=100_000)
     telegram_group_mode: Literal["commands_only", "mentions", "all_messages"]
     telegram_private_mode: Literal["commands_only", "all_messages"]
+    telegram_streaming_enabled: bool
     telegram_attach_markdown: bool
 
     @field_validator("claude_model")
@@ -168,6 +179,42 @@ class ClaudeIntegrationInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     oauth_token: SecretStr = Field(min_length=20, max_length=16_384)
+
+
+class ClaudeIntegrationStatus(BaseModel):
+    configured: bool
+    source: Literal["panel", "environment", "missing"]
+    proxy_configured: bool
+
+
+class ClaudeOAuthStartInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ClaudeOAuthStartResponse(BaseModel):
+    session_id: str
+    authorization_url: str
+    expires_at: datetime
+
+
+class ClaudeOAuthCompleteInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    code: SecretStr = Field(min_length=1, max_length=4_096)
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: SecretStr) -> SecretStr:
+        normalized = value.get_secret_value().strip()
+        if (
+            not normalized
+            or not normalized.isascii()
+            or not normalized.isprintable()
+            or any(character in normalized for character in "\r\n\0")
+        ):
+            raise ValueError("Claude OAuth code must be printable single-line ASCII")
+        return SecretStr(normalized)
 
 
 class McpAccountCreateInput(BaseModel):
@@ -251,6 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging(settings)
     database = Database(settings)
     telegram = TelegramAdapter(settings, database)
+    claude_oauth = ClaudeOAuthManager(settings)
     redis_client: redis.Redis = redis.from_url(  # type: ignore[no-untyped-call]
         settings.redis_url, decode_responses=True
     )
@@ -269,6 +317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.snapshot_root.mkdir(parents=True, exist_ok=True)
         async with mcp_server.session_manager.run():
             yield
+        await claude_oauth.close()
         await telegram.close()
         await redis_client.aclose()
         await database.close()
@@ -281,6 +330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.database = database
     app.state.telegram = telegram
+    app.state.claude_oauth = claude_oauth
     app.state.redis = redis_client
 
     async def require_admin(
@@ -329,6 +379,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         actual = urlsplit(origin)
         if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "cross_origin_mutation_denied")
+
+    async def append_claude_oauth_audit(
+        *,
+        event_type: str,
+        admin: AdminContext,
+        session_id: str | None,
+        outcome: str = "success",
+        error_code: str | None = None,
+        expires_at: datetime | None = None,
+        cancelled: bool | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {}
+        if error_code is not None:
+            payload["error_code"] = error_code
+        if expires_at is not None:
+            payload["expires_at"] = expires_at.isoformat()
+        if cancelled is not None:
+            payload["cancelled"] = cancelled
+        async with database.session() as session:
+            await append_audit(
+                session,
+                event_type=event_type,
+                correlation_id=f"claude-oauth:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                subject_type="claude_oauth_session",
+                subject_id=(
+                    oauth_session_fingerprint(session_id) if session_id is not None else None
+                ),
+                outcome=outcome,
+                payload=payload,
+            )
+
+    async def store_claude_oauth_token(
+        session: Any,
+        provider_value: str,
+        admin_id: UUID,
+    ) -> None:
+        ciphertext = encrypt_system_secret(provider_value, raw_session_secret)
+        managed = await session.get(SystemSecret, SYSTEM_SECRET_CLAUDE_OAUTH)
+        if managed is None:
+            session.add(
+                SystemSecret(
+                    name=SYSTEM_SECRET_CLAUDE_OAUTH,
+                    ciphertext=ciphertext,
+                    updated_by=admin_id,
+                )
+            )
+            return
+        managed.ciphertext = ciphertext
+        managed.updated_by = admin_id
+        managed.updated_at = utcnow()
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -545,8 +647,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             row.answer_style = payload.answer_style
             row.privacy_level = payload.privacy_level
             row.denied_globs = payload.denied_globs
+            row.memory_enabled = payload.memory_enabled
+            row.memory_recent_messages = payload.memory_recent_messages
+            row.memory_max_context_chars = payload.memory_max_context_chars
             row.telegram_group_mode = payload.telegram_group_mode
             row.telegram_private_mode = payload.telegram_private_mode
+            row.telegram_streaming_enabled = payload.telegram_streaming_enabled
             row.telegram_attach_markdown = payload.telegram_attach_markdown
             row.updated_by_admin_id = admin.principal_id
             row.updated_at = utcnow()
@@ -564,10 +670,109 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "version": row.version,
                     "enabled": row.enabled,
                     "privacy_level": row.privacy_level,
+                    "memory_enabled": row.memory_enabled,
                 },
             )
             result = serialize_agent_settings(row, project_id)
         return result
+
+    @app.post(
+        "/api/v1/integrations/claude/oauth/start",
+        response_model=ClaudeOAuthStartResponse,
+    )
+    async def start_claude_oauth(
+        _: ClaudeOAuthStartInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        __: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        try:
+            started = await claude_oauth.start(admin.principal_id)
+        except ClaudeError as exc:
+            await append_claude_oauth_audit(
+                event_type="claude.oauth_start_failed",
+                admin=admin,
+                session_id=None,
+                outcome="failure",
+                error_code=exc.code,
+            )
+            raise claude_oauth_http_exception(exc) from exc
+        try:
+            await append_claude_oauth_audit(
+                event_type="claude.oauth_started",
+                admin=admin,
+                session_id=started.session_id,
+                expires_at=started.expires_at,
+            )
+        except BaseException:
+            await claude_oauth.cancel(admin.principal_id, started.session_id)
+            raise
+        return {
+            "session_id": started.session_id,
+            "authorization_url": started.authorization_url,
+            "expires_at": started.expires_at,
+        }
+
+    @app.post(
+        "/api/v1/integrations/claude/oauth/complete",
+        response_model=ClaudeIntegrationStatus,
+    )
+    async def complete_claude_oauth(
+        payload: ClaudeOAuthCompleteInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        try:
+            provider_value = await claude_oauth.complete(
+                admin.principal_id,
+                payload.session_id,
+                payload.code.get_secret_value(),
+            )
+        except ClaudeError as exc:
+            await append_claude_oauth_audit(
+                event_type="claude.oauth_complete_failed",
+                admin=admin,
+                session_id=payload.session_id,
+                outcome="failure",
+                error_code=exc.code,
+            )
+            raise claude_oauth_http_exception(exc) from exc
+        try:
+            async with database.session() as session:
+                await store_claude_oauth_token(session, provider_value, admin.principal_id)
+                await append_audit(
+                    session,
+                    event_type="claude.oauth_completed",
+                    correlation_id=f"claude-oauth:{secrets.token_hex(8)}",
+                    actor_type="admin",
+                    actor_id=str(admin.principal_id),
+                    subject_type="claude_oauth_session",
+                    subject_id=oauth_session_fingerprint(payload.session_id),
+                    payload={"source": "panel"},
+                )
+        finally:
+            provider_value = ""
+        return claude_integration_status(settings, panel_configured=True)
+
+    @app.delete(
+        "/api/v1/integrations/claude/oauth/{session_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def cancel_claude_oauth(
+        session_id: Annotated[
+            str,
+            ApiPath(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+        ],
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> Response:
+        cancelled = await claude_oauth.cancel(admin.principal_id, session_id)
+        await append_claude_oauth_audit(
+            event_type="claude.oauth_cancelled",
+            admin=admin,
+            session_id=session_id,
+            cancelled=cancelled,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/api/v1/integrations/claude")
     async def get_claude_integration(
@@ -586,20 +791,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         token = payload.oauth_token.get_secret_value().strip()
         if len(token) < 20:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "oauth_token_too_short")
-        ciphertext = encrypt_system_secret(token, raw_session_secret)
         async with database.session() as session:
-            managed = await session.get(SystemSecret, SYSTEM_SECRET_CLAUDE_OAUTH)
-            if managed is None:
-                managed = SystemSecret(
-                    name=SYSTEM_SECRET_CLAUDE_OAUTH,
-                    ciphertext=ciphertext,
-                    updated_by=admin.principal_id,
-                )
-                session.add(managed)
-            else:
-                managed.ciphertext = ciphertext
-                managed.updated_by = admin.principal_id
-                managed.updated_at = utcnow()
+            await store_claude_oauth_token(session, token, admin.principal_id)
             await append_audit(
                 session,
                 event_type="claude.integration_updated",
@@ -889,6 +1082,141 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "recent_events": [serialize_audit(event) for event in recent],
         }
 
+    @app.get("/api/v1/conversations")
+    async def list_conversations(
+        _: Annotated[AdminContext, Depends(require_admin)],
+        project_id: UUID | None = None,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> list[dict[str, Any]]:
+        message_count = (
+            select(func.count())
+            .select_from(ConversationMessage)
+            .where(ConversationMessage.thread_id == ConversationThread.id)
+            .correlate(ConversationThread)
+            .scalar_subquery()
+        )
+        memory_count = (
+            select(func.count())
+            .select_from(ConversationMemory)
+            .where(ConversationMemory.thread_id == ConversationThread.id)
+            .correlate(ConversationThread)
+            .scalar_subquery()
+        )
+        query = (
+            select(
+                ConversationThread,
+                User.display_name,
+                message_count.label("message_count"),
+                memory_count.label("memory_count"),
+            )
+            .outerjoin(User, User.id == ConversationThread.user_id)
+            .order_by(
+                ConversationThread.last_message_at.desc().nullslast(),
+                ConversationThread.created_at.desc(),
+            )
+        )
+        if project_id is not None:
+            query = query.where(ConversationThread.project_id == project_id)
+        async with database.session() as session:
+            rows = (await session.execute(query.limit(limit).offset(offset))).all()
+        return [
+            serialize_conversation_summary(
+                thread,
+                user_display_name=user_display_name,
+                message_count=int(messages),
+                memory_count=int(memories),
+            )
+            for thread, user_display_name, messages, memories in rows
+        ]
+
+    @app.get("/api/v1/conversations/{thread_id}")
+    async def conversation_detail(
+        thread_id: UUID,
+        _: Annotated[AdminContext, Depends(require_admin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            thread = await session.get(ConversationThread, thread_id)
+            if thread is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation_not_found")
+            user_display_name = (
+                await session.scalar(select(User.display_name).where(User.id == thread.user_id))
+                if thread.user_id is not None
+                else None
+            )
+            messages = list(
+                await session.scalars(
+                    select(ConversationMessage)
+                    .where(ConversationMessage.thread_id == thread.id)
+                    .order_by(
+                        ConversationMessage.created_at.desc(),
+                        ConversationMessage.id.desc(),
+                    )
+                    .limit(500)
+                )
+            )
+            messages.reverse()
+            memories = list(
+                await session.scalars(
+                    select(ConversationMemory)
+                    .where(ConversationMemory.thread_id == thread.id)
+                    .order_by(
+                        ConversationMemory.kind,
+                        ConversationMemory.updated_at.desc(),
+                        ConversationMemory.id,
+                    )
+                    .limit(200)
+                )
+            )
+            message_count = await session.scalar(
+                select(func.count())
+                .select_from(ConversationMessage)
+                .where(ConversationMessage.thread_id == thread.id)
+            )
+            memory_count = await session.scalar(
+                select(func.count())
+                .select_from(ConversationMemory)
+                .where(ConversationMemory.thread_id == thread.id)
+            )
+        return {
+            **serialize_conversation_summary(
+                thread,
+                user_display_name=user_display_name,
+                message_count=int(message_count or 0),
+                memory_count=int(memory_count or 0),
+            ),
+            "messages": [serialize_conversation_message(row) for row in messages],
+            "memories": [serialize_conversation_memory(row) for row in memories],
+        }
+
+    @app.delete(
+        "/api/v1/conversations/{thread_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_conversation(
+        thread_id: UUID,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> Response:
+        async with database.session() as session:
+            thread = await session.get(ConversationThread, thread_id)
+            if thread is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation_not_found")
+            project_id = thread.project_id
+            await append_audit(
+                session,
+                event_type="conversation.deleted",
+                correlation_id=f"conversation:{thread.id}:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                project_id=project_id,
+                subject_type="conversation_thread",
+                subject_id=str(thread.id),
+                payload={"chat_id": str(thread.chat_id) if thread.chat_id else None},
+            )
+            await session.delete(thread)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.get("/api/v1/interactions")
     async def list_interactions(
         _: Annotated[AdminContext, Depends(require_admin)],
@@ -1118,8 +1446,12 @@ def serialize_agent_settings(
             "answer_style": "normal",
             "privacy_level": "strict",
             "denied_globs": [],
+            "memory_enabled": True,
+            "memory_recent_messages": 24,
+            "memory_max_context_chars": 24_000,
             "telegram_group_mode": "mentions",
             "telegram_private_mode": "all_messages",
+            "telegram_streaming_enabled": True,
             "telegram_attach_markdown": True,
             "version": 0,
             "updated_by_admin_id": None,
@@ -1137,8 +1469,12 @@ def serialize_agent_settings(
         "answer_style": row.answer_style,
         "privacy_level": row.privacy_level,
         "denied_globs": row.denied_globs,
+        "memory_enabled": row.memory_enabled,
+        "memory_recent_messages": row.memory_recent_messages,
+        "memory_max_context_chars": row.memory_max_context_chars,
         "telegram_group_mode": row.telegram_group_mode,
         "telegram_private_mode": row.telegram_private_mode,
+        "telegram_streaming_enabled": row.telegram_streaming_enabled,
         "telegram_attach_markdown": row.telegram_attach_markdown,
         "version": row.version,
         "updated_by_admin_id": (
@@ -1204,11 +1540,56 @@ async def serialize_mcp_account(
     }
 
 
+def serialize_conversation_summary(
+    row: ConversationThread,
+    *,
+    user_display_name: str | None,
+    message_count: int,
+    memory_count: int,
+) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "project_id": str(row.project_id),
+        "chat_id": str(row.chat_id) if row.chat_id is not None else None,
+        "user_id": str(row.user_id) if row.user_id is not None else None,
+        "user_display_name": user_display_name,
+        "message_count": message_count,
+        "memory_count": memory_count,
+        "last_message_at": row.last_message_at,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def serialize_conversation_message(row: ConversationMessage) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "role": row.role,
+        "source": row.source,
+        "content": row.content,
+        "author_user_id": (str(row.author_user_id) if row.author_user_id is not None else None),
+        "created_at": row.created_at,
+    }
+
+
+def serialize_conversation_memory(row: ConversationMemory) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "kind": row.kind,
+        "memory_key": row.memory_key,
+        "content": row.content,
+        "updated_at": row.updated_at,
+    }
+
+
 def serialize_interaction(row: Interaction) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "project_id": str(row.project_id),
         "repository_id": str(row.repository_id) if row.repository_id is not None else None,
+        "conversation_thread_id": (
+            str(row.conversation_thread_id) if row.conversation_thread_id is not None else None
+        ),
         "correlation_id": row.correlation_id,
         "source": row.source,
         "source_ref": row.source_ref,
@@ -1234,6 +1615,9 @@ def serialize_interaction_summary(row: Interaction) -> dict[str, Any]:
         "id": str(row.id),
         "project_id": str(row.project_id),
         "repository_id": str(row.repository_id) if row.repository_id is not None else None,
+        "conversation_thread_id": (
+            str(row.conversation_thread_id) if row.conversation_thread_id is not None else None
+        ),
         "source": row.source,
         "question": row.question[:question_limit],
         "question_truncated": len(row.question) > question_limit,
@@ -1320,6 +1704,22 @@ def serialize_audit(row: AuditEvent) -> dict[str, Any]:
         "outcome": row.outcome,
         "payload": row.payload,
     }
+
+
+def oauth_session_fingerprint(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode()).hexdigest()[:16]
+
+
+def claude_oauth_http_exception(error: ClaudeError) -> HTTPException:
+    status_code = {
+        "claude_oauth_session_active": status.HTTP_409_CONFLICT,
+        "claude_oauth_invalid_state": status.HTTP_409_CONFLICT,
+        "claude_oauth_session_expired": status.HTTP_410_GONE,
+        "claude_oauth_invalid_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "claude_oauth_provider_error": status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "claude_oauth_proxy_required": status.HTTP_422_UNPROCESSABLE_ENTITY,
+    }.get(error.code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+    return HTTPException(status_code, error.code)
 
 
 def service_http_error(error: ServiceError) -> HTTPException:

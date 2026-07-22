@@ -28,6 +28,7 @@ from dca.claude import ClaudeCode, ClaudeError, RepositorySnapshots
 from dca.config import Settings, get_settings
 from dca.db import (
     AgentMessage,
+    ConversationThread,
     Database,
     Interaction,
     Job,
@@ -40,6 +41,13 @@ from dca.db import (
     enqueue_job,
 )
 from dca.domain import JobStatus, KnowledgeAnswer, KnowledgeArtifact, utcnow
+from dca.memory import (
+    ConversationContext,
+    append_conversation_message,
+    get_or_create_conversation_thread,
+    load_conversation_context,
+    upsert_conversation_memory,
+)
 from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
 from dca.service import (
     SYSTEM_SECRET_CLAUDE_OAUTH,
@@ -49,7 +57,7 @@ from dca.service import (
     load_project_agent_settings,
     load_system_secret,
 )
-from dca.telegram import TelegramAdapter, ingest_telegram_update, new_draft_id
+from dca.telegram import TelegramAdapter, ingest_telegram_update
 
 log = structlog.get_logger()
 TELEGRAM_EXTERNAL_ACTIONS = {
@@ -85,6 +93,25 @@ def trusted_requester_profile(interaction: Interaction) -> dict[str, str] | None
         if isinstance((value := raw_profile.get(key)), str)
     }
     return profile or None
+
+
+def conversation_prompt_context(context: ConversationContext) -> dict[str, Any]:
+    return {
+        "summary": context.summary,
+        "facts": [{"key": fact.key, "content": fact.content} for fact in context.facts],
+        "messages": [
+            {
+                "role": message.role,
+                "source": message.source,
+                "content": message.content,
+                "author_user_id": (
+                    str(message.author_user_id) if message.author_user_id is not None else None
+                ),
+                "created_at": message.created_at.isoformat(),
+            }
+            for message in context.messages
+        ],
+    }
 
 
 class Worker:
@@ -344,6 +371,9 @@ class Worker:
         if job.kind == "telegram.deliver_agent_message":
             agent_message_id = UUID(job.payload["agent_message_id"])
             return await self._deliver_agent_message(agent_message_id)
+        if job.kind == "conversation.remember_agent_message":
+            agent_message_id = UUID(job.payload["agent_message_id"])
+            return await self._remember_agent_message(agent_message_id)
         if job.kind == "knowledge.answer":
             interaction_id = UUID(job.payload["interaction_id"])
             return await self._answer_interaction(interaction_id)
@@ -479,16 +509,70 @@ class Worker:
                 subject_id=str(persisted.id),
                 payload={"telegram_message_id": telegram_message_id},
             )
+            await enqueue_job(
+                session,
+                kind="conversation.remember_agent_message",
+                payload={"agent_message_id": str(persisted.id)},
+                deduplication_key=f"agent-message:{persisted.id}:remember",
+                max_attempts=5,
+            )
         return {
             "agent_message_id": str(agent_message_id),
             "status": "sent",
             "telegram_message_id": telegram_message_id,
         }
 
+    async def _remember_agent_message(self, agent_message_id: UUID) -> dict[str, Any]:
+        async with self.database.session() as session:
+            message = await session.get(AgentMessage, agent_message_id)
+            if message is None or message.status != "sent":
+                return {"agent_message_id": str(agent_message_id), "remembered": False}
+            agent_settings = await load_project_agent_settings(session, message.project_id)
+            if not agent_settings.memory_enabled:
+                return {"agent_message_id": str(agent_message_id), "remembered": False}
+            thread = await get_or_create_conversation_thread(
+                session,
+                project_id=message.project_id,
+                chat_id=message.target_chat_id,
+                user_id=message.target_user_id,
+            )
+            _, created = await append_conversation_message(
+                session,
+                project_id=message.project_id,
+                chat_id=message.target_chat_id,
+                user_id=message.target_user_id,
+                thread_id=thread.id,
+                role="agent",
+                source="mcp",
+                content=message.text_markdown,
+                external_id=str(message.id),
+            )
+            return {
+                "agent_message_id": str(agent_message_id),
+                "thread_id": str(thread.id),
+                "remembered": True,
+                "created": created,
+            }
+
     async def _answer_interaction(self, interaction_id: UUID) -> dict[str, Any]:
+        prompt_memory: dict[str, Any] | None = None
         async with self.database.session() as session:
             interaction = await session.get(Interaction, interaction_id)
-            if interaction is None or interaction.repository_id is None:
+            if interaction is None:
+                raise ServiceError("request_not_found", "Interaction is missing")
+            if interaction.status in {"answer_ready", "published"}:
+                return {
+                    "interaction_id": str(interaction.id),
+                    "already_completed": True,
+                    "privacy_blocked": False,
+                }
+            if interaction.status == "failed" and interaction.error_code == "privacy_blocked":
+                return {
+                    "interaction_id": str(interaction.id),
+                    "already_completed": True,
+                    "privacy_blocked": True,
+                }
+            if interaction.repository_id is None:
                 raise ServiceError("request_not_found", "Interaction or repository is missing")
             repository = await session.get(Repository, interaction.repository_id)
             if repository is None or interaction.commit_sha is None:
@@ -501,6 +585,28 @@ class Worker:
                 SYSTEM_SECRET_CLAUDE_OAUTH,
                 self.settings.session_secret.get_secret_value(),
             )
+            if agent_settings.memory_enabled and interaction.conversation_thread_id is not None:
+                thread = await session.get(
+                    ConversationThread,
+                    interaction.conversation_thread_id,
+                )
+                if thread is None or thread.project_id != interaction.project_id:
+                    raise ServiceError(
+                        "conversation_scope_unavailable",
+                        "Interaction conversation is unavailable",
+                    )
+                context = await load_conversation_context(
+                    session,
+                    project_id=interaction.project_id,
+                    chat_id=thread.chat_id,
+                    user_id=thread.user_id,
+                    thread_id=thread.id,
+                    message_limit=agent_settings.memory_recent_messages,
+                    max_chars=agent_settings.memory_max_context_chars,
+                    exclude_external_id=interaction.correlation_id,
+                    before=interaction.created_at,
+                )
+                prompt_memory = conversation_prompt_context(context)
             interaction.status = "generating"
             await session.flush()
             session.expunge(interaction)
@@ -511,19 +617,25 @@ class Worker:
             interaction.commit_sha,
             denied_globs=agent_settings.denied_globs,
         )
-        heartbeat = asyncio.create_task(self._draft_heartbeat(interaction))
+        heartbeat = (
+            asyncio.create_task(self._draft_heartbeat(interaction))
+            if agent_settings.telegram_streaming_enabled
+            else None
+        )
         try:
             result = await self.claude.answer(
                 snapshot=snapshot,
                 question=interaction.question,
                 project_settings=agent_settings,
                 requester_profile=trusted_requester_profile(interaction),
+                conversation_context=prompt_memory,
                 oauth_token=oauth_token,
             )
         finally:
-            heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
 
         if agent_settings.privacy_level not in {"strict", "balanced"}:
             raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
@@ -591,7 +703,70 @@ class Worker:
                 "cli_version": result.cli_version,
                 "model": agent_settings.claude_model,
                 "effort": agent_settings.claude_effort,
+                "memory_enabled": prompt_memory is not None,
+                "memory_messages": len(prompt_memory["messages"]) if prompt_memory else 0,
+                "memory_summary_updated": bool(
+                    persisted.conversation_thread_id is not None and safe_answer.memory_summary
+                ),
             }
+            if agent_settings.memory_enabled and persisted.conversation_thread_id is not None:
+                thread = await session.get(
+                    ConversationThread,
+                    persisted.conversation_thread_id,
+                )
+                if thread is None or thread.project_id != persisted.project_id:
+                    raise ServiceError(
+                        "conversation_scope_unavailable",
+                        "Interaction conversation is unavailable",
+                    )
+                await append_conversation_message(
+                    session,
+                    project_id=persisted.project_id,
+                    chat_id=thread.chat_id,
+                    user_id=thread.user_id,
+                    thread_id=thread.id,
+                    role="assistant",
+                    source="claude",
+                    content=safe_answer.answer_markdown,
+                    external_id=str(persisted.id),
+                )
+                if safe_answer.memory_summary:
+                    stored_memory = await upsert_conversation_memory(
+                        session,
+                        project_id=persisted.project_id,
+                        chat_id=thread.chat_id,
+                        user_id=thread.user_id,
+                        thread_id=thread.id,
+                        kind="summary",
+                        memory_key="current",
+                        content=safe_answer.memory_summary,
+                    )
+                    if stored_memory.privacy_findings:
+                        await append_audit(
+                            session,
+                            event_type="conversation.memory_redacted",
+                            correlation_id=persisted.correlation_id,
+                            actor_type="system",
+                            actor_id="memory-filter",
+                            project_id=persisted.project_id,
+                            subject_type="conversation_thread",
+                            subject_id=str(thread.id),
+                            payload={
+                                "findings": len(stored_memory.privacy_findings),
+                                "kinds": sorted(
+                                    {
+                                        str(finding.get("kind", "unknown"))
+                                        for finding in stored_memory.privacy_findings
+                                    }
+                                ),
+                                "locations": sorted(
+                                    {
+                                        str(finding.get("location", "memory"))
+                                        for finding in stored_memory.privacy_findings
+                                    }
+                                ),
+                            },
+                        )
             await enqueue_job(
                 session,
                 kind="telegram.publish_interaction",
@@ -630,10 +805,9 @@ class Worker:
         return {"interaction_id": str(interaction_id), "citations": len(accepted)}
 
     async def _draft_heartbeat(self, interaction: Interaction) -> None:
-        draft_id = new_draft_id()
         while True:
             try:
-                await self.telegram.send_knowledge_progress(interaction, draft_id)
+                await self.telegram.send_knowledge_progress(interaction)
             except Exception:
                 log.warning(
                     "telegram.draft_failed",
@@ -660,6 +834,7 @@ class Worker:
                 interaction.answer_markdown or "",
                 artifacts=interaction.artifacts,
                 attach_markdown=agent_settings.telegram_attach_markdown,
+                stream=agent_settings.telegram_streaming_enabled,
             )
         async with self.database.session() as session:
             persisted = await session.get(Interaction, interaction_id)

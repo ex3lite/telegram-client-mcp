@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { computed } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 
 import { api, queryString } from "../api";
 import PageState from "../components/PageState.vue";
@@ -182,6 +182,9 @@ function downloadArtifact(artifact: KnowledgeArtifact) {
             <dl class="detail-list detail-list--compact">
               <dt>Проект</dt><dd>{{ projectName(projects.data.value, selected.data.value.project_id) }}</dd>
               <dt>Commit</dt><dd><code>{{ selected.data.value.commit_sha ?? "Нет" }}</code></dd>
+              <template v-if="selected.data.value.conversation_thread_id">
+                <dt>Память</dt><dd><RouterLink :to="{ name: 'memory', query: { project: selected.data.value.project_id, selected: selected.data.value.conversation_thread_id } }">Открыть диалог →</RouterLink></dd>
+              </template>
               <dt>Correlation</dt><dd><code>{{ selected.data.value.correlation_id }}</code></dd>
               <dt>Provider</dt><dd><pre>{{ JSON.stringify(selected.data.value.provider_metadata, null, 2) }}</pre></dd>
             </dl>

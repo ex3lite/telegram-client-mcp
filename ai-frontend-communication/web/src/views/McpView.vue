@@ -19,7 +19,8 @@ const scopes = [
   { value: "telegram.ask_user", label: "Задавать вопросы", detail: "Отправлять уточнения сотрудникам в Telegram" },
   { value: "telegram.get_clarification", label: "Читать ответы", detail: "Проверять состояние и получать ответ" },
   { value: "telegram.cancel_clarification", label: "Отменять вопросы", detail: "Закрывать больше не актуальные запросы" },
-  { value: "telegram.send_message", label: "Отправлять сообщения", detail: "Писать в разрешённые чаты и прикладывать Markdown" }
+  { value: "telegram.send_message", label: "Отправлять сообщения", detail: "Писать в разрешённые чаты и прикладывать Markdown" },
+  { value: "memory.read", label: "Читать память", detail: "Получать очищенный контекст диалогов выбранного проекта" }
 ] as const;
 
 const queryClient = useQueryClient();
@@ -31,7 +32,11 @@ const copyError = ref("");
 const drafts = reactive<Record<string, AccountDraft>>({});
 const createForm = reactive<AccountDraft & { name: string }>({
   name: "",
-  tool_scopes: ["identity.resolve_user", "telegram.ask_user", "telegram.get_clarification"],
+  tool_scopes: [
+    "identity.resolve_user",
+    "telegram.ask_user",
+    "telegram.get_clarification"
+  ],
   project_ids: [],
   expires_at: ""
 });

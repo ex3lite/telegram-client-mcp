@@ -18,9 +18,10 @@ contract and trust boundaries live in [PROJECT_SPEC.md](PROJECT_SPEC.md).
 ## Operator control plane
 
 The panel at `/` is the working control plane, not only a health dashboard. Per project it controls
-the Claude model, effort, timeout, budget, base prompt, answer style, Telegram response modes and
-Markdown attachments. Claude credentials are encrypted at rest when entered through the panel and
-are never returned to the browser; an environment credential remains a supported fallback.
+the Claude model, effort, timeout, budget, base prompt, answer style, bounded conversation memory,
+Telegram response modes, native AI drafts and Markdown attachments. Claude OAuth can be completed
+from a guided panel flow; the resulting credential is encrypted at rest and is never returned to
+the browser. An environment credential remains a supported fallback.
 
 Privacy is enforced after model output and before every MCP-originated Telegram delivery. `strict`
 blocks suspected credentials before persistence or delivery, while `balanced` persists and sends
@@ -30,6 +31,20 @@ project deny globs configured in the panel.
 MCP service accounts are managed from the same panel with project and tool scopes, expiry,
 deactivation and one-time token rotation. Besides durable clarifications they can send idempotent
 informational messages and Markdown documents without receiving the Telegram bot token.
+The `memory_get_context` tool exposes only bounded, privacy-sanitized history for an explicitly
+scoped project member or chat.
+
+## Durable agent memory
+
+PostgreSQL stores isolated conversation threads, redacted messages, rolling summaries and durable
+facts. Private conversations are scoped by project and employee; group conversations additionally
+include the configured internal chat. Before each Claude run the worker injects a bounded summary
+and recent history as untrusted data, then persists the privacy-checked answer and updated summary.
+The panel's **Память** screen lets administrators inspect or delete a complete thread.
+
+Private Telegram chats use Bot API Rich Message drafts with a stable non-zero draft ID and a
+server-controlled Thinking block. Raw model deltas are never published before the privacy filter;
+the permanent Rich Message is sent only after the final answer has passed policy checks.
 
 ## Local quick start
 

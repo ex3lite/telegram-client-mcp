@@ -1,8 +1,12 @@
+from datetime import timedelta
+from uuid import uuid4
+
 import pytest
 from pydantic import ValidationError
 
-from dca.domain import KnowledgeAnswer, KnowledgeArtifact
+from dca.domain import AskUserInput, KnowledgeAnswer, KnowledgeArtifact, utcnow
 from dca.privacy import sanitize_text
+from dca.service import ServiceError, sanitize_clarification_request
 from dca.worker import sanitize_knowledge_answer
 
 
@@ -50,6 +54,30 @@ def test_balanced_redacts_without_retaining_secret_value() -> None:
     ]
     assert secret not in repr(result.findings)
     assert result.blocked is False
+
+
+def test_clarification_privacy_covers_nested_expected_answer() -> None:
+    secret = "Bearer abcdefghijklmnopqrstuvwxyz"  # noqa: S105
+    request = AskUserInput(
+        project_id=uuid4(),
+        agent_run_id="run-1",
+        correlation_id="corr-1",
+        idempotency_key="privacy-clarification-1",
+        recipient_user_id=uuid4(),
+        context="Safe context",
+        question="Can you check this?",
+        expected_answer={"example": {"authorization": secret}},
+        expires_at=utcnow() + timedelta(hours=1),
+    )
+
+    with pytest.raises(ServiceError) as blocked:
+        sanitize_clarification_request(request, level="strict")
+    assert blocked.value.code == "privacy_blocked"
+    assert secret not in str(blocked.value.metadata)
+
+    sanitized, findings = sanitize_clarification_request(request, level="balanced")
+    assert sanitized.expected_answer == {"example": {"authorization": "[REDACTED:bearer_token]"}}
+    assert findings[0]["location"] == "clarification.expected_answer.example.authorization"
 
 
 def test_strict_blocks_secret_in_markdown_artifact() -> None:

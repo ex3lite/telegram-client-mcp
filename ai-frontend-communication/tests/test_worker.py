@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -22,7 +23,13 @@ import dca.worker as worker_module
 from dca.claude import ClaudeError
 from dca.config import Settings
 from dca.db import AgentMessage, Interaction, Job, TelegramChat
-from dca.worker import TELEGRAM_EXTERNAL_ACTIONS, Worker, trusted_requester_profile
+from dca.memory import ConversationContext, ConversationContextMessage
+from dca.worker import (
+    TELEGRAM_EXTERNAL_ACTIONS,
+    Worker,
+    conversation_prompt_context,
+    trusted_requester_profile,
+)
 
 
 def test_telegram_mode_is_strict_and_webhook_compatible() -> None:
@@ -30,6 +37,26 @@ def test_telegram_mode_is_strict_and_webhook_compatible() -> None:
     assert Settings(telegram_mode="webhook").telegram_mode == "webhook"
     with pytest.raises(ValidationError):
         Settings(telegram_mode="updates")  # type: ignore[arg-type]
+
+
+def test_prompt_context_keeps_legitimate_latest_historical_user_message() -> None:
+    message = ConversationContextMessage(
+        role="user",
+        source="telegram",
+        content="Предыдущее решение",
+        author_user_id=uuid4(),
+        created_at=datetime.now(UTC),
+    )
+    context = ConversationContext(
+        thread_id=uuid4(),
+        summary=None,
+        facts=(),
+        messages=(message,),
+    )
+
+    payload = conversation_prompt_context(context)
+
+    assert payload["messages"][0]["content"] == "Предыдущее решение"
 
 
 @pytest.mark.asyncio
@@ -300,6 +327,8 @@ async def test_agent_message_delivery_revalidates_chat_and_records_message_id(mo
         ),
     )
     monkeypatch.setattr(worker_module, "append_audit", AsyncMock())
+    enqueue_job_mock = AsyncMock()
+    monkeypatch.setattr(worker_module, "enqueue_job", enqueue_job_mock)
 
     result = await worker._deliver_agent_message(message.id)
 
@@ -313,6 +342,9 @@ async def test_agent_message_delivery_revalidates_chat_and_records_message_id(mo
         attachment_name=None,
         attachment_markdown=None,
     )
+    enqueue_job_mock.assert_awaited_once()
+    assert enqueue_job_mock.await_args.kwargs["kind"] == "conversation.remember_agent_message"
+    assert enqueue_job_mock.await_args.kwargs["payload"] == {"agent_message_id": str(message.id)}
 
 
 @pytest.mark.asyncio

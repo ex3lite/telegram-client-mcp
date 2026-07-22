@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -19,11 +20,12 @@ from dca.db import Database
 from dca.telegram import (
     MAX_RICH_MESSAGE_CHARS,
     TelegramAdapter,
+    answer_draft_parts,
+    draft_id_for_interaction,
     extract_bot_mention,
     extract_project_prefix,
     ingest_telegram_update,
     markdown_documents,
-    new_draft_id,
     split_rich_answer,
 )
 
@@ -81,7 +83,12 @@ def test_explicit_markdown_artifacts_do_not_duplicate_long_answer() -> None:
 
 
 def test_draft_id_is_never_zero() -> None:
-    assert all(new_draft_id() > 0 for _ in range(100))
+    interaction_id = uuid4()
+    draft_id = draft_id_for_interaction(interaction_id)
+
+    assert draft_id == draft_id_for_interaction(interaction_id)
+    assert 0 < draft_id < 2_147_483_647
+    assert draft_id_for_interaction(type(interaction_id)(int=0)) == 1
 
 
 @pytest.mark.asyncio
@@ -100,44 +107,111 @@ async def test_adapter_uses_configured_outbound_proxy() -> None:
         await database.close()
 
 
+def test_final_answer_draft_parts_are_progressive_and_bounded() -> None:
+    answer = "x" * 8_000
+    parts = answer_draft_parts(answer)
+
+    assert 4 <= len(parts) <= 8
+    assert parts[-1] == answer[:4_096]
+    assert all(answer.startswith(part) for part in parts)
+    assert all(len(left) <= len(right) for left, right in pairwise(parts))
+    assert answer_draft_parts("ОК") == ["О", "ОК"]
+
+
 @pytest.mark.asyncio
-async def test_private_progress_uses_rich_draft_with_stable_id(
+async def test_controlled_thinking_heartbeat_uses_the_interaction_draft_id(
     adapter: TelegramAdapter,
 ) -> None:
     adapter.bot.send_rich_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
     interaction = SimpleNamespace(
+        id=uuid4(),
         source_ref={
             "delivery": {
                 "kind": "private_draft",
                 "chat_id": 42,
                 "message_thread_id": 7,
             }
-        }
+        },
     )
-    await adapter.send_knowledge_progress(interaction, draft_id=91)
-    await adapter.send_knowledge_progress(interaction, draft_id=91)
-    assert adapter.bot.send_rich_message_draft.await_count == 2
-    for call in adapter.bot.send_rich_message_draft.await_args_list:
-        assert call.kwargs["draft_id"] == 91
-        rich = call.kwargs["rich_message"]
-        assert rich.blocks is not None
-        assert rich.markdown is None
 
-
-@pytest.mark.asyncio
-async def test_private_progress_retries_as_plain_html(adapter: TelegramAdapter) -> None:
-    adapter.bot.send_rich_message_draft = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[bad_rich_message(), True]
-    )
-    interaction = SimpleNamespace(source_ref={"delivery": {"kind": "private_draft", "chat_id": 42}})
-
-    await adapter.send_knowledge_progress(interaction, draft_id=92)
+    await adapter.send_knowledge_progress(interaction)
+    await adapter.send_knowledge_progress(interaction)
 
     calls = adapter.bot.send_rich_message_draft.await_args_list
     assert len(calls) == 2
-    assert calls[0].kwargs["rich_message"].blocks is not None
-    assert calls[1].kwargs["rich_message"].html == "Проверяю код и подтверждаю ссылки"
-    assert calls[1].kwargs["draft_id"] == 92
+    assert {call.kwargs["draft_id"] for call in calls} == {draft_id_for_interaction(interaction.id)}
+    assert all(call.kwargs["rich_message"].blocks is not None for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_private_final_streams_safe_parts_with_one_stable_draft_id(
+    adapter: TelegramAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter.bot.send_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(chat=SimpleNamespace(id=42))
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(telegram_module.asyncio, "sleep", sleep)
+    interaction = SimpleNamespace(
+        id=uuid4(),
+        source_ref={
+            "delivery": {
+                "kind": "private_draft",
+                "chat_id": 42,
+                "message_thread_id": 7,
+            }
+        },
+    )
+    safe_answer = "Проверенный ответ. " * 100
+
+    await adapter.publish_knowledge_answer(interaction, safe_answer, stream=True)
+
+    calls = adapter.bot.send_message_draft.await_args_list
+    assert 4 <= len(calls) <= 8
+    draft_ids = {call.kwargs["draft_id"] for call in calls}
+    assert draft_ids == {draft_id_for_interaction(interaction.id)}
+    assert [call.kwargs["text"] for call in calls] == answer_draft_parts(safe_answer)
+    assert all(call.kwargs["chat_id"] == 42 for call in calls)
+    assert all(call.kwargs["message_thread_id"] == 7 for call in calls)
+    assert sleep.await_count == len(calls) - 1
+    adapter.bot.send_rich_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_draft_failure_does_not_block_permanent_rich_answer(
+    adapter: TelegramAdapter,
+) -> None:
+    adapter.bot.send_message_draft = AsyncMock(  # type: ignore[method-assign]
+        side_effect=bad_rich_message()
+    )
+    adapter.bot.send_rich_message = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(chat=SimpleNamespace(id=42))
+    )
+    interaction = SimpleNamespace(
+        id=uuid4(), source_ref={"delivery": {"kind": "private_draft", "chat_id": 42}}
+    )
+
+    await adapter.publish_knowledge_answer(interaction, "Безопасный финальный ответ", stream=True)
+
+    adapter.bot.send_message_draft.assert_awaited_once()
+    rich = adapter.bot.send_rich_message.await_args.kwargs["rich_message"]
+    assert rich.markdown == "Безопасный финальный ответ"
+
+
+@pytest.mark.asyncio
+async def test_group_final_never_uses_private_draft_stream(adapter: TelegramAdapter) -> None:
+    adapter.bot.send_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    adapter.bot.edit_message_text = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    interaction = SimpleNamespace(
+        source_ref={"delivery": {"kind": "group_message", "chat_id": -100, "message_id": 9}}
+    )
+
+    await adapter.publish_knowledge_answer(interaction, "Готово", stream=True)
+
+    adapter.bot.send_message_draft.assert_not_awaited()
+    adapter.bot.edit_message_text.assert_awaited_once()
 
 
 @pytest.mark.asyncio

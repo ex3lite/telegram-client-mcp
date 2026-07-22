@@ -151,6 +151,7 @@ class KnowledgeAnswer(BaseModel):
     citations: list[Citation] = Field(default_factory=list, max_length=100)
     uncertainty: list[str] = Field(default_factory=list, max_length=50)
     artifacts: list[KnowledgeArtifact] = Field(default_factory=list, max_length=8)
+    memory_summary: str | None = Field(default=None, max_length=16_000)
 
     @model_validator(mode="after")
     def artifact_names_are_unique(self) -> KnowledgeAnswer:

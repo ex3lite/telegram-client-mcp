@@ -16,18 +16,22 @@ The MVP is complete only when these four paths work end to end:
    the durable answer later.
 4. Every external action and state transition is reconstructable by `correlation_id` in the audit
    view.
+5. Telegram questions, MCP clarifications, and agent messages form project-scoped conversation
+   threads whose sanitized history survives restarts and is available to later Claude/MCP calls.
 
 ## Deliberate MVP decisions
 
 - One Python modular monolith, with API and worker processes built from the same image.
 - A PostgreSQL `jobs` table is both durable queue and transactional outbox. Workers claim work with
   `FOR UPDATE SKIP LOCKED`. Redis never owns a job.
-- No vector database or persistent knowledge index. `/ask` searches an exact Git commit on demand.
-- No Celery, Kafka, WebSocket, S3, provider framework, prompt editor, or generic event bus.
+- No vector database or persistent code index. `/ask` searches an exact Git commit on demand;
+  conversation memory is relational PostgreSQL data with strict size bounds.
+- No Celery, Kafka, WebSocket, S3, provider framework, or generic event bus.
 - Telegram is command/reply driven. The bot does not classify every group message with an LLM.
 - A timed-out Telegram send becomes `delivery_uncertain`; it is not blindly retried because the
   remote side may already have accepted it.
 - Human answers, repository files, and repository-local agent instructions are untrusted data.
+- Conversation summaries and old messages are also untrusted data, never system instructions.
 - Claude receives an extracted commit snapshot and only the Read, Glob, and Grep tools. Project
   hooks, project MCP servers, writes, sessions, and shell execution are disabled.
 - The initial admin surface is an operational queue: overview, clarifications, requests,

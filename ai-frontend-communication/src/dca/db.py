@@ -9,8 +9,10 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     LargeBinary,
@@ -81,10 +83,14 @@ class ProjectAgentSettings(Base, TimestampMixin):
     answer_style: Mapped[str] = mapped_column(String(16), nullable=False, default="normal")
     privacy_level: Mapped[str] = mapped_column(String(16), nullable=False, default="strict")
     denied_globs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    memory_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    memory_recent_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    memory_max_context_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=24_000)
     telegram_group_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="mentions")
     telegram_private_mode: Mapped[str] = mapped_column(
         String(24), nullable=False, default="all_messages"
     )
+    telegram_streaming_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     telegram_attach_markdown: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_by_admin_id: Mapped[UUID | None] = mapped_column(
@@ -196,6 +202,7 @@ class TelegramIdentity(Base, TimestampMixin):
 class TelegramChat(Base, TimestampMixin):
     __tablename__ = "telegram_chats"
     __table_args__ = (
+        UniqueConstraint("id", "project_id", name="uq_telegram_chat_id_project"),
         UniqueConstraint(
             "telegram_chat_id",
             "message_thread_id",
@@ -212,6 +219,144 @@ class TelegramChat(Base, TimestampMixin):
     message_thread_id: Mapped[int | None] = mapped_column(BigInteger)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class ConversationThread(Base, TimestampMixin):
+    __tablename__ = "conversation_threads"
+    __table_args__ = (
+        UniqueConstraint("id", "project_id", name="uq_conversation_thread_id_project"),
+        UniqueConstraint(
+            "project_id",
+            "chat_id",
+            "user_id",
+            name="uq_conversation_thread_scope",
+            postgresql_nulls_not_distinct=True,
+        ),
+        ForeignKeyConstraint(
+            ["chat_id", "project_id"],
+            ["telegram_chats.id", "telegram_chats.project_id"],
+            name="fk_conversation_thread_chat_project",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["project_id", "user_id"],
+            ["project_memberships.project_id", "project_memberships.user_id"],
+            name="fk_conversation_thread_member",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "chat_id IS NOT NULL OR user_id IS NOT NULL",
+            name="ck_conversation_thread_target",
+        ),
+        Index("ix_conversation_thread_project_recent", "project_id", "last_message_at"),
+    )
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    chat_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    user_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ConversationMessage(Base, TimestampMixin):
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "thread_id",
+            "source",
+            "external_id",
+            name="uq_conversation_message_source",
+        ),
+        ForeignKeyConstraint(
+            ["thread_id", "project_id"],
+            ["conversation_threads.id", "conversation_threads.project_id"],
+            name="fk_conversation_message_thread_project",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "role IN ('user', 'assistant', 'agent', 'tool')",
+            name="ck_conversation_message_role",
+        ),
+        CheckConstraint(
+            "source ~ '^[a-z][a-z0-9_.-]{1,31}$'",
+            name="ck_conversation_message_source",
+        ),
+        CheckConstraint(
+            "char_length(content) BETWEEN 1 AND 32000",
+            name="ck_conversation_message_content",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(privacy_findings) = 'array'",
+            name="ck_conversation_message_privacy",
+        ),
+        Index(
+            "ix_conversation_message_thread_recent",
+            "project_id",
+            "thread_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    thread_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(String(255))
+    author_user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    privacy_findings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+
+class ConversationMemory(Base, TimestampMixin):
+    __tablename__ = "conversation_memories"
+    __table_args__ = (
+        UniqueConstraint(
+            "thread_id",
+            "kind",
+            "memory_key",
+            name="uq_conversation_memory_key",
+        ),
+        ForeignKeyConstraint(
+            ["thread_id", "project_id"],
+            ["conversation_threads.id", "conversation_threads.project_id"],
+            name="fk_conversation_memory_thread_project",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "kind IN ('summary', 'fact')",
+            name="ck_conversation_memory_kind",
+        ),
+        CheckConstraint(
+            "memory_key ~ '^[a-z0-9][a-z0-9_.:-]{0,127}$'",
+            name="ck_conversation_memory_key",
+        ),
+        CheckConstraint(
+            "char_length(content) BETWEEN 1 AND 32000",
+            name="ck_conversation_memory_content",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(privacy_findings) = 'array'",
+            name="ck_conversation_memory_privacy",
+        ),
+        Index("ix_conversation_memory_thread_kind", "project_id", "thread_id", "kind"),
+    )
+
+    id: Mapped[UUID] = uuid_column(primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    thread_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    memory_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    privacy_findings: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
 
 
 class ServiceAccount(Base, TimestampMixin):
@@ -256,6 +401,14 @@ class TelegramUpdate(Base):
 
 class Interaction(Base, TimestampMixin):
     __tablename__ = "interactions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["conversation_thread_id", "project_id"],
+            ["conversation_threads.id", "conversation_threads.project_id"],
+            name="fk_interaction_conversation_project",
+            ondelete="SET NULL (conversation_thread_id)",
+        ),
+    )
 
     id: Mapped[UUID] = uuid_column(primary_key=True)
     project_id: Mapped[UUID] = mapped_column(
@@ -264,6 +417,7 @@ class Interaction(Base, TimestampMixin):
     repository_id: Mapped[UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("repositories.id", ondelete="SET NULL")
     )
+    conversation_thread_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     correlation_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     source_ref: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

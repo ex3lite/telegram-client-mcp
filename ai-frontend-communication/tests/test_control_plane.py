@@ -39,8 +39,12 @@ def valid_agent_settings() -> dict[str, object]:
         "answer_style": "normal",
         "privacy_level": "strict",
         "denied_globs": [".env", "**/*.pem"],
+        "memory_enabled": True,
+        "memory_recent_messages": 24,
+        "memory_max_context_chars": 24_000,
         "telegram_group_mode": "mentions",
         "telegram_private_mode": "all_messages",
+        "telegram_streaming_enabled": True,
         "telegram_attach_markdown": True,
     }
 
@@ -250,8 +254,12 @@ async def test_missing_agent_settings_use_secure_runtime_defaults() -> None:
     assert settings.project_id == project_id
     assert settings.version == 0
     assert settings.privacy_level == "strict"
+    assert settings.memory_enabled is True
+    assert settings.memory_recent_messages == 24
+    assert settings.memory_max_context_chars == 24_000
     assert settings.telegram_group_mode == "mentions"
     assert settings.telegram_private_mode == "all_messages"
+    assert settings.telegram_streaming_enabled is True
 
 
 def test_control_plane_inputs_reject_unsafe_values() -> None:
@@ -262,6 +270,10 @@ def test_control_plane_inputs_reject_unsafe_values() -> None:
         AgentSettingsInput.model_validate({**valid, "claude_timeout_seconds": 901})
     with pytest.raises(ValidationError):
         AgentSettingsInput.model_validate({**valid, "denied_globs": [".env", ".env"]})
+    with pytest.raises(ValidationError):
+        AgentSettingsInput.model_validate({**valid, "memory_recent_messages": 101})
+    with pytest.raises(ValidationError):
+        AgentSettingsInput.model_validate({**valid, "memory_max_context_chars": 2_999})
     with pytest.raises(ValidationError):
         AgentSettingsInput.model_validate(
             {**valid, "base_prompt": "Use OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456"}
@@ -449,11 +461,16 @@ async def test_control_plane_routes_are_registered(tmp_path: Path) -> None:
         assert set(paths["/api/v1/projects/{project_id}/agent-settings"]) == {"get", "put"}
         assert set(paths["/api/v1/integrations/claude"]) == {"get", "put", "delete"}
         assert set(paths["/api/v1/integrations/claude/check"]) == {"post"}
+        assert set(paths["/api/v1/integrations/claude/oauth/start"]) == {"post"}
+        assert set(paths["/api/v1/integrations/claude/oauth/complete"]) == {"post"}
+        assert set(paths["/api/v1/integrations/claude/oauth/{session_id}"]) == {"delete"}
         assert set(paths["/api/v1/mcp/accounts"]) == {"get", "post"}
         assert set(paths["/api/v1/mcp/accounts/{account_id}"]) == {"patch"}
         assert set(paths["/api/v1/mcp/accounts/{account_id}/rotate-token"]) == {"post"}
         assert set(paths["/api/v1/interactions"]) == {"get"}
         assert set(paths["/api/v1/interactions/{interaction_id}"]) == {"get"}
+        assert set(paths["/api/v1/conversations"]) == {"get"}
+        assert set(paths["/api/v1/conversations/{thread_id}"]) == {"get", "delete"}
     finally:
         await app.state.telegram.close()
         await app.state.redis.aclose()

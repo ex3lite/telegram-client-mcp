@@ -27,6 +27,7 @@ const router = createRouter({
     { path: "/overview", name: "overview", component: () => import("./views/OverviewView.vue") },
     { path: "/runs", name: "runs", component: () => import("./views/RunsView.vue") },
     { path: "/agent", name: "agent", component: () => import("./views/AgentView.vue") },
+    { path: "/memory", name: "memory", component: () => import("./views/MemoryView.vue") },
     { path: "/mcp", name: "mcp", component: () => import("./views/McpView.vue") },
     {
       path: "/repositories",

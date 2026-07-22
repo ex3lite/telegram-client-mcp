@@ -38,7 +38,7 @@ from dca.domain import (
     ensure_transition,
     utcnow,
 )
-from dca.privacy import PrivacyLevel, sanitize_text
+from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
 
 SYSTEM_SECRET_CLAUDE_OAUTH = "claude_oauth_token"  # noqa: S105 - database key, not a secret
 _MARKDOWN_ATTACHMENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.md")
@@ -137,8 +137,12 @@ async def load_project_agent_settings(
         answer_style="normal",
         privacy_level="strict",
         denied_globs=[],
+        memory_enabled=True,
+        memory_recent_messages=24,
+        memory_max_context_chars=24_000,
         telegram_group_mode="mentions",
         telegram_private_mode="all_messages",
+        telegram_streaming_enabled=True,
         telegram_attach_markdown=True,
         version=0,
         updated_by_admin_id=None,
@@ -442,6 +446,96 @@ def ensure_same_agent_message(
         )
 
 
+def sanitize_clarification_request(
+    request: AskUserInput,
+    *,
+    level: PrivacyLevel,
+) -> tuple[AskUserInput, list[PrivacyFinding]]:
+    context = sanitize_text(
+        request.context,
+        level=level,
+        location="clarification.context",
+    )
+    question = sanitize_text(
+        request.question,
+        level=level,
+        location="clarification.question",
+    )
+    expected_answer, expected_findings, expected_blocked = _sanitize_json_strings(
+        request.expected_answer,
+        level=level,
+        location="clarification.expected_answer",
+    )
+    findings = [*context.findings, *question.findings, *expected_findings]
+    if context.blocked or question.blocked or expected_blocked:
+        raise ServiceError(
+            "privacy_blocked",
+            "Clarification contains credential material and was not persisted or delivered",
+            metadata={
+                "privacy_findings_count": len(findings),
+                "privacy_findings": [
+                    {"kind": finding["kind"], "location": finding["location"]}
+                    for finding in findings
+                ],
+            },
+        )
+    return (
+        request.model_copy(
+            update={
+                "context": context.text,
+                "question": question.text,
+                "expected_answer": expected_answer,
+            }
+        ),
+        findings,
+    )
+
+
+def _sanitize_json_strings(
+    value: Any,
+    *,
+    level: PrivacyLevel,
+    location: str,
+    depth: int = 0,
+) -> tuple[Any, list[PrivacyFinding], bool]:
+    if depth > 20:
+        raise ServiceError("invalid_request", "Expected-answer schema is nested too deeply")
+    if isinstance(value, str):
+        result = sanitize_text(value, level=level, location=location)
+        return result.text, result.findings, result.blocked
+    if isinstance(value, list):
+        sanitized: list[Any] = []
+        findings: list[PrivacyFinding] = []
+        blocked = False
+        for index, item in enumerate(value):
+            safe, item_findings, item_blocked = _sanitize_json_strings(
+                item,
+                level=level,
+                location=f"{location}[{index}]",
+                depth=depth + 1,
+            )
+            sanitized.append(safe)
+            findings.extend(item_findings)
+            blocked = blocked or item_blocked
+        return sanitized, findings, blocked
+    if isinstance(value, dict):
+        sanitized_dict: dict[str, Any] = {}
+        findings = []
+        blocked = False
+        for key, item in value.items():
+            safe, item_findings, item_blocked = _sanitize_json_strings(
+                item,
+                level=level,
+                location=f"{location}.{key}",
+                depth=depth + 1,
+            )
+            sanitized_dict[str(key)] = safe
+            findings.extend(item_findings)
+            blocked = blocked or item_blocked
+        return sanitized_dict, findings, blocked
+    return value, [], False
+
+
 async def create_clarification(
     session: AsyncSession,
     *,
@@ -453,6 +547,13 @@ async def create_clarification(
         service_account_id=service_account_id,
         project_id=request.project_id,
         tool="telegram.ask_user",
+    )
+    project_settings = await load_project_agent_settings(session, request.project_id)
+    if project_settings.privacy_level not in {"strict", "balanced"}:
+        raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
+    request, privacy_findings = sanitize_clarification_request(
+        request,
+        level=cast(PrivacyLevel, project_settings.privacy_level),
     )
     now = utcnow()
     if request.expires_at <= now:
@@ -541,7 +642,11 @@ async def create_clarification(
         project_id=request.project_id,
         subject_type="clarification",
         subject_id=str(clarification.id),
-        payload={"recipient_user_id": str(request.recipient_user_id)},
+        payload={
+            "recipient_user_id": str(request.recipient_user_id),
+            "privacy_findings": len(privacy_findings),
+            "privacy_kinds": sorted({finding["kind"] for finding in privacy_findings}),
+        },
     )
     return clarification, True
 
@@ -680,6 +785,29 @@ async def answer_clarification_from_telegram(
     )
     if clarification is None:
         raise ServiceError("request_not_found", "No clarification is bound to this reply")
+    project_settings = await load_project_agent_settings(session, clarification.project_id)
+    if project_settings.privacy_level not in {"strict", "balanced"}:
+        raise ServiceError("privacy_policy_invalid", "Project privacy policy is invalid")
+    answer_result = sanitize_text(
+        answer[:16_000],
+        level=cast(PrivacyLevel, project_settings.privacy_level),
+        location="clarification.answer",
+    )
+    if answer_result.blocked:
+        raise ServiceError(
+            "privacy_blocked",
+            "Ответ содержит секрет или учётные данные и не был сохранён.",
+            metadata={
+                "project_id": str(clarification.project_id),
+                "clarification_id": str(clarification.id),
+                "correlation_id": clarification.correlation_id,
+                "privacy_findings_count": len(answer_result.findings),
+                "privacy_findings": [
+                    {"kind": finding["kind"], "location": finding["location"]}
+                    for finding in answer_result.findings
+                ],
+            },
+        )
     if clarification.expires_at <= now:
         await expire_clarification(session, clarification)
         raise ServiceError("request_expired", "This clarification has expired")
@@ -692,7 +820,7 @@ async def answer_clarification_from_telegram(
         )
         .values(
             status=ClarificationStatus.ANSWERED.value,
-            answer_raw=answer[:16_000],
+            answer_raw=answer_result.text,
             answered_at=now,
             updated_at=now,
         )
@@ -709,7 +837,11 @@ async def answer_clarification_from_telegram(
         project_id=clarification.project_id,
         subject_type="clarification",
         subject_id=str(clarification.id),
-        payload={"answer_length": len(answer)},
+        payload={
+            "answer_length": len(answer_result.text),
+            "privacy_findings": len(answer_result.findings),
+            "privacy_kinds": sorted({finding["kind"] for finding in answer_result.findings}),
+        },
     )
     await session.refresh(clarification)
     return clarification

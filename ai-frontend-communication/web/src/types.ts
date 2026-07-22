@@ -105,8 +105,12 @@ export interface AgentSettings {
   answer_style: AnswerStyle;
   privacy_level: PrivacyLevel;
   denied_globs: string[];
+  memory_enabled: boolean;
+  memory_recent_messages: number;
+  memory_max_context_chars: number;
   telegram_group_mode: TelegramGroupMode;
   telegram_private_mode: TelegramPrivateMode;
+  telegram_streaming_enabled: boolean;
   telegram_attach_markdown: boolean;
   version: number;
   updated_by_admin_id: string | null;
@@ -123,6 +127,12 @@ export interface ClaudeIntegration {
 export interface ClaudeCheck {
   ok: boolean;
   version: string | null;
+}
+
+export interface ClaudeOAuthStart {
+  session_id: string;
+  authorization_url: string;
+  expires_at: string;
 }
 
 export interface McpAccount {
@@ -173,6 +183,7 @@ export interface Interaction {
   id: string;
   project_id: string;
   repository_id: string | null;
+  conversation_thread_id: string | null;
   correlation_id: string;
   source: string;
   question: string;
@@ -194,6 +205,7 @@ export interface InteractionSummary {
   id: string;
   project_id: string;
   repository_id: string | null;
+  conversation_thread_id: string | null;
   source: string;
   question: string;
   question_truncated: boolean;
@@ -205,4 +217,39 @@ export interface InteractionSummary {
   privacy_findings_count: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  project_id: string;
+  chat_id: string | null;
+  user_id: string | null;
+  user_display_name: string | null;
+  message_count: number;
+  memory_count: number;
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationMessage {
+  id: string;
+  role: string;
+  source: string;
+  content: string;
+  author_user_id: string | null;
+  created_at: string;
+}
+
+export interface ConversationMemory {
+  id: string;
+  kind: string;
+  memory_key: string;
+  content: string;
+  updated_at: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: ConversationMessage[];
+  memories: ConversationMemory[];
 }

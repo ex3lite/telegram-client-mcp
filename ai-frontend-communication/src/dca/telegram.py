@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import logging
 import re
-import secrets
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
@@ -52,6 +53,8 @@ from dca.domain import (
     RepositoryStatus,
     utcnow,
 )
+from dca.memory import append_conversation_message, get_or_create_conversation_thread
+from dca.privacy import sanitize_text
 from dca.service import (
     ServiceError,
     answer_clarification_from_telegram,
@@ -64,13 +67,17 @@ from dca.service import (
 
 MAX_RICH_MESSAGE_CHARS = 32_768
 MAX_EPHEMERAL_CHARS = 4_096
+DRAFT_STEP_DELAY_SECONDS = 0.12
+KNOWLEDGE_PROGRESS_TEXT = "Проверяю код и подтверждаю ссылки"
 PROJECT_PREFIX_RE = re.compile(r"^project:([a-z0-9][a-z0-9-]{0,79})\s+", re.IGNORECASE)
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class MessageContext:
     project: Project
     user_id: UUID
+    chat_id: UUID | None
     requester_profile: dict[str, str | None]
 
 
@@ -285,29 +292,25 @@ class TelegramAdapter:
         )
         return sent.message_id
 
-    async def send_knowledge_progress(self, interaction: Interaction, draft_id: int) -> None:
+    async def send_knowledge_progress(self, interaction: Interaction) -> None:
         delivery = interaction.source_ref.get("delivery", {})
-        kind = delivery.get("kind")
-        if kind != "private_draft":
+        if delivery.get("kind") != "private_draft":
             return
         kwargs = {
             "chat_id": int(delivery["chat_id"]),
             "message_thread_id": delivery.get("message_thread_id"),
-            "draft_id": draft_id,
+            "draft_id": draft_id_for_interaction(interaction.id),
         }
         try:
             await self.bot.send_rich_message_draft(
                 **kwargs,
                 rich_message=InputRichMessage(
-                    blocks=[InputRichBlockThinking(text="Проверяю код и подтверждаю ссылки")],
+                    blocks=[InputRichBlockThinking(text=KNOWLEDGE_PROGRESS_TEXT)],
                     skip_entity_detection=True,
                 ),
             )
         except TelegramBadRequest:
-            await self.bot.send_rich_message_draft(
-                **kwargs,
-                rich_message=plain_rich_message("Проверяю код и подтверждаю ссылки"),
-            )
+            await self.bot.send_message_draft(**kwargs, text=KNOWLEDGE_PROGRESS_TEXT)
 
     async def publish_knowledge_answer(
         self,
@@ -316,6 +319,7 @@ class TelegramAdapter:
         *,
         artifacts: list[dict[str, Any]] | None = None,
         attach_markdown: bool = True,
+        stream: bool = False,
     ) -> None:
         delivery = interaction.source_ref.get("delivery", {})
         kind = delivery.get("kind")
@@ -326,6 +330,11 @@ class TelegramAdapter:
         documents = markdown_documents(artifacts or [], attachment=attachment)
         rich = InputRichMessage(markdown=short_answer, skip_entity_detection=True)
         if kind == "private_draft":
+            if stream:
+                try:
+                    await self._stream_knowledge_answer(interaction.id, delivery, short_answer)
+                except Exception:
+                    log.warning("telegram draft stream failed", exc_info=True)
             kwargs = {
                 "chat_id": int(delivery["chat_id"]),
                 "message_thread_id": delivery.get("message_thread_id"),
@@ -377,6 +386,26 @@ class TelegramAdapter:
                     message_thread_id=delivery.get("message_thread_id"),
                     documents=documents,
                 )
+
+    async def _stream_knowledge_answer(
+        self,
+        interaction_id: UUID,
+        delivery: dict[str, Any],
+        answer: str,
+    ) -> None:
+        draft_id = draft_id_for_interaction(interaction_id)
+        parts = answer_draft_parts(answer)
+        for index, part in enumerate(parts):
+            sent = await self.bot.send_message_draft(
+                chat_id=int(delivery["chat_id"]),
+                message_thread_id=delivery.get("message_thread_id"),
+                draft_id=draft_id,
+                text=part,
+            )
+            if not sent:
+                return
+            if index + 1 < len(parts):
+                await asyncio.sleep(DRAFT_STEP_DELAY_SECONDS)
 
     async def _send_markdown_documents(
         self,
@@ -600,15 +629,59 @@ class TelegramAdapter:
                 return
             try:
                 async with self.database.session() as session:
-                    await answer_clarification_from_telegram(
+                    clarification = await answer_clarification_from_telegram(
                         session,
                         telegram_user_id=message.from_user.id,
                         telegram_chat_id=message.chat.id,
                         reply_to_message_id=message.reply_to_message.message_id,
                         answer=message.text or "",
                     )
+                    agent_settings = await load_project_agent_settings(
+                        session,
+                        clarification.project_id,
+                    )
+                    if agent_settings.memory_enabled:
+                        thread = await get_or_create_conversation_thread(
+                            session,
+                            project_id=clarification.project_id,
+                            chat_id=None,
+                            user_id=clarification.recipient_user_id,
+                        )
+                        await append_conversation_message(
+                            session,
+                            project_id=clarification.project_id,
+                            chat_id=None,
+                            user_id=clarification.recipient_user_id,
+                            thread_id=thread.id,
+                            role="user",
+                            source="telegram",
+                            content=clarification.answer_raw or "",
+                            external_id=f"clarification:{clarification.id}:answer",
+                            author_user_id=clarification.recipient_user_id,
+                        )
                 await message.answer("Ответ сохранён и доступен инициировавшему AI-агенту.")
             except ServiceError as exc:
+                if exc.code == "privacy_blocked" and isinstance(
+                    exc.metadata.get("project_id"), str
+                ):
+                    async with self.database.session() as session:
+                        await append_audit(
+                            session,
+                            event_type="clarification.answer_privacy_blocked",
+                            correlation_id=str(exc.metadata.get("correlation_id") or "unknown"),
+                            actor_type="user",
+                            actor_id=str(message.from_user.id),
+                            project_id=UUID(str(exc.metadata["project_id"])),
+                            subject_type="clarification",
+                            subject_id=str(exc.metadata.get("clarification_id") or "unknown"),
+                            outcome="blocked",
+                            payload={
+                                "privacy_findings_count": exc.metadata.get(
+                                    "privacy_findings_count", 0
+                                ),
+                                "privacy_findings": exc.metadata.get("privacy_findings", []),
+                            },
+                        )
                 if exc.code != "request_not_found":
                     await message.answer(exc.message)
 
@@ -850,7 +923,12 @@ def extract_bot_mention(value: str, username: str) -> str | None:
     return remainder.strip()
 
 
-async def _message_context(session: Any, project: Project, user_id: UUID) -> MessageContext:
+async def _message_context(
+    session: Any,
+    project: Project,
+    user_id: UUID,
+    message: Message,
+) -> MessageContext:
     row = (
         await session.execute(
             select(User, ProjectMembership)
@@ -864,9 +942,23 @@ async def _message_context(session: Any, project: Project, user_id: UUID) -> Mes
     if row is None:
         raise ServiceError("project_scope_violation", "Project membership is unavailable")
     user, membership = row
+    chat_id = await session.scalar(
+        select(TelegramChat.id)
+        .where(
+            TelegramChat.project_id == project.id,
+            TelegramChat.telegram_chat_id == message.chat.id,
+            TelegramChat.enabled.is_(True),
+            (
+                (TelegramChat.message_thread_id == message.message_thread_id)
+                | (TelegramChat.message_thread_id.is_(None))
+            ),
+        )
+        .order_by(TelegramChat.message_thread_id.desc().nullslast())
+    )
     return MessageContext(
         project=project,
         user_id=user_id,
+        chat_id=chat_id,
         requester_profile=project_member_profile(user, membership),
     )
 
@@ -904,7 +996,7 @@ async def resolve_context(
         )
         if project is None:
             raise ServiceError("project_scope_violation", "Project is unavailable to this user")
-        return await _message_context(session, project, identity.user_id)
+        return await _message_context(session, project, identity.user_id, message)
 
     project = await session.scalar(
         select(Project)
@@ -926,7 +1018,7 @@ async def resolve_context(
         .order_by(TelegramChat.message_thread_id.desc().nullslast())
     )
     if project is not None:
-        return await _message_context(session, project, identity.user_id)
+        return await _message_context(session, project, identity.user_id, message)
 
     projects = list(
         await session.scalars(
@@ -940,7 +1032,7 @@ async def resolve_context(
         )
     )
     if len(projects) == 1:
-        return await _message_context(session, projects[0], identity.user_id)
+        return await _message_context(session, projects[0], identity.user_id, message)
     raise ServiceError(
         "project_required",
         "Укажите проект в начале команды: project:slug",
@@ -966,13 +1058,46 @@ async def queue_interaction(
     )
     if repository is None or repository.current_commit is None:
         raise ServiceError("source_unavailable", "У проекта нет готового Git snapshot")
+    agent_settings = await load_project_agent_settings(session, context.project.id)
+    question_result = sanitize_text(
+        question[:8_000],
+        level="balanced",
+        location="interaction.question",
+    )
+    safe_question = question_result.text[:8_000]
+    conversation_thread_id: UUID | None = None
+    if agent_settings.memory_enabled:
+        thread = await get_or_create_conversation_thread(
+            session,
+            project_id=context.project.id,
+            chat_id=context.chat_id,
+            user_id=context.user_id,
+        )
+        await append_conversation_message(
+            session,
+            project_id=context.project.id,
+            chat_id=context.chat_id,
+            user_id=context.user_id,
+            thread_id=thread.id,
+            role="user",
+            source="telegram",
+            content=safe_question,
+            external_id=correlation_id,
+            author_user_id=context.user_id,
+        )
+        conversation_thread_id = thread.id
     interaction = Interaction(
         project_id=context.project.id,
         repository_id=repository.id,
+        conversation_thread_id=conversation_thread_id,
         correlation_id=correlation_id,
         source="telegram",
-        source_ref={**source_ref, "requester_profile": context.requester_profile},
-        question=question[:8_000],
+        source_ref={
+            **source_ref,
+            "requester_profile": context.requester_profile,
+            "question_privacy_findings": [dict(finding) for finding in question_result.findings],
+        },
+        question=safe_question,
         commit_sha=repository.current_commit,
     )
     session.add(interaction)
@@ -993,7 +1118,14 @@ async def queue_interaction(
         project_id=context.project.id,
         subject_type="interaction",
         subject_id=str(interaction.id),
-        payload={"repository_id": str(repository.id), "commit": repository.current_commit},
+        payload={
+            "repository_id": str(repository.id),
+            "commit": repository.current_commit,
+            "input_privacy_findings": len(question_result.findings),
+            "input_privacy_kinds": sorted(
+                {finding["kind"] for finding in question_result.findings}
+            ),
+        },
     )
     return interaction
 
@@ -1030,5 +1162,13 @@ def plain_rich_message(text: str) -> InputRichMessage:
     return InputRichMessage(html=html.escape(text), skip_entity_detection=True)
 
 
-def new_draft_id() -> int:
-    return secrets.randbelow(2_147_483_646) + 1
+def draft_id_for_interaction(interaction_id: UUID) -> int:
+    return interaction_id.int % 2_147_483_647 or 1
+
+
+def answer_draft_parts(answer: str) -> list[str]:
+    preview = answer[:MAX_EPHEMERAL_CHARS]
+    if not preview:
+        return []
+    steps = min(len(preview), 8, max(4, (len(preview) + 511) // 512))
+    return [preview[: (len(preview) * step + steps - 1) // steps] for step in range(1, steps + 1)]

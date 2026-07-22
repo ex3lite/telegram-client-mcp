@@ -31,8 +31,9 @@ const navigation = [
   { name: "overview", label: "Центр", index: "01" },
   { name: "runs", label: "Запуски", index: "02" },
   { name: "agent", label: "Агент", index: "03" },
-  { name: "mcp", label: "MCP", index: "04" },
-  { name: "repositories", label: "Репозитории", index: "05" }
+  { name: "memory", label: "Память", index: "04" },
+  { name: "mcp", label: "MCP", index: "05" },
+  { name: "repositories", label: "Репозитории", index: "06" }
 ] as const;
 
 const workNavigation = [

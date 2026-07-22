@@ -36,6 +36,7 @@ async def test_mcp_tool_contracts_are_stable() -> None:
         "telegram_get_clarification",
         "telegram_cancel_clarification",
         "telegram_send_message",
+        "memory_get_context",
     }
     assert tools["identity_resolve_user"].inputSchema["required"] == ["project_id", "query"]
     ask_schema = tools["telegram_ask_user"].inputSchema
@@ -49,6 +50,11 @@ async def test_mcp_tool_contracts_are_stable() -> None:
     send_request = send_schema["$defs"]["TelegramSendMessageInput"]
     assert send_request["properties"]["project_id"]["format"] == "uuid"
     assert send_request["properties"]["text_markdown"]["maxLength"] == 4096
+    memory_schema = tools["memory_get_context"].inputSchema
+    assert memory_schema["required"] == ["request"]
+    memory_request = memory_schema["$defs"]["MemoryContextInput"]
+    assert memory_request["properties"]["project_id"]["format"] == "uuid"
+    assert memory_request["properties"]["message_limit"]["maximum"] == 100
     transport_security = server.settings.transport_security
     assert transport_security is not None
     assert transport_security.allowed_hosts == ["agent.example.com"]
