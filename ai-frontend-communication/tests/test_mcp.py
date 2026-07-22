@@ -57,7 +57,8 @@ async def test_mcp_tool_contracts_are_stable() -> None:
     assert memory_schema["required"] == ["request"]
     memory_request = memory_schema["$defs"]["MemoryContextInput"]
     assert memory_request["properties"]["project_id"]["format"] == "uuid"
-    assert memory_request["properties"]["message_limit"]["maximum"] == 100
+    assert memory_request["properties"]["message_limit"]["maximum"] == 500
+    assert memory_request["properties"]["max_context_chars"]["maximum"] == 1_000_000
     transport_security = server.settings.transport_security
     assert transport_security is not None
     assert transport_security.allowed_hosts == ["agent.example.com"]

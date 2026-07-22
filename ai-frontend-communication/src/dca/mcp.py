@@ -129,8 +129,8 @@ class MemoryContextInput(BaseModel):
         default=None,
         description="Internal telegram_chats UUID, never a raw Telegram chat ID.",
     )
-    message_limit: int = Field(default=24, ge=1, le=100)
-    max_context_chars: int = Field(default=24_000, ge=3_000, le=100_000)
+    message_limit: int = Field(default=200, ge=1, le=500)
+    max_context_chars: int = Field(default=500_000, ge=3_000, le=1_000_000)
 
     @model_validator(mode="after")
     def validate_target(self) -> MemoryContextInput:

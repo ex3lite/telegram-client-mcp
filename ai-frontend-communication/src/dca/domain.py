@@ -221,7 +221,7 @@ def has_explicit_backend_request_intent(question: str) -> bool:
 
 class KnowledgeAnswer(BaseModel):
     answer_scope: Literal["project", "general"] = "project"
-    answer_markdown: str = Field(min_length=1, max_length=200_000)
+    answer_markdown: str = Field(min_length=1, max_length=500_000)
     citations: list[Citation] = Field(default_factory=list, max_length=100)
     uncertainty: list[str] = Field(default_factory=list, max_length=50)
     artifacts: list[KnowledgeArtifact] = Field(default_factory=list, max_length=8)

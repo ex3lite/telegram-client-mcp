@@ -38,6 +38,29 @@ def test_every_alembic_revision_has_transaction_free_sql_pair() -> None:
         assert re.search(r"(?im)^\s*(begin|commit)\s*;\s*$", sql) is None
 
 
+def test_timestamped_revision_chain_is_strictly_increasing() -> None:
+    root = Path(__file__).parents[1] / "migrations" / "versions"
+    revisions: dict[str, str | None] = {}
+    for path in root.glob("[!_]*.py"):
+        source = path.read_text()
+        revision = re.search(r'^revision: str = "([^"]+)"$', source, re.MULTILINE)
+        down = re.search(
+            r'^down_revision: str \| Sequence\[str\] \| None = (?:"([^"]+)"|None)$',
+            source,
+            re.MULTILINE,
+        )
+        assert revision is not None and down is not None
+        revisions[revision.group(1)] = down.group(1)
+
+    for revision, parent in revisions.items():
+        if revision in LEGACY_REVISIONS or parent is None or parent in LEGACY_REVISIONS:
+            continue
+        current_timestamp = TIMESTAMPED_REVISION.fullmatch(revision)
+        parent_timestamp = TIMESTAMPED_REVISION.fullmatch(parent)
+        assert current_timestamp is not None and parent_timestamp is not None
+        assert parent_timestamp.group("timestamp") < current_timestamp.group("timestamp")
+
+
 def test_claude_context_migration_defines_policy_and_session_state() -> None:
     root = Path(__file__).parents[1] / "migrations" / "sql"
     up = (root / "20260722_163207_02_context.up.sql").read_text()

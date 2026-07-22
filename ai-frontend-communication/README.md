@@ -49,10 +49,13 @@ compaction boundaries and context receipts are persisted for audit. The panel's 
 lets administrators inspect a thread or delete both its database history and native transcript.
 
 Private Telegram chats use Bot API Rich Message drafts with a stable non-zero draft ID and a
-native Thinking block. Streaming deltas are privacy-redacted before each ephemeral draft; the
-permanent Rich Message is sent only after context attestation, citation validation, live policy
+native Thinking block. A heartbeat keeps Telegram's 30-second preview alive while Claude thinks;
+the first answer delta is promoted to one permanent Rich Message that is edited in place, so a live
+answer cannot disappear when the draft expires. Streaming deltas are privacy-redacted before each
+delivery; final publication still requires context attestation, citation validation, live policy
 revalidation and the final privacy check. Ordinary long answers are sent losslessly in multiple
-Rich Messages; a Markdown document is attached only after an explicit document request.
+Rich Messages; a Markdown document is attached only after an explicit document request and the
+server rejects any promised-but-missing artifact.
 
 ## Local quick start
 

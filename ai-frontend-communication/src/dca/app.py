@@ -246,15 +246,15 @@ class AgentSettingsInput(BaseModel):
     enabled: bool
     claude_model: str | None = Field(default=None, max_length=120)
     claude_effort: Literal["low", "medium", "high", "xhigh", "max"]
-    claude_timeout_seconds: int = Field(ge=10, le=900)
+    claude_timeout_seconds: int = Field(ge=10, le=3_600)
     max_budget_cents: int | None = Field(default=None, gt=0)
     base_prompt: str = Field(max_length=20_000)
     answer_style: Literal["brief", "normal", "detailed"]
     privacy_level: Literal["strict", "balanced"]
     denied_globs: list[str] = Field(max_length=200)
     memory_enabled: bool
-    memory_recent_messages: int = Field(ge=4, le=100)
-    memory_max_context_chars: int = Field(ge=3_000, le=100_000)
+    memory_recent_messages: int = Field(ge=4, le=500)
+    memory_max_context_chars: int = Field(ge=3_000, le=1_000_000)
     telegram_group_mode: Literal["commands_only", "mentions", "all_messages"]
     telegram_private_mode: Literal["commands_only", "all_messages"]
     telegram_streaming_enabled: bool
@@ -1933,15 +1933,15 @@ def serialize_agent_settings(
             "enabled": True,
             "claude_model": None,
             "claude_effort": "medium",
-            "claude_timeout_seconds": 180,
+            "claude_timeout_seconds": 1_200,
             "max_budget_cents": None,
             "base_prompt": "",
             "answer_style": "normal",
             "privacy_level": "strict",
             "denied_globs": [],
             "memory_enabled": True,
-            "memory_recent_messages": 24,
-            "memory_max_context_chars": 24_000,
+            "memory_recent_messages": 200,
+            "memory_max_context_chars": 500_000,
             "telegram_group_mode": "mentions",
             "telegram_private_mode": "all_messages",
             "telegram_streaming_enabled": True,

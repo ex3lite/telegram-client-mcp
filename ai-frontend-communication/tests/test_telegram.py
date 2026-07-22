@@ -122,6 +122,7 @@ def test_bot_call_accepts_username_name_and_alias_only_at_the_start() -> None:
         "Создай документацию по интеграции",
         "Подготовь README.md с примером запуска",
         "Документацию по API оформи отдельным файлом",
+        "Как мне аватарки прикрутить. Дай файл",
         "Create a runbook for this deployment",
     ],
 )
@@ -230,10 +231,12 @@ async def test_controlled_thinking_heartbeat_uses_the_interaction_draft_id(
 
 
 @pytest.mark.asyncio
-async def test_private_stream_uses_thinking_block_and_one_stable_draft_id(
+async def test_private_stream_promotes_thinking_draft_to_persistent_answer(
     adapter: TelegramAdapter,
 ) -> None:
     adapter.bot.send_rich_message_draft = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    sent = SimpleNamespace(chat=SimpleNamespace(id=42), message_id=91)
+    adapter.bot.send_rich_message = AsyncMock(return_value=sent)  # type: ignore[method-assign]
     interaction = SimpleNamespace(
         id=uuid4(),
         source_ref={
@@ -250,14 +253,14 @@ async def test_private_stream_uses_thinking_block_and_one_stable_draft_id(
         answer_markdown="",
         thinking="Проверяю реализацию",
     )
-    await adapter.send_knowledge_stream(
+    promoted = await adapter.send_knowledge_stream(
         interaction,
         answer_markdown="**Проверенный ответ**",
         thinking="Проверяю реализацию",
     )
 
     calls = adapter.bot.send_rich_message_draft.await_args_list
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert {call.kwargs["draft_id"] for call in calls} == {draft_id_for_interaction(interaction.id)}
     assert all(call.kwargs["chat_id"] == 42 for call in calls)
     assert all(call.kwargs["message_thread_id"] == 7 for call in calls)
@@ -265,10 +268,15 @@ async def test_private_stream_uses_thinking_block_and_one_stable_draft_id(
     assert first_rich.blocks is not None
     assert isinstance(first_rich.blocks[0], InputRichBlockThinking)
     assert first_rich.blocks[0].text == "Проверяю реализацию"
-    second_markdown = calls[1].kwargs["rich_message"].markdown
-    assert second_markdown is not None
-    assert "<tg-thinking>Проверяю реализацию</tg-thinking>" in second_markdown
-    assert "**Проверенный ответ**" in second_markdown
+    persistent = adapter.bot.send_rich_message.await_args.kwargs["rich_message"]
+    assert persistent.markdown == "**Проверенный ответ**"
+    assert "Проверяю реализацию" not in (persistent.markdown or "")
+    assert promoted == {
+        "kind": "private_message",
+        "chat_id": 42,
+        "message_id": 91,
+        "message_thread_id": 7,
+    }
 
 
 @pytest.mark.asyncio
@@ -328,11 +336,11 @@ async def test_group_progress_and_stream_use_typing_action(adapter: TelegramAdap
         }
     adapter.bot.send_rich_message_draft.assert_not_awaited()
     adapter.bot.send_message_draft.assert_not_awaited()
-    adapter.bot.edit_message_text.assert_awaited_once_with(
-        chat_id=-100,
-        message_id=9,
-        text="💭 Mind\nПроверяю\n\nПромежуточный ответ",
-    )
+    call = adapter.bot.edit_message_text.await_args
+    assert call.kwargs["chat_id"] == -100
+    assert call.kwargs["message_id"] == 9
+    assert call.kwargs["rich_message"].markdown == "Промежуточный ответ"
+    assert "Проверяю" not in (call.kwargs["rich_message"].markdown or "")
 
 
 @pytest.mark.asyncio

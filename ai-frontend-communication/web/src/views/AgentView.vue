@@ -65,15 +65,15 @@ const form = reactive<AgentForm>({
   enabled: true,
   claude_model: null,
   claude_effort: "medium",
-  claude_timeout_seconds: 180,
+  claude_timeout_seconds: 1200,
   max_budget_cents: null,
   base_prompt: "",
   answer_style: "normal",
   privacy_level: "strict",
   denied_globs: [],
   memory_enabled: true,
-  memory_recent_messages: 24,
-  memory_max_context_chars: 24_000,
+  memory_recent_messages: 200,
+  memory_max_context_chars: 500_000,
   telegram_group_mode: "mentions",
   telegram_private_mode: "all_messages",
   telegram_streaming_enabled: true,
@@ -703,7 +703,7 @@ const disconnectClaude = useMutation({
           </label>
           <label class="field">
             <span>Таймаут, сек.</span>
-            <input v-model.number="form.claude_timeout_seconds" type="number" min="10" max="900" required />
+            <input v-model.number="form.claude_timeout_seconds" type="number" min="10" max="3600" required />
           </label>
           <label class="field">
             <span>Бюджет, центы</span>
@@ -777,12 +777,12 @@ const disconnectClaude = useMutation({
         <div class="form-grid form-grid--two">
           <label class="field">
             <span>Недавних сообщений</span>
-            <input v-model.number="form.memory_recent_messages" type="number" min="4" max="100" required :disabled="!form.memory_enabled" />
+            <input v-model.number="form.memory_recent_messages" type="number" min="4" max="500" required :disabled="!form.memory_enabled" />
             <small>Сколько реплик загрузить из БД при создании или восстановлении native-сессии.</small>
           </label>
           <label class="field">
             <span>Лимит контекста, символов</span>
-            <input v-model.number="form.memory_max_context_chars" type="number" min="3000" max="100000" step="1000" required :disabled="!form.memory_enabled" />
+            <input v-model.number="form.memory_max_context_chars" type="number" min="3000" max="1000000" step="10000" required :disabled="!form.memory_enabled" />
             <small>Предел bootstrap-контекста из БД; внутри активной сессии Claude использует native compaction.</small>
           </label>
         </div>
@@ -801,8 +801,9 @@ const disconnectClaude = useMutation({
           <label class="field">
             <span>В группе</span>
             <select v-model="form.telegram_group_mode">
-              <option value="commands_only">Только команды</option><option value="mentions">Упоминания и команды</option><option value="all_messages">Все сообщения</option>
+              <option value="commands_only">Только команды</option><option value="mentions">Упоминания и команды</option><option value="all_messages">Все сообщения — отвечает без вызова</option>
             </select>
+            <small>Рекомендуется «Упоминания»: Братулец не будет влезать в обычный разговор.</small>
           </label>
           <label class="field">
             <span>В личных сообщениях</span>

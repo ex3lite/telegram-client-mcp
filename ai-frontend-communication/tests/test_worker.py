@@ -26,14 +26,16 @@ import dca.worker as worker_module
 from dca.claude import ClaudeError, compile_agent_policy
 from dca.config import Settings
 from dca.db import AgentMessage, ConversationThread, Interaction, Job, Repository, TelegramChat
-from dca.domain import KnowledgeAnswer, KnowledgeArtifact
+from dca.domain import KnowledgeAnswer
 from dca.memory import ConversationContext, ConversationContextMessage
 from dca.service import ServiceError
 from dca.worker import (
     TELEGRAM_EXTERNAL_ACTIONS,
     Worker,
+    conversation_message_record,
     conversation_prompt_context,
     interaction_agent_role,
+    normalize_guard_reply,
     render_answer,
     sanitize_stream_text,
     trusted_requester_profile,
@@ -82,6 +84,42 @@ def test_render_answer_keeps_verification_sources_internal() -> None:
     assert rendered == "Используйте `GET /avatars`."
     assert "Источники" not in rendered
     assert "src/" not in rendered
+
+
+def test_guard_reply_keeps_generated_words_but_forces_plain_compact_text() -> None:
+    normalized = normalize_guard_reply(
+        "## Отказ\n\n- **ХУЙ ТЕБЕ**, а не ключ.\n- Попытка записана в аудит."
+    )
+
+    assert normalized == "Отказ ХУЙ ТЕБЕ, а не ключ. Попытка записана в аудит."
+    assert "\n" not in normalized
+    assert "**" not in normalized
+
+
+def test_long_answer_memory_record_preserves_both_ends_within_database_limit() -> None:
+    answer = "A" * 40_000 + "TAIL"
+
+    record = conversation_message_record(answer)
+
+    assert len(record) == 32_000
+    assert record.startswith("A" * 100)
+    assert record.endswith("TAIL")
+    assert "Полный ответ сохранён в interaction" in record
+
+
+@pytest.mark.asyncio
+async def test_private_draft_heartbeat_refreshes_until_answer_is_durable(monkeypatch) -> None:
+    refresh = AsyncMock(side_effect=[False, False, True])
+    monkeypatch.setattr(worker_module.asyncio, "sleep", AsyncMock())
+    worker = Worker.__new__(Worker)
+    interaction = SimpleNamespace(
+        source="telegram",
+        source_ref={"delivery": {"kind": "private_draft"}},
+    )
+
+    await worker._draft_heartbeat(interaction, refresh=refresh)  # type: ignore[arg-type]
+
+    assert refresh.await_count == 3
 
 
 def test_prompt_context_keeps_legitimate_latest_historical_user_message() -> None:
@@ -794,6 +832,7 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
         _: Interaction,
         *,
         policy_guard: Callable[[], Awaitable[None]] | None = None,
+        refresh: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         if policy_guard is not None:
             await policy_guard()
@@ -805,7 +844,7 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
 
     answer = KnowledgeAnswer(
         answer_markdown="Используйте endpoint профиля.",
-        artifacts=[KnowledgeArtifact(name="avatar-guide.md", content="# Лишний файл")],
+        artifacts=[],
         change_request={
             "kind": "integration",
             "title": "Добавить аватарки",
@@ -821,6 +860,7 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
 
     async def claude_answer(**kwargs):
         assert kwargs["tool_profile"] == "read_only"
+        assert kwargs["artifact_requested"] is False
         on_stream = kwargs["on_stream"]
         assert on_stream is not None
         await heartbeat_started.wait()
@@ -1221,6 +1261,7 @@ async def test_publish_attaches_markdown_only_when_requested(
         artifacts=[artifact],
         provider_metadata={"native_context": {"policy_sha256": policy_hash}},
     )
+    interaction.provider_metadata["document_requested"] = expected_attach
 
     class FakeSession:
         async def get(self, model, key):

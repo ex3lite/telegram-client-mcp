@@ -264,15 +264,15 @@ async def load_conversation_context(
     chat_id: UUID | None,
     user_id: UUID | None,
     thread_id: UUID,
-    message_limit: int = 24,
+    message_limit: int = 200,
     fact_limit: int = 50,
-    max_chars: int = 24_000,
+    max_chars: int = 500_000,
     exclude_external_id: str | None = None,
     before: datetime | None = None,
 ) -> ConversationContext:
-    if not 1 <= message_limit <= 100 or not 0 <= fact_limit <= 100:
+    if not 1 <= message_limit <= 500 or not 0 <= fact_limit <= 100:
         raise ServiceError("invalid_memory_limit", "Conversation memory limits are invalid")
-    if not 3_000 <= max_chars <= 100_000:
+    if not 3_000 <= max_chars <= 1_000_000:
         raise ServiceError("invalid_memory_limit", "Conversation context size is invalid")
     await _require_thread_scope(
         session,

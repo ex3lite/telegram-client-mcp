@@ -278,8 +278,9 @@ async def test_missing_agent_settings_use_secure_runtime_defaults() -> None:
     assert settings.version == 0
     assert settings.privacy_level == "strict"
     assert settings.memory_enabled is True
-    assert settings.memory_recent_messages == 24
-    assert settings.memory_max_context_chars == 24_000
+    assert settings.claude_timeout_seconds == 1_200
+    assert settings.memory_recent_messages == 200
+    assert settings.memory_max_context_chars == 500_000
     assert settings.telegram_group_mode == "mentions"
     assert settings.telegram_private_mode == "all_messages"
     assert settings.telegram_streaming_enabled is True
@@ -290,13 +291,15 @@ def test_control_plane_inputs_reject_unsafe_values() -> None:
     assert AgentSettingsInput.model_validate(valid).privacy_level == "strict"
 
     with pytest.raises(ValidationError):
-        AgentSettingsInput.model_validate({**valid, "claude_timeout_seconds": 901})
+        AgentSettingsInput.model_validate({**valid, "claude_timeout_seconds": 3_601})
     with pytest.raises(ValidationError):
         AgentSettingsInput.model_validate({**valid, "denied_globs": [".env", ".env"]})
     with pytest.raises(ValidationError):
-        AgentSettingsInput.model_validate({**valid, "memory_recent_messages": 101})
+        AgentSettingsInput.model_validate({**valid, "memory_recent_messages": 501})
     with pytest.raises(ValidationError):
         AgentSettingsInput.model_validate({**valid, "memory_max_context_chars": 2_999})
+    with pytest.raises(ValidationError):
+        AgentSettingsInput.model_validate({**valid, "memory_max_context_chars": 1_000_001})
     with pytest.raises(ValidationError):
         AgentSettingsInput.model_validate(
             {**valid, "base_prompt": "Use OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456"}

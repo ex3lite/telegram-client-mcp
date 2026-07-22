@@ -80,15 +80,15 @@ class ProjectAgentSettings(Base, TimestampMixin):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     claude_model: Mapped[str | None] = mapped_column(String(120))
     claude_effort: Mapped[str] = mapped_column(String(16), nullable=False, default="medium")
-    claude_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
+    claude_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=1_200)
     max_budget_cents: Mapped[int | None] = mapped_column(Integer)
     base_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
     answer_style: Mapped[str] = mapped_column(String(16), nullable=False, default="normal")
     privacy_level: Mapped[str] = mapped_column(String(16), nullable=False, default="strict")
     denied_globs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     memory_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    memory_recent_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
-    memory_max_context_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=24_000)
+    memory_recent_messages: Mapped[int] = mapped_column(Integer, nullable=False, default=200)
+    memory_max_context_chars: Mapped[int] = mapped_column(Integer, nullable=False, default=500_000)
     telegram_group_mode: Mapped[str] = mapped_column(String(24), nullable=False, default="mentions")
     telegram_private_mode: Mapped[str] = mapped_column(
         String(24), nullable=False, default="all_messages"

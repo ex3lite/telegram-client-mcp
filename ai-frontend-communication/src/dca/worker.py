@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -94,6 +95,7 @@ TELEGRAM_POLL_FATAL_ERRORS = (
     TelegramUnauthorizedError,
 )
 KNOWLEDGE_STREAM_INTERVAL_SECONDS = 1.0
+PRIVATE_DRAFT_KEEPALIVE_SECONDS = 15
 
 
 def _poll_retry_delay(base_delay: float) -> float:
@@ -985,21 +987,46 @@ class Worker:
                     retryable=True,
                 )
 
+        last_stream_at = float("-inf")
+        latest_stream_answer = ""
+        latest_stream_thinking = ""
+        stream_privacy_findings: set[tuple[str, str]] = set()
+        stream_delivery_lock = asyncio.Lock()
+
+        async def refresh_stream() -> bool:
+            async with stream_delivery_lock:
+                if not latest_stream_answer and not latest_stream_thinking:
+                    await self.telegram.send_knowledge_progress(interaction)
+                    return False
+                delivery = await self.telegram.send_knowledge_stream(
+                    interaction,
+                    answer_markdown=latest_stream_answer,
+                    thinking=latest_stream_thinking,
+                )
+                if not isinstance(delivery, dict):
+                    return False
+                current_delivery = interaction.source_ref.get("delivery")
+                if delivery != current_delivery:
+                    await self._persist_stream_delivery(interaction, delivery)
+                return bool(latest_stream_answer) and delivery.get("kind") in {
+                    "group_message",
+                    "private_message",
+                }
+
         heartbeat = (
             asyncio.create_task(
-                self._draft_heartbeat(interaction, policy_guard=ensure_policy_current)
+                self._draft_heartbeat(
+                    interaction,
+                    policy_guard=ensure_policy_current,
+                    refresh=refresh_stream,
+                )
             )
             if agent_settings.telegram_streaming_enabled
             else None
         )
-        last_stream_at = float("-inf")
-        stream_privacy_findings: set[tuple[str, str]] = set()
 
         async def stream_answer(answer_markdown: str, thinking: str) -> None:
-            nonlocal heartbeat, last_stream_at
-            now = asyncio.get_running_loop().time()
-            if now - last_stream_at < KNOWLEDGE_STREAM_INTERVAL_SECONDS:
-                return
+            nonlocal heartbeat, last_stream_at, latest_stream_answer, latest_stream_thinking
             await ensure_policy_current()
             safe_answer_stream, answer_stream_findings = sanitize_stream_text(
                 answer_markdown,
@@ -1016,26 +1043,27 @@ class Worker:
                 for finding in (*answer_stream_findings, *thinking_stream_findings)
             )
             if not safe_answer_stream and not safe_thinking_stream:
-                last_stream_at = now
                 return
-            if heartbeat is not None:
-                heartbeat.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat
-                heartbeat = None
+            latest_stream_answer = safe_answer_stream
+            latest_stream_thinking = safe_thinking_stream
+            now = asyncio.get_running_loop().time()
+            if now - last_stream_at < KNOWLEDGE_STREAM_INTERVAL_SECONDS:
+                return
             last_stream_at = now
             try:
-                await self.telegram.send_knowledge_stream(
-                    interaction,
-                    answer_markdown=safe_answer_stream,
-                    thinking=safe_thinking_stream,
-                )
+                durable = await refresh_stream()
             except Exception:
                 log.warning(
                     "telegram.stream_failed",
                     interaction_id=str(interaction.id),
                     exc_info=True,
                 )
+                return
+            if durable and heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+                heartbeat = None
 
         async def ask_claude(*, should_resume: bool, memory: dict[str, Any] | None) -> Any:
             return await self.claude.answer(
@@ -1051,6 +1079,7 @@ class Worker:
                 resume_session=should_resume,
                 compiled_policy=compiled_policy,
                 tool_profile=("none" if agent_role == SECURITY_GUARD_ROLE else "read_only"),
+                artifact_requested=wants_document,
             )
 
         session_rotated = False
@@ -1074,13 +1103,21 @@ class Worker:
                     await heartbeat
 
         await ensure_policy_current()
-        answer = (
-            result.answer if wants_document else result.answer.model_copy(update={"artifacts": []})
-        )
+        if wants_document != bool(result.answer.artifacts):
+            raise ClaudeError(
+                "model_output_contract_violation",
+                "Claude artifact output did not match the explicit document request",
+                retryable=True,
+            )
+        answer = result.answer
         safe_answer, privacy_findings, privacy_blocked = sanitize_knowledge_answer(
             answer,
             level=cast(PrivacyLevel, agent_settings.privacy_level),
         )
+        if agent_role == SECURITY_GUARD_ROLE:
+            safe_answer = safe_answer.model_copy(
+                update={"answer_markdown": normalize_guard_reply(safe_answer.answer_markdown)}
+            )
         accepted = [check.citation.model_dump(mode="json") for check in result.accepted_citations]
         rejected = [check.model_dump(mode="json") for check in result.rejected_citations]
         if privacy_blocked:
@@ -1206,7 +1243,7 @@ class Worker:
                     thread_id=thread.id,
                     role="assistant",
                     source="claude",
-                    content=safe_answer.answer_markdown,
+                    content=conversation_message_record(safe_answer.answer_markdown),
                     external_id=str(persisted.id),
                 )
                 if safe_answer.memory_summary:
@@ -1356,8 +1393,13 @@ class Worker:
         interaction: Interaction,
         *,
         policy_guard: Callable[[], Awaitable[None]] | None = None,
+        refresh: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
-        interval = 4 if interaction_delivery_scope(interaction) == "group" else 20
+        interval = (
+            4
+            if interaction_delivery_scope(interaction) == "group"
+            else PRIVATE_DRAFT_KEEPALIVE_SECONDS
+        )
         while True:
             if policy_guard is not None:
                 try:
@@ -1365,7 +1407,11 @@ class Worker:
                 except (ClaudeError, ServiceError):
                     return
             try:
-                await self.telegram.send_knowledge_progress(interaction)
+                if refresh is not None:
+                    if await refresh():
+                        return
+                else:
+                    await self.telegram.send_knowledge_progress(interaction)
             except Exception:
                 log.warning(
                     "telegram.draft_failed",
@@ -1373,6 +1419,30 @@ class Worker:
                     exc_info=True,
                 )
             await asyncio.sleep(interval)
+
+    async def _persist_stream_delivery(
+        self,
+        interaction: Interaction,
+        delivery: dict[str, Any],
+    ) -> None:
+        source_ref = {**interaction.source_ref, "delivery": dict(delivery)}
+        async with self.database.session() as session:
+            persisted = await session.get(Interaction, interaction.id)
+            if persisted is None:
+                raise ServiceError("request_not_found", "Interaction disappeared during streaming")
+            persisted.source_ref = source_ref
+            await append_audit(
+                session,
+                event_type="telegram.stream_promoted",
+                correlation_id=persisted.correlation_id,
+                actor_type="system",
+                actor_id="telegram-stream",
+                project_id=persisted.project_id,
+                subject_type="interaction",
+                subject_id=str(persisted.id),
+                payload={"delivery_kind": delivery.get("kind")},
+            )
+        interaction.source_ref = source_ref
 
     async def _publish_interaction(self, interaction_id: UUID) -> dict[str, Any]:
         policy_blocked = False
@@ -1448,9 +1518,11 @@ class Worker:
         if blocked:
             await self.telegram.publish_knowledge_error(interaction)
         else:
-            attach_markdown = agent_settings.telegram_attach_markdown and document_requested(
-                interaction.question
+            document_was_requested = (
+                isinstance(interaction.provider_metadata, dict)
+                and interaction.provider_metadata.get("document_requested") is True
             )
+            attach_markdown = agent_settings.telegram_attach_markdown and document_was_requested
             await self.telegram.publish_knowledge_answer(
                 interaction,
                 interaction.answer_markdown or "",
@@ -1965,6 +2037,26 @@ def render_answer(
     if uncertainty:
         sections.extend(["## Неопределённость", "\n".join(f"- {item}" for item in uncertainty)])
     return "\n\n".join(sections)
+
+
+def normalize_guard_reply(value: str) -> str:
+    """Keep the generated guard voice while forcing safe plain Telegram formatting."""
+    without_list_markers = re.sub(
+        r"(?m)^\s{0,3}(?:#{1,6}\s+|[-*•]\s+|\d+[.)]\s+)",
+        "",
+        value,
+    )
+    without_markdown = without_list_markers.replace("`", "").replace("**", "")
+    return re.sub(r"\s+", " ", without_markdown).strip()
+
+
+def conversation_message_record(value: str, *, limit: int = 32_000) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n\n[Полный ответ сохранён в interaction; память содержит начало и конец.]\n\n"
+    head = (limit * 3) // 4
+    tail = limit - head - len(marker)
+    return f"{value[:head]}{marker}{value[-tail:]}"
 
 
 async def main() -> None:

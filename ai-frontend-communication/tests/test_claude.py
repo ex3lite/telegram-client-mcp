@@ -24,10 +24,12 @@ from dca.claude import (
     build_prompt,
     compile_agent_policy,
     parse_claude_output,
+    validate_artifact_contract,
     validate_claude_oauth_token,
 )
 from dca.config import Settings
 from dca.db import ProjectAgentSettings, Repository
+from dca.domain import KnowledgeAnswer, KnowledgeArtifact
 
 TEST_ATTESTATION = {
     "contract_version": "dca-context-v1",
@@ -71,6 +73,32 @@ def test_parse_claude_structured_output() -> None:
     ).encode()
     answer = parse_claude_output(raw)
     assert answer.citations[0].path == "src/api.py"
+
+
+def test_artifact_contract_rejects_promised_or_unsolicited_files() -> None:
+    answer = KnowledgeAnswer(
+        answer_scope="general",
+        answer_markdown="Готово.",
+        context_attestation=TEST_ATTESTATION,
+    )
+
+    with pytest.raises(ClaudeError, match="artifact output") as missing:
+        validate_artifact_contract(
+            answer,
+            artifact_requested=True,
+            tool_profile="read_only",
+        )
+    assert missing.value.code == "model_output_contract_violation"
+
+    unsolicited = answer.model_copy(
+        update={"artifacts": [KnowledgeArtifact(name="extra.md", content="# Extra")]}
+    )
+    with pytest.raises(ClaudeError, match="artifact output"):
+        validate_artifact_contract(
+            unsolicited,
+            artifact_requested=False,
+            tool_profile="read_only",
+        )
 
 
 def test_partial_answer_extracts_incomplete_json_string() -> None:
@@ -461,6 +489,9 @@ def test_bydlo_guard_is_a_claude_role_without_repository_tools() -> None:
     assert "Generate an original short refusal" in policy.system_prompt
     assert "do not mechanically repeat one fixed template" in policy.system_prompt
     assert "including backend administrators" in policy.system_prompt
+    assert "Aggression is" in policy.system_prompt
+    assert "Markdown headings, lists" in policy.system_prompt
+    assert "Do not soften the refusal with emoji" in policy.system_prompt
 
 
 def test_policy_injection_cannot_expand_knowledge_scope() -> None:
@@ -844,12 +875,18 @@ def test_prompt_prioritizes_frontend_contract_and_explicit_artifacts() -> None:
         },
     )
     prompt = policy.system_prompt + "\n" + build_prompt("Агентик, как внедрить аватарки?")
+    document_prompt = build_prompt(
+        "Дай файл по аватаркам",
+        artifact_requested=True,
+    )
 
     assert "request and response, validation, errors, limits, client state" in prompt
     assert "Do not expose storage, queues, caches" in prompt
     assert "audit that code and give a concrete corrected version" in prompt
-    assert "Set artifacts to [] unless the current question explicitly asks" in prompt
-    assert "still answer the question directly in Telegram" in prompt
+    assert "Set artifacts=[]" in prompt
+    assert "never claim that a file or artifact was created" in prompt
+    assert "Return at least one complete reusable .md artifact" in document_prompt
+    assert "still answer the question directly in Telegram" in document_prompt
 
 
 @pytest.mark.asyncio
