@@ -79,6 +79,7 @@ CLAUDE_OAUTH_SESSION_TTL_SECONDS = 10 * 60
 CLAUDE_OAUTH_START_TIMEOUT_SECONDS = 45
 CLAUDE_OAUTH_COMPLETE_TIMEOUT_SECONDS = 90
 CLAUDE_OAUTH_MAX_OUTPUT_BYTES = 512_000
+EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 CLAUDE_OAUTH_AUTHORIZATION_ANCHOR = "Browser didn't open? Use the url below to sign in"
 CLAUDE_OAUTH_CODE_ANCHOR = "Paste code here if prompted >"
 _CLAUDE_OAUTH_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
@@ -767,7 +768,7 @@ class ClaudeCode:
                 "--no-chrome",
                 "--strict-mcp-config",
                 "--mcp-config",
-                "{}",
+                EMPTY_MCP_CONFIG,
                 "--setting-sources",
                 "",
                 "--permission-mode",
@@ -843,7 +844,7 @@ class ClaudeCode:
                 "--no-chrome",
                 "--strict-mcp-config",
                 "--mcp-config",
-                "{}",
+                EMPTY_MCP_CONFIG,
                 "--setting-sources",
                 "",
                 "--permission-mode",

@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from dca.claude import (
+    EMPTY_MCP_CONFIG,
     ClaudeCode,
     ClaudeError,
     RepositorySnapshots,
@@ -53,6 +54,10 @@ def test_parse_claude_structured_output() -> None:
     ).encode()
     answer = parse_claude_output(raw)
     assert answer.citations[0].path == "src/api.py"
+
+
+def test_empty_mcp_config_matches_claude_cli_schema() -> None:
+    assert json.loads(EMPTY_MCP_CONFIG) == {"mcpServers": {}}
 
 
 def test_parse_claude_rejects_unstructured_text() -> None:
