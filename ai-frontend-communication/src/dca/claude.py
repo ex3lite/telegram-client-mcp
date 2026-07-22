@@ -81,12 +81,13 @@ CLAUDE_OAUTH_COMPLETE_TIMEOUT_SECONDS = 90
 CLAUDE_OAUTH_MAX_OUTPUT_BYTES = 512_000
 CLAUDE_OAUTH_AUTHORIZATION_ANCHOR = "Browser didn't open? Use the url below to sign in"
 CLAUDE_OAUTH_CODE_ANCHOR = "Paste code here if prompted >"
-CLAUDE_OAUTH_TOKEN_ANCHOR = "Your OAuth token (valid for 1 year):"  # noqa: S105 - provider output anchor
 _CLAUDE_OAUTH_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _CLAUDE_OAUTH_URL_RE = re.compile(r"https://[^\s\x00-\x1f\x7f<>\"']{1,8192}")
 _CLAUDE_OAUTH_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{20,8192}")
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-_ANSI_OSC8_OPEN_RE = re.compile(r"\x1b\]8;;(?P<url>https://[^\x07\x1b]{1,8192})(?:\x07|\x1b\\)")
+_ANSI_OSC8_OPEN_RE = re.compile(
+    r"\x1b\]8;[^\x07\x1b;]{0,512};(?P<url>https://[^\x07\x1b]{1,8192})(?:\x07|\x1b\\)"
+)
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CLAUDE_OAUTH_INVALID_CODE_MARKERS = (
     "invalid code",
@@ -1009,13 +1010,19 @@ def _terminal_text(raw: bytes | bytearray) -> str:
     )
 
 
+def _compact_terminal_text(value: str) -> str:
+    return "".join(character for character in value.casefold() if not character.isspace())
+
+
 def _extract_authorization_url(raw: bytes) -> str | None:
     text = _terminal_text(raw)
-    anchor_index = text.rfind(CLAUDE_OAUTH_AUTHORIZATION_ANCHOR)
-    code_anchor_index = text.rfind(CLAUDE_OAUTH_CODE_ANCHOR)
-    if anchor_index < 0 or code_anchor_index < anchor_index:
+    compact = _compact_terminal_text(text)
+    if (
+        _compact_terminal_text(CLAUDE_OAUTH_AUTHORIZATION_ANCHOR) not in compact
+        or _compact_terminal_text(CLAUDE_OAUTH_CODE_ANCHOR) not in compact
+    ):
         return None
-    for match in _CLAUDE_OAUTH_URL_RE.finditer(text, anchor_index):
+    for match in _CLAUDE_OAUTH_URL_RE.finditer(text):
         candidate = match.group(0).rstrip(".,;")
         parsed = urlsplit(candidate)
         host = (parsed.hostname or "").lower()
@@ -1045,10 +1052,16 @@ def _extract_oauth_value(raw: bytes) -> str | None:
         candidate = match.group(1).strip()
         if _CLAUDE_OAUTH_VALUE_RE.fullmatch(candidate) is not None:
             return candidate
-    anchor_index = text.rfind(CLAUDE_OAUTH_TOKEN_ANCHOR)
-    if anchor_index < 0:
+    anchor_matches = list(
+        re.finditer(
+            r"Your\s*OAuth\s*token\s*\(valid\s*for\s*1\s*year\s*\):",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not anchor_matches:
         return None
-    tail = text[anchor_index + len(CLAUDE_OAUTH_TOKEN_ANCHOR) :]
+    tail = text[anchor_matches[-1].end() :]
     for line in tail.splitlines():
         candidate = line.strip().strip("`\"'")
         if _CLAUDE_OAUTH_VALUE_RE.fullmatch(candidate) is not None:
@@ -1057,10 +1070,10 @@ def _extract_oauth_value(raw: bytes) -> str | None:
 
 
 def _contains_invalid_code(raw: bytes | bytearray) -> bool:
-    text = _terminal_text(raw).casefold()
+    text = _compact_terminal_text(_terminal_text(raw))
     return (
-        any(marker in text for marker in _CLAUDE_OAUTH_INVALID_CODE_MARKERS)
-        or text.count(CLAUDE_OAUTH_CODE_ANCHOR.casefold()) > 0
+        any(_compact_terminal_text(marker) in text for marker in _CLAUDE_OAUTH_INVALID_CODE_MARKERS)
+        or _compact_terminal_text(CLAUDE_OAUTH_CODE_ANCHOR) in text
     )
 
 

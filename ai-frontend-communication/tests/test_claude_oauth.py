@@ -43,17 +43,21 @@ if os.environ.get("HTTPS_PROXY") != "http://proxy.example:8080/":
     print("proxy missing", flush=True)
     raise SystemExit(4)
 
-print("\\033[36mBrowser didn't open? Use the url below to sign in\\033[0m")
+print("Browser didn't open?\\033[23GUse the url\\033[35Gbelow\\033[41Gto\\033[44Gsign\\033[49Gin")
 print(
-    "\\033]8;;https://claude.ai/oauth/authorize?state=test-state\\033\\\\"
+    "\\033]8;id=test-link;https://claude.ai/oauth/authorize?state=test-state\\033\\\\"
     "Open URL\\033]8;;\\033\\\\"
 )
-print("Paste code here if prompted >", flush=True)
+print("Paste\\033[8Gcode\\033[13Ghere\\033[18Gif\\033[21Gprompted\\033[30G>", flush=True)
 code = sys.stdin.readline().strip()
 if code != "one-time-code":
     print("Invalid code", flush=True)
     raise SystemExit(5)
-print("Your OAuth token (valid for 1 year):", flush=True)
+print(
+    "Your\\033[6GOAuth\\033[12Gtoken\\033[18G(valid\\033[25Gfor"
+    "\\033[29G1\\033[31Gyear):",
+    flush=True,
+)
 print("long-lived-test-value-1234567890", flush=True)
 """
     )
