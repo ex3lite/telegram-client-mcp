@@ -240,8 +240,11 @@ class ClaudeOAuthManager:
         try:
             # Claude Code's Ink prompt runs the TTY in raw mode. Text and Enter must be
             # separate input events so React commits the pasted code before submit runs.
-            await _write_pty(session.master_fd, normalized_code.encode())
-            await asyncio.sleep(0.1)
+            await _write_pty(
+                session.master_fd,
+                b"\x1b[200~" + normalized_code.encode() + b"\x1b[201~",
+            )
+            await asyncio.sleep(0.5)
             await _write_pty(session.master_fd, b"\r")
             provider_value = await self._read_until(
                 session,

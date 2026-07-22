@@ -63,7 +63,7 @@ while True:
     if character == b"\\r":
         break
     code_bytes.extend(character)
-code = code_bytes.decode()
+code = code_bytes.decode().removeprefix("\\033[200~").removesuffix("\\033[201~")
 if code not in {"one-time-code", "invalid-provider-token"}:
     print("Invalid code", flush=True)
     raise SystemExit(5)

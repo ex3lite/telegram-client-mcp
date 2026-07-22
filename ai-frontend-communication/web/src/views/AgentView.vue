@@ -416,7 +416,7 @@ const completeOauth = useMutation({
 function submitOauthCode() {
   const normalized = normalizeOauthCode(oauthCode.value);
   if (!normalized) {
-    oauthCodeError.value = "Вставьте код целиком — вместе с частью после #.";
+    oauthCodeError.value = "Вставьте всю строку из синего блока Anthropic.";
     void nextTick(() => oauthCodeInput.value?.focus());
     return;
   }
@@ -520,7 +520,7 @@ const disconnectClaude = useMutation({
 
           <ol class="oauth-steps" aria-label="Шаги подключения Claude">
             <li :class="{ 'oauth-step--active': oauthStep === 1, 'oauth-step--done': oauthStep > 1 }"><span>1</span><div><strong>Anthropic</strong><small>Разрешить вход</small></div></li>
-            <li :class="{ 'oauth-step--active': oauthStep === 2, 'oauth-step--done': oauthStep > 2 }"><span>2</span><div><strong>Код</strong><small>Вставить code#state</small></div></li>
+            <li :class="{ 'oauth-step--active': oauthStep === 2, 'oauth-step--done': oauthStep > 2 }"><span>2</span><div><strong>Код</strong><small>Вставить всю строку</small></div></li>
             <li :class="{ 'oauth-step--active': oauthStep === 3, 'oauth-step--done': checkClaude.data.value?.ok }"><span>3</span><div><strong>Проверка</strong><small>Запустить Claude CLI</small></div></li>
           </ol>
 
@@ -558,7 +558,7 @@ const disconnectClaude = useMutation({
             <span class="oauth-stage__number" aria-hidden="true">02</span>
             <div class="oauth-stage__content">
               <h4 id="oauth-stage-two-title">Вставьте ответ Anthropic</h4>
-              <p>Скопируйте код со страницы Anthropic целиком. Часть после <code>#</code> обязательна.</p>
+              <p>Скопируйте всю строку из синего блока на странице Anthropic.</p>
 
               <div v-if="completeOauth.error.value" class="oauth-flow__state oauth-flow__state--error" role="alert">
                 <strong>Этот код не сработал</strong>
