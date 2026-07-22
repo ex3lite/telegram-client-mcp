@@ -84,7 +84,6 @@ CLAUDE_OAUTH_AUTHORIZATION_ANCHOR = "Browser didn't open? Use the url below to s
 CLAUDE_OAUTH_CODE_ANCHOR = "Paste code here if prompted >"
 _CLAUDE_OAUTH_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _CLAUDE_OAUTH_URL_RE = re.compile(r"https://[^\s\x00-\x1f\x7f<>\"']{1,8192}")
-_CLAUDE_OAUTH_VALUE_RE = re.compile(r"[A-Za-z0-9._~+/=-]{20,8192}")
 _CLAUDE_SETUP_TOKEN_RE = re.compile(r"sk-ant-oat[A-Za-z0-9_-]{20,16374}")
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC8_OPEN_RE = re.compile(
@@ -1061,11 +1060,14 @@ def _extract_authorization_url(raw: bytes) -> str | None:
 
 def _extract_oauth_value(raw: bytes) -> str | None:
     text = _terminal_text(raw)
-    export_matches = list(re.finditer(r"CLAUDE_CODE_OAUTH_TOKEN\s*=\s*([^\s\"'`<>]+)", text))
+    export_matches = list(
+        re.finditer(
+            rf"CLAUDE_CODE_OAUTH_TOKEN\s*=\s*({_CLAUDE_SETUP_TOKEN_RE.pattern})",
+            text,
+        )
+    )
     for match in reversed(export_matches):
-        candidate = match.group(1).strip()
-        if _CLAUDE_OAUTH_VALUE_RE.fullmatch(candidate) is not None:
-            return candidate
+        return match.group(1)
     anchor_matches = list(
         re.finditer(
             r"Your\s*OAuth\s*token\s*\(valid\s*for\s*1\s*year\s*\):",
@@ -1073,13 +1075,10 @@ def _extract_oauth_value(raw: bytes) -> str | None:
             flags=re.IGNORECASE,
         )
     )
-    if not anchor_matches:
-        return None
-    tail = text[anchor_matches[-1].end() :]
-    for line in tail.splitlines():
-        candidate = line.strip().strip("`\"'")
-        if _CLAUDE_OAUTH_VALUE_RE.fullmatch(candidate) is not None:
-            return candidate
+    for anchor in reversed(anchor_matches):
+        token = _CLAUDE_SETUP_TOKEN_RE.search(text, anchor.end())
+        if token is not None:
+            return token.group(0)
     return None
 
 

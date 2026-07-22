@@ -74,6 +74,9 @@ print(
     "\\033[29G1\\033[31Gyear):",
     flush=True,
 )
+print("----------------------------------------", flush=True)
+print("Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>", flush=True)
+time.sleep(0.05)
 token = (
     "sk-ant-oat01-abcdefghijklmnopqrstuvwxyz1234567890"
     if code == "one-time-code"
@@ -143,7 +146,7 @@ async def test_claude_oauth_pty_flow_and_terminal_states(
         invalid_provider = await manager.start(owner_id)
         with pytest.raises(ClaudeError) as invalid_token:
             await manager.complete(owner_id, invalid_provider.session_id, "invalid-provider-token")
-        assert invalid_token.value.code == "claude_oauth_invalid_token"
+        assert invalid_token.value.code == "claude_oauth_provider_error"
 
         with pytest.raises(ClaudeError) as restart_state:
             await restarted.complete(owner_id, started.session_id, "one-time-code")
