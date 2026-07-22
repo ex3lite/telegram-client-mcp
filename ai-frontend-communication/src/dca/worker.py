@@ -62,7 +62,7 @@ from dca.memory import (
     load_conversation_context,
     upsert_conversation_memory,
 )
-from dca.privacy import PrivacyFinding, PrivacyLevel, sanitize_text
+from dca.privacy import SECURITY_GUARD_ROLE, PrivacyFinding, PrivacyLevel, sanitize_text
 from dca.service import (
     SYSTEM_SECRET_CLAUDE_OAUTH,
     ServiceError,
@@ -196,6 +196,16 @@ def interaction_delivery_scope(
     if interaction.source != "telegram" or not isinstance(delivery, dict):
         return "external"
     return "group" if delivery.get("kind") == "group_message" else "private"
+
+
+def interaction_agent_role(
+    interaction: Interaction,
+) -> Literal["knowledge", "bydlo_guard"]:
+    return (
+        SECURITY_GUARD_ROLE
+        if interaction.source_ref.get("agent_role") == SECURITY_GUARD_ROLE
+        else "knowledge"
+    )
 
 
 def sanitize_stream_text(
@@ -853,12 +863,14 @@ class Worker:
                     requester_profile.get(key) != queued_profile.get(key) for key in queued_profile
                 )
             delivery_scope = interaction_delivery_scope(interaction)
+            agent_role = interaction_agent_role(interaction)
             compiled_policy = compile_agent_policy(
                 project_settings=agent_settings,
                 requester_profile=requester_profile,
                 delivery_scope=delivery_scope,
                 repository_allowed_paths=repository.allowed_paths or [],
                 repository_denied_globs=agent_settings.denied_globs or [],
+                agent_role=agent_role,
             )
             thread: ConversationThread | None = None
             if agent_settings.memory_enabled and interaction.conversation_thread_id is not None:
@@ -901,7 +913,7 @@ class Worker:
             interaction.commit_sha,
             denied_globs=agent_settings.denied_globs,
         )
-        wants_document = document_requested(interaction.question)
+        wants_document = agent_role == "knowledge" and document_requested(interaction.question)
         policy_stale = asyncio.Event()
 
         async def ensure_policy_current() -> None:
@@ -947,6 +959,7 @@ class Worker:
                         delivery_scope=interaction_delivery_scope(live_interaction),
                         repository_allowed_paths=live_repository.allowed_paths or [],
                         repository_denied_globs=live_settings.denied_globs or [],
+                        agent_role=interaction_agent_role(live_interaction),
                     )
             except ClaudeError as exc:
                 policy_stale.set()
@@ -1037,6 +1050,7 @@ class Worker:
                 session_id=native_session_id,
                 resume_session=should_resume,
                 compiled_policy=compiled_policy,
+                tool_profile=("none" if agent_role == SECURITY_GUARD_ROLE else "read_only"),
             )
 
         session_rotated = False
@@ -1119,7 +1133,8 @@ class Worker:
             persisted.uncertainty = safe_answer.uncertainty
             answer_markdown = safe_answer.answer_markdown
             if (
-                safe_answer.change_request is not None
+                agent_role == "knowledge"
+                and safe_answer.change_request is not None
                 and compiled_policy.requester["can_create_requests"] is True
             ):
                 try:
@@ -1140,8 +1155,6 @@ class Worker:
                     )
             persisted.answer_markdown = render_answer(
                 answer_markdown=answer_markdown,
-                citations=accepted,
-                commit_sha=interaction.commit_sha,
                 uncertainty=safe_answer.uncertainty,
             )
             persisted.provider_metadata = {
@@ -1149,6 +1162,8 @@ class Worker:
                 "cli_version": result.cli_version,
                 "model": agent_settings.claude_model,
                 "effort": agent_settings.claude_effort,
+                "agent_role": agent_role,
+                "answer_scope": safe_answer.answer_scope,
                 "memory_enabled": prompt_memory is not None,
                 "memory_messages": len(prompt_memory["messages"]) if prompt_memory else 0,
                 "memory_summary_updated": bool(
@@ -1395,6 +1410,7 @@ class Worker:
                             delivery_scope=interaction_delivery_scope(interaction),
                             repository_allowed_paths=repository.allowed_paths or [],
                             repository_denied_globs=agent_settings.denied_globs or [],
+                            agent_role=interaction_agent_role(interaction),
                         ).policy_sha256
                 except (ClaudeError, ServiceError):
                     live_policy_hash = None
@@ -1943,15 +1959,9 @@ def privacy_audit_payload(findings: list[PrivacyFinding]) -> dict[str, Any]:
 def render_answer(
     *,
     answer_markdown: str,
-    citations: list[dict[str, Any]],
-    commit_sha: str,
     uncertainty: list[str],
 ) -> str:
-    source_lines = [
-        f"- `{citation['path']}:{citation['start_line']}-{citation['end_line']}` @ `{commit_sha}`"
-        for citation in citations
-    ]
-    sections = [answer_markdown.rstrip(), "## Источники", "\n".join(source_lines)]
+    sections = [answer_markdown.rstrip()]
     if uncertainty:
         sections.extend(["## Неопределённость", "\n".join(f"- {item}" for item in uncertainty)])
     return "\n\n".join(sections)

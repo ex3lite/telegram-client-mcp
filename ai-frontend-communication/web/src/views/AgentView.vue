@@ -687,12 +687,13 @@ const disconnectClaude = useMutation({
           <label class="field field--wide">
             <span>Модель</span>
             <select v-model="claudeModelInput">
-              <option value="">По умолчанию</option>
-              <option value="fable">Fable</option>
-              <option value="sonnet">Sonnet</option>
-              <option value="opus">Opus</option>
+              <option value="claude-opus-4-6">Opus 4.6 · видимый Mind</option>
+              <option value="opus">Opus latest · Mind может быть скрыт</option>
+              <option value="sonnet">Sonnet latest · Mind может быть скрыт</option>
+              <option value="fable">Fable latest · Mind может быть скрыт</option>
+              <option value="">По умолчанию Claude CLI</option>
             </select>
-            <small>«По умолчанию» использует модель, выбранную Claude CLI.</small>
+            <small>Для нативного Thinking в Telegram используйте Opus 4.6: этот профиль проверен на реальном stream-json Claude CLI.</small>
           </label>
           <label class="field">
             <span>Усилие</span>
@@ -753,6 +754,7 @@ const disconnectClaude = useMutation({
             <span>Редактирует найденные секреты и публикует очищенную версию.</span>
           </label>
         </div>
+        <p class="muted-note"><strong>Быдло Guard всегда включён.</strong> Высокоуверенные попытки вытащить ключи, токены, пароли или `.env` фиксируются в аудите. Claude отвечает отдельной неизменяемой ролью без доступа к репозиторию; исключений по ролям нет.</p>
         <label class="field">
           <span>Дополнительно запрещённые пути</span>
           <textarea v-model="deniedGlobsText" class="code-input" rows="6" spellcheck="false" placeholder="config/private/**&#10;docs/internal-credentials.md"></textarea>

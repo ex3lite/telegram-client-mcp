@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -52,7 +52,11 @@ from dca.domain import (
     utcnow,
 )
 from dca.memory import append_conversation_message, get_or_create_conversation_thread
-from dca.privacy import sanitize_text
+from dca.privacy import (
+    SECURITY_GUARD_ROLE,
+    sanitize_text,
+    secret_extraction_request,
+)
 from dca.service import (
     ServiceError,
     answer_clarification_from_telegram,
@@ -66,9 +70,16 @@ from dca.service import (
 MAX_RICH_MESSAGE_CHARS = 32_768
 MAX_EPHEMERAL_CHARS = 4_096
 MAX_THINKING_DRAFT_CHARS = 8_000
-KNOWLEDGE_PROGRESS_TEXT = "Проверяю код и подтверждаю ссылки"
+KNOWLEDGE_PROGRESS_TEXT = "Разбираюсь и собираю ответ"
 PROJECT_PREFIX_RE = re.compile(r"^project:([a-z0-9][a-z0-9-]{0,79})\s+", re.IGNORECASE)
-BOT_NAME_ALIASES = ("агентик агент", "агентик", "kakadu ai agent", "kakadu ai")
+BOT_NAME_ALIASES = (
+    "братулец агент",
+    "братулец",
+    "агентик агент",
+    "агентик",
+    "kakadu ai agent",
+    "kakadu ai",
+)
 DOCUMENT_ACTION_RE = re.compile(
     r"\b(?:создай|сделай|подготовь|напиши|сгенерируй|оформи|выгрузи|"
     r"create|write|generate|prepare|export)\b",
@@ -122,9 +133,10 @@ class TelegramAdapter:
         await self.bot.session.close()
 
     async def setup_commands(self) -> None:
+        await self.bot.set_my_name(name="Братулец")
         await self.bot.set_my_commands(
             [
-                BotCommand(command="ask", description="Задать вопрос по коду"),
+                BotCommand(command="ask", description="Задать вопрос Братульцу"),
                 BotCommand(command="request", description="Создать заявку"),
                 BotCommand(command="help", description="Показать формат команд"),
             ],
@@ -132,7 +144,7 @@ class TelegramAdapter:
         )
         await self.bot.set_my_commands(
             [
-                BotCommand(command="ask", description="Задать вопрос по коду"),
+                BotCommand(command="ask", description="Задать вопрос Братульцу"),
                 BotCommand(
                     command="ask_private",
                     description="Задать вопрос приватно",
@@ -161,10 +173,10 @@ class TelegramAdapter:
             return None
         result = InlineQueryResultArticle(
             id=f"dca-{update_object.update_id}",
-            title="Ответ Developer Agent",
+            title="Ответ Братульца",
             input_message_content=InputRichMessageContent(
                 rich_message=InputRichMessage(
-                    markdown="**Проверяю проект и источники...**",
+                    markdown="**Думаю...**",
                     skip_entity_detection=True,
                 )
             ),
@@ -340,6 +352,22 @@ class TelegramAdapter:
         delivery = interaction.source_ref.get("delivery", {})
         kind = delivery.get("kind")
         if kind == "group_message":
+            thinking_preview = thinking[-MAX_THINKING_DRAFT_CHARS:]
+            parts = []
+            if thinking_preview:
+                parts.append(f"💭 Mind\n{thinking_preview}")
+            if answer_markdown:
+                parts.append(answer_markdown)
+            preview = "\n\n".join(parts)[:MAX_EPHEMERAL_CHARS]
+            if preview:
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=int(delivery["chat_id"]),
+                        message_id=int(delivery["message_id"]),
+                        text=preview,
+                    )
+                except TelegramBadRequest:
+                    pass
             await self.bot.send_chat_action(
                 chat_id=int(delivery["chat_id"]),
                 message_thread_id=delivery.get("message_thread_id"),
@@ -569,7 +597,7 @@ class TelegramAdapter:
             await self._reply(
                 message,
                 "Команды:\n"
-                "/ask [project:slug] вопрос\n"
+                "/ask [project:slug] вопрос Братульцу\n"
                 "/ask_private [project:slug] вопрос\n"
                 "/request [project:slug] bug|task|feature Заголовок | Подробности",
             )
@@ -640,7 +668,7 @@ class TelegramAdapter:
             if not question:
                 await self._reply(
                     message,
-                    "Формат: /ask [project:slug] точный вопрос по коду",
+                    "Формат: /ask [project:slug] вопрос",
                     prefer_ephemeral=prefer_ephemeral,
                 )
                 return
@@ -660,6 +688,7 @@ class TelegramAdapter:
             if inline_message_id is None or caller is None:
                 return
             explicit_project, question = extract_project_prefix(message.text or "")
+            guard_kinds = secret_extraction_request(question)
             try:
                 async with self.database.session() as session:
                     context = await resolve_context(
@@ -680,6 +709,8 @@ class TelegramAdapter:
                                 "inline_message_id": inline_message_id,
                             },
                         },
+                        agent_role=(SECURITY_GUARD_ROLE if guard_kinds else "knowledge"),
+                        guard_kinds=guard_kinds,
                     )
             except (ServiceError, ValueError) as exc:
                 await self.bot.edit_message_text(
@@ -697,7 +728,7 @@ class TelegramAdapter:
             if not question:
                 await self._reply(
                     message,
-                    "Формат: @bot [project:slug] точный вопрос по коду",
+                    "Формат: Братулец, [project:slug] вопрос",
                 )
                 return
             await self._queue_code_question(
@@ -804,6 +835,7 @@ class TelegramAdapter:
         if prefer_ephemeral and not await self._ephemeral_available(message):
             return
         try:
+            guard_kinds: tuple[str, ...] = ()
             async with self.database.session() as session:
                 context = await resolve_context(
                     session,
@@ -820,6 +852,7 @@ class TelegramAdapter:
                 )
                 if allowed_modes is not None and mode not in allowed_modes:
                     return
+                guard_kinds = secret_extraction_request(question)
                 delivery: dict[str, Any]
                 if (
                     prefer_ephemeral
@@ -832,7 +865,7 @@ class TelegramAdapter:
                         reply_parameters=ReplyParameters(
                             ephemeral_message_id=message.ephemeral_message_id
                         ),
-                        text="Проверяю код и источники...",
+                        text="Думаю...",
                     )
                     if placeholder.ephemeral_message_id is None:
                         raise ServiceError(
@@ -852,7 +885,7 @@ class TelegramAdapter:
                         "message_thread_id": message.message_thread_id,
                     }
                 else:
-                    placeholder = await message.answer("Проверяю код и подтверждаю источники...")
+                    placeholder = await message.answer("💭 Думаю...")
                     delivery = {
                         "kind": "group_message",
                         "chat_id": placeholder.chat.id,
@@ -869,6 +902,8 @@ class TelegramAdapter:
                         "telegram_user_id": message.from_user.id if message.from_user else None,
                         "delivery": delivery,
                     },
+                    agent_role=(SECURITY_GUARD_ROLE if guard_kinds else "knowledge"),
+                    guard_kinds=guard_kinds,
                 )
         except (ServiceError, ValueError) as exc:
             await self._reply(message, str(exc), prefer_ephemeral=prefer_ephemeral)
@@ -1178,6 +1213,8 @@ async def queue_interaction(
     question: str,
     correlation_id: str,
     source_ref: dict[str, Any],
+    agent_role: Literal["knowledge", "bydlo_guard"] = "knowledge",
+    guard_kinds: tuple[str, ...] = (),
 ) -> Interaction:
     repository = await session.scalar(
         select(Repository)
@@ -1198,7 +1235,7 @@ async def queue_interaction(
     )
     safe_question = question_result.text[:8_000]
     conversation_thread_id: UUID | None = None
-    if agent_settings.memory_enabled:
+    if agent_settings.memory_enabled and agent_role == "knowledge":
         thread = await get_or_create_conversation_thread(
             session,
             project_id=context.project.id,
@@ -1230,6 +1267,8 @@ async def queue_interaction(
             "requester_user_id": str(context.user_id),
             "requester_profile": context.requester_profile,
             "question_privacy_findings": [dict(finding) for finding in question_result.findings],
+            "agent_role": agent_role,
+            "guard_kinds": list(guard_kinds),
         },
         question=safe_question,
         commit_sha=repository.current_commit,
@@ -1259,8 +1298,26 @@ async def queue_interaction(
             "input_privacy_kinds": sorted(
                 {finding["kind"] for finding in question_result.findings}
             ),
+            "agent_role": agent_role,
         },
     )
+    if agent_role == SECURITY_GUARD_ROLE:
+        await append_audit(
+            session,
+            event_type="security.secret_extraction_blocked",
+            correlation_id=f"{correlation_id}:guard",
+            actor_type="user",
+            actor_id=str(context.user_id),
+            project_id=context.project.id,
+            subject_type="interaction",
+            subject_id=str(interaction.id),
+            outcome="blocked",
+            payload={
+                "guard_role": SECURITY_GUARD_ROLE,
+                "kinds": list(guard_kinds),
+                "telegram_user_id": context.telegram_user_id,
+            },
+        )
     return interaction
 
 

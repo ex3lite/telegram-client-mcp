@@ -33,6 +33,8 @@ from dca.worker import (
     TELEGRAM_EXTERNAL_ACTIONS,
     Worker,
     conversation_prompt_context,
+    interaction_agent_role,
+    render_answer,
     sanitize_stream_text,
     trusted_requester_profile,
 )
@@ -51,6 +53,25 @@ def test_knowledge_concurrency_defaults_to_five_and_uses_env(monkeypatch) -> Non
     assert Settings().knowledge_concurrency == 3
     with pytest.raises(ValidationError):
         Settings(knowledge_concurrency=6)
+
+
+def test_interaction_agent_role_is_server_marker_only() -> None:
+    guarded = SimpleNamespace(source_ref={"agent_role": "bydlo_guard"})
+    ordinary = SimpleNamespace(source_ref={"agent_role": "admin", "guard_kinds": ["token"]})
+
+    assert interaction_agent_role(guarded) == "bydlo_guard"
+    assert interaction_agent_role(ordinary) == "knowledge"
+
+
+def test_render_answer_keeps_verification_sources_internal() -> None:
+    rendered = render_answer(
+        answer_markdown="Используйте `GET /avatars`.",
+        uncertainty=[],
+    )
+
+    assert rendered == "Используйте `GET /avatars`."
+    assert "Источники" not in rendered
+    assert "src/" not in rendered
 
 
 def test_prompt_context_keeps_legitimate_latest_historical_user_message() -> None:
@@ -789,6 +810,7 @@ async def test_answer_streams_throttled_and_drops_unrequested_documents(monkeypa
     )
 
     async def claude_answer(**kwargs):
+        assert kwargs["tool_profile"] == "read_only"
         on_stream = kwargs["on_stream"]
         assert on_stream is not None
         await heartbeat_started.wait()

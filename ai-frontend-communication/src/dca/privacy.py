@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 PrivacyLevel = Literal["balanced", "strict"]
+SECURITY_GUARD_ROLE: Literal["bydlo_guard"] = "bydlo_guard"
 
 
 class PrivacyFinding(TypedDict):
@@ -50,6 +51,95 @@ _SECRET_RE = re.compile(
     "|".join(f"(?P<p{index}>{pattern})" for index, (_, pattern) in enumerate(_SECRET_PATTERNS)),
     re.IGNORECASE | re.MULTILINE,
 )
+
+_SECRET_REQUEST_TARGET_PATTERNS = (
+    (
+        "private_key",
+        r"(?:private|приватн(?:ый|ого|ому|ым|ом|ые|ых))\s+"
+        r"(?:key|ключ(?:а|у|ом|е|и|ей|ами|ах)?)|"
+        r"(?:ssh[- ]?key|ssh[- ]?ключ(?:а|у|ом|е|и|ей|ами|ах)?|id_rsa|id_ed25519)",
+    ),
+    (
+        "api_key",
+        r"(?:api[- _]?(?:key|ключ(?:а|у|ом|е|и|ей|ами|ах)?)|"
+        r"(?:key|ключ(?:а|у|ом|е|и|ей|ами|ах)?)\s+(?:api|апи))",
+    ),
+    (
+        "token",
+        r"(?:access|refresh|bearer|auth|oauth|telegram|bot|доступа|бота)?[- _]?"
+        r"(?:token|токен(?:а|у|ом|е|ы|ов|ам|ами|ах)?)",
+    ),
+    ("password", r"(?:password|passwd|парол(?:ь|я|ю|ем|е|и|ей|ям|ями|ях))"),
+    ("credentials", r"(?:credentials?|credential|креды|кредов|учетные\s+данные)"),
+    ("secret", r"(?:secrets?|секрет(?:а|у|ом|е|ы|ов|ам|ами|ах)?)"),
+    (
+        "environment_file",
+        r"(?<![\w.])\.env(?:\.[a-z0-9_-]+)?(?![\w.])|"
+        r"(?:env|environment)[- _]?(?:file|файл)",
+    ),
+    (
+        "auth_material",
+        r"(?:authorization[- _]?header|auth[- _]?header|заголовок\s+authorization|"
+        r"session[- _]?cookie|куки\s+сессии)",
+    ),
+)
+_SECRET_REQUEST_TARGET = (
+    "(?:" + "|".join(pattern for _, pattern in _SECRET_REQUEST_TARGET_PATTERNS) + ")"
+)
+_SECRET_REQUEST_ACTION = (
+    r"(?:дай|дайте|скинь|скиньте|пришли|пришлите|слей|слейте|раскрой|раскройте|"  # noqa: S105 - regex vocabulary
+    r"выведи|выведите|напечатай|напечатайте|покажи|покажите|верни|верните|"
+    r"прочитай|прочитайте|достань|достаньте|скопируй|скопируйте|"
+    r"give|send|dump|reveal|print|show|output|extract|read|leak|copy)"
+)
+_SECRET_REQUEST_QUALIFIER = (
+    r"(?:мне|нам|сюда|все|весь|всю|всех|сам|само|саму|реальный|реальную|"  # noqa: S105 - regex vocabulary
+    r"текущий|текущую|боевой|боевую|продовый|продовую|production|actual|"
+    r"prod|current|all|the|our|your|значение|содержимое)"
+)
+_DIRECT_SECRET_REQUEST_RE = re.compile(
+    rf"\b{_SECRET_REQUEST_ACTION}\b(?:\s+{_SECRET_REQUEST_QUALIFIER})*\s+"
+    rf"{_SECRET_REQUEST_TARGET}",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_REQUEST_RE = re.compile(
+    rf"(?:\b(?:значение|содержимое|value|contents?)\b.{{0,40}}{_SECRET_REQUEST_TARGET}|"
+    rf"{_SECRET_REQUEST_TARGET}.{{0,40}}\b(?:целиком|полностью|значение|value)\b)",
+    re.IGNORECASE,
+)
+_SECRET_FILE_LINE_REQUEST_RE = re.compile(
+    rf"\b(?:первая|первую|последняя|последнюю|вторая|вторую|first|last|second)\s+"
+    rf"(?:строка|строку|line)\b.{{0,60}}{_SECRET_REQUEST_TARGET}",
+    re.IGNORECASE,
+)
+_OWN_SECRET_REQUEST_RE = re.compile(
+    rf"\b(?:какой|какая|какое|what\s+is)\b\s+"
+    rf"(?:(?:у\s+нас|наш|наша|текущий|боевой|продовый|our|current|production|prod)\s+)+"
+    rf"{_SECRET_REQUEST_TARGET}",
+    re.IGNORECASE,
+)
+
+
+def secret_extraction_request(text: str) -> tuple[str, ...]:
+    """Detect only high-confidence attempts to obtain secret values, not security questions."""
+    normalized = " ".join(text.casefold().replace("ё", "е").split())
+    if not normalized or not any(
+        pattern.search(normalized)
+        for pattern in (
+            _DIRECT_SECRET_REQUEST_RE,
+            _SECRET_VALUE_REQUEST_RE,
+            _SECRET_FILE_LINE_REQUEST_RE,
+            _OWN_SECRET_REQUEST_RE,
+        )
+    ):
+        return ()
+    return tuple(
+        sorted(
+            kind
+            for kind, pattern in _SECRET_REQUEST_TARGET_PATTERNS
+            if re.search(pattern, normalized, re.IGNORECASE) is not None
+        )
+    )
 
 
 def sanitize_text(text: str, *, level: PrivacyLevel, location: str) -> PrivacyResult:

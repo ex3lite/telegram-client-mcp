@@ -41,6 +41,7 @@ from dca.claude import (
     ClaudeCode,
     ClaudeError,
     ClaudeOAuthManager,
+    normalize_repository_allowed_paths,
     validate_claude_oauth_token,
 )
 from dca.config import Settings, get_settings
@@ -294,6 +295,20 @@ class AgentSettingsInput(BaseModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("denied globs must be unique")
         return normalized
+
+
+class RepositoryScopeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_paths: list[str] = Field(max_length=200)
+
+    @field_validator("allowed_paths")
+    @classmethod
+    def validate_allowed_paths(cls, values: list[str]) -> list[str]:
+        try:
+            return list(normalize_repository_allowed_paths(values))
+        except ClaudeError as exc:
+            raise ValueError(exc.message) from exc
 
 
 class ClaudeIntegrationInput(BaseModel):
@@ -1748,6 +1763,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with database.session() as session:
             rows = list(await session.scalars(select(Repository).order_by(Repository.name)))
         return [serialize_repository(row, settings) for row in rows]
+
+    @app.put("/api/v1/repositories/{repository_id}/scope")
+    async def update_repository_scope(
+        repository_id: UUID,
+        payload: RepositoryScopeInput,
+        admin: Annotated[AdminContext, Depends(require_admin)],
+        _: Annotated[None, Depends(require_same_origin)],
+    ) -> dict[str, Any]:
+        async with database.session() as session:
+            repository = await session.scalar(
+                select(Repository).where(Repository.id == repository_id).with_for_update()
+            )
+            if repository is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "repository_not_found")
+            previous = list(repository.allowed_paths or [])
+            repository.allowed_paths = payload.allowed_paths
+            await session.flush()
+            await append_audit(
+                session,
+                event_type="repository.scope_updated",
+                correlation_id=f"repository:{repository_id}:scope:{secrets.token_hex(8)}",
+                actor_type="admin",
+                actor_id=str(admin.principal_id),
+                project_id=repository.project_id,
+                subject_type="repository",
+                subject_id=str(repository.id),
+                payload={
+                    "previous_allowed_paths": previous,
+                    "allowed_paths": list(repository.allowed_paths),
+                },
+            )
+            result = serialize_repository(repository, settings)
+        return result
 
     @app.post("/api/v1/repositories/{repository_id}/sync", status_code=status.HTTP_202_ACCEPTED)
     async def sync_repository(

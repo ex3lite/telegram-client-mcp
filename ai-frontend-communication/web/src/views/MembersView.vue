@@ -210,7 +210,7 @@ async function closeSelection() {
           </label>
           <label class="member-permission">
             <input v-model="draft.active" type="checkbox" />
-            <span><strong>Активный участник</strong><small>Профиль участвует в политике доступа агента.</small></span>
+            <span><strong>Доступ к боту (whitelist)</strong><small>Если выключить, Братулец сразу перестанет принимать сообщения этого Telegram-пользователя.</small></span>
           </label>
 
           <p v-if="updateMember.error.value" class="inline-error" role="alert">Не удалось сохранить: {{ updateMember.error.value.message }}</p>

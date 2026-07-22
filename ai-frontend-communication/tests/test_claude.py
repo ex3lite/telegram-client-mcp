@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 
 from dca.claude import (
+    CLAUDE_RUNTIME_SETTINGS,
     EMPTY_MCP_CONFIG,
     ClaudeCode,
     ClaudeError,
@@ -171,6 +172,48 @@ async def test_stream_reader_emits_thinking_and_partial_answer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_reader_uses_nonempty_assistant_thinking_as_fallback() -> None:
+    final_answer = {
+        "answer_scope": "general",
+        "answer_markdown": "Готово",
+        "citations": [],
+        "uncertainty": [],
+        "artifacts": [],
+        "memory_summary": None,
+        "context_attestation": TEST_ATTESTATION,
+    }
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "Проверяю контракт"},
+                        {
+                            "type": "tool_use",
+                            "name": "StructuredOutput",
+                            "input": final_answer,
+                        },
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ).encode()
+        + b"\n"
+    )
+    reader.feed_eof()
+    updates: list[tuple[str, str]] = []
+
+    async def on_stream(answer: str, thinking: str) -> None:
+        updates.append((answer, thinking))
+
+    await _read_claude_stream(reader, on_stream)
+
+    assert updates[-1] == ("Готово", "Проверяю контракт")
+
+
+@pytest.mark.asyncio
 async def test_stream_reader_preserves_compact_boundary_metadata() -> None:
     session_id = str(uuid4())
     compact_boundary = {
@@ -254,6 +297,37 @@ def test_stream_runtime_accepts_only_exact_read_only_session(tmp_path: Path) -> 
             )
         assert error.value.code == "context_runtime_mismatch"
         assert error.value.retryable is True
+
+
+def test_stream_runtime_rejects_file_tools_for_no_tool_guard(tmp_path: Path) -> None:
+    session_id = uuid4()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    base = {
+        "type": "system",
+        "subtype": "init",
+        "session_id": str(session_id),
+        "cwd": str(snapshot),
+        "tools": ["StructuredOutput"],
+        "mcp_servers": [],
+    }
+
+    _validate_stream_runtime(
+        ClaudeStreamState(session_id=str(session_id), init=base),
+        expected_session_id=session_id,
+        snapshot=snapshot,
+        expected_file_tools=set(),
+    )
+    with pytest.raises(ClaudeError):
+        _validate_stream_runtime(
+            ClaudeStreamState(
+                session_id=str(session_id),
+                init={**base, "tools": ["Read", "StructuredOutput"]},
+            ),
+            expected_session_id=session_id,
+            snapshot=snapshot,
+            expected_file_tools=set(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -365,6 +439,28 @@ def test_prompt_marks_requester_profile_as_server_metadata() -> None:
     assert '"department":"Mobile"' in policy.system_prompt
     assert '"stack":"Android / Kotlin"' in policy.system_prompt
     assert policy.requester["knowledge_scope"] == "integration"
+
+
+def test_bydlo_guard_is_a_claude_role_without_repository_tools() -> None:
+    settings = ProjectAgentSettings(
+        project_id=uuid4(),
+        enabled=True,
+        base_prompt="",
+        answer_style="normal",
+    )
+
+    policy = compile_agent_policy(
+        project_settings=settings,
+        requester_profile={"role": "backend", "language": "ru"},
+        agent_role="bydlo_guard",
+    )
+
+    assert policy.metadata["agent_role"] == "bydlo_guard"
+    assert policy.metadata["tools"] == []
+    assert policy.requester["code_access"] == "none"
+    assert "Generate an original short refusal" in policy.system_prompt
+    assert "do not mechanically repeat one fixed template" in policy.system_prompt
+    assert "including backend administrators" in policy.system_prompt
 
 
 def test_policy_injection_cannot_expand_knowledge_scope() -> None:
@@ -652,6 +748,9 @@ for event in events:
     )
     assert "--resume" not in first_invocation["args"]
     assert "--no-session-persistence" not in first_invocation["args"]
+    assert first_invocation["args"][first_invocation["args"].index("--settings") + 1] == (
+        CLAUDE_RUNTIME_SETTINGS
+    )
     assert first_invocation["config_dir"] == str(config_root.resolve())
     assert config_root.stat().st_mode & 0o777 == 0o700
     assert (
@@ -799,6 +898,50 @@ print(json.dumps({
 
     assert error.value.code == "answer_without_verified_sources"
     assert error.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_general_answer_does_not_require_repository_citations(tmp_path: Path) -> None:
+    executable = tmp_path / "fake-claude"
+    executable.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+prompt = sys.stdin.read()
+prefix = "- Set context_attestation to this exact object: "
+attestation_line = next(line for line in prompt.splitlines() if line.startswith(prefix))
+print(json.dumps({
+    "structured_output": {
+        "answer_scope": "general",
+        "answer_markdown": "Да нормально, работаем.",
+        "citations": [],
+        "uncertainty": [],
+        "artifacts": [],
+        "memory_summary": None,
+        "context_attestation": json.loads(attestation_line.removeprefix(prefix)),
+    }
+}))
+"""
+    )
+    executable.chmod(0o700)
+    settings = ProjectAgentSettings(
+        project_id=uuid4(),
+        enabled=True,
+        claude_timeout_seconds=10,
+        base_prompt="",
+        answer_style="normal",
+    )
+
+    result = await ClaudeCode(Settings(claude_bin=str(executable))).answer(
+        snapshot=tmp_path,
+        question="Как дела?",
+        project_settings=settings,
+        oauth_token="sk-ant-oat01-" + "a" * 40,
+    )
+
+    assert result.answer.answer_scope == "general"
+    assert result.accepted_citations == []
 
 
 def test_claude_environment_adds_only_configured_proxy(

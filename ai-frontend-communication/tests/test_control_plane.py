@@ -10,6 +10,7 @@ from dca.app import (
     McpAccountCreateInput,
     McpAccountPatchInput,
     MemberUpdateInput,
+    RepositoryScopeInput,
     _purge_claude_session_artifacts,
     claude_integration_status,
     create_app,
@@ -60,6 +61,15 @@ def valid_agent_settings() -> dict[str, object]:
         "telegram_streaming_enabled": True,
         "telegram_attach_markdown": True,
     }
+
+
+def test_repository_scope_normalizes_and_rejects_escape_paths() -> None:
+    payload = RepositoryScopeInput(allowed_paths=[" src/api ", "docs", "src/api"])
+
+    assert payload.allowed_paths == ["docs", "src/api"]
+    for invalid in (["../etc"], ["/etc"], ["src\\private"]):
+        with pytest.raises(ValidationError):
+            RepositoryScopeInput(allowed_paths=invalid)
 
 
 def test_system_secret_encryption_is_authenticated_and_key_scoped() -> None:
@@ -626,6 +636,7 @@ async def test_control_plane_routes_are_registered(tmp_path: Path) -> None:
         assert set(paths["/api/v1/members"]) == {"get"}
         assert set(paths["/api/v1/projects/{project_id}/members/{user_id}"]) == {"put"}
         assert set(paths["/api/v1/projects/{project_id}/agent-settings"]) == {"get", "put"}
+        assert set(paths["/api/v1/repositories/{repository_id}/scope"]) == {"put"}
         assert set(paths["/api/v1/integrations/claude"]) == {"get", "put", "delete"}
         assert set(paths["/api/v1/integrations/claude/check"]) == {"post"}
         assert set(paths["/api/v1/integrations/claude/oauth/start"]) == {"post"}
