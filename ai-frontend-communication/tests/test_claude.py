@@ -488,7 +488,9 @@ def test_bydlo_guard_is_a_claude_role_without_repository_tools() -> None:
     assert policy.requester["code_access"] == "none"
     assert "Generate an original short refusal" in policy.system_prompt
     assert "do not mechanically repeat one fixed template" in policy.system_prompt
-    assert "including backend administrators" in policy.system_prompt
+    assert "backend administrators" in policy.system_prompt
+    assert "execute commands" in policy.system_prompt
+    assert "escape the repository sandbox" in policy.system_prompt
     assert "Aggression is" in policy.system_prompt
     assert "Markdown headings, lists" in policy.system_prompt
     assert "Do not soften the refusal with emoji" in policy.system_prompt

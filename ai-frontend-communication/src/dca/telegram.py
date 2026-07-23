@@ -55,8 +55,8 @@ from dca.domain import (
 from dca.memory import append_conversation_message, get_or_create_conversation_thread
 from dca.privacy import (
     SECURITY_GUARD_ROLE,
+    guard_request_kinds,
     sanitize_text,
-    secret_extraction_request,
 )
 from dca.service import (
     ServiceError,
@@ -727,7 +727,6 @@ class TelegramAdapter:
             if inline_message_id is None or caller is None:
                 return
             explicit_project, question = extract_project_prefix(message.text or "")
-            guard_kinds = secret_extraction_request(question)
             try:
                 async with self.database.session() as session:
                     context = await resolve_context(
@@ -748,8 +747,6 @@ class TelegramAdapter:
                                 "inline_message_id": inline_message_id,
                             },
                         },
-                        agent_role=(SECURITY_GUARD_ROLE if guard_kinds else "knowledge"),
-                        guard_kinds=guard_kinds,
                     )
             except (ServiceError, ValueError) as exc:
                 await self.bot.edit_message_text(
@@ -874,7 +871,6 @@ class TelegramAdapter:
         if prefer_ephemeral and not await self._ephemeral_available(message):
             return
         try:
-            guard_kinds: tuple[str, ...] = ()
             async with self.database.session() as session:
                 context = await resolve_context(
                     session,
@@ -891,7 +887,6 @@ class TelegramAdapter:
                 )
                 if allowed_modes is not None and mode not in allowed_modes:
                     return
-                guard_kinds = secret_extraction_request(question)
                 delivery: dict[str, Any]
                 if (
                     prefer_ephemeral
@@ -941,8 +936,6 @@ class TelegramAdapter:
                         "telegram_user_id": message.from_user.id if message.from_user else None,
                         "delivery": delivery,
                     },
-                    agent_role=(SECURITY_GUARD_ROLE if guard_kinds else "knowledge"),
-                    guard_kinds=guard_kinds,
                 )
         except (ServiceError, ValueError) as exc:
             if (
@@ -1263,8 +1256,6 @@ async def queue_interaction(
     question: str,
     correlation_id: str,
     source_ref: dict[str, Any],
-    agent_role: Literal["knowledge", "bydlo_guard"] = "knowledge",
-    guard_kinds: tuple[str, ...] = (),
 ) -> Interaction:
     repository = await session.scalar(
         select(Repository)
@@ -1278,6 +1269,10 @@ async def queue_interaction(
     if repository is None or repository.current_commit is None:
         raise ServiceError("source_unavailable", "У проекта нет готового Git snapshot")
     agent_settings = await load_project_agent_settings(session, context.project.id)
+    guard_kinds = guard_request_kinds(question[:MAX_INTERACTION_QUESTION_CHARS])
+    agent_role: Literal["knowledge", "bydlo_guard"] = (
+        SECURITY_GUARD_ROLE if guard_kinds else "knowledge"
+    )
     question_result = sanitize_text(
         question[:MAX_INTERACTION_QUESTION_CHARS],
         level="balanced",
@@ -1354,7 +1349,7 @@ async def queue_interaction(
     if agent_role == SECURITY_GUARD_ROLE:
         await append_audit(
             session,
-            event_type="security.secret_extraction_blocked",
+            event_type="security.bydlo_guard_activated",
             correlation_id=f"{correlation_id}:guard",
             actor_type="user",
             actor_id=str(context.user_id),
