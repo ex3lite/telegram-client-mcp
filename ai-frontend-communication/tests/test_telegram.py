@@ -928,6 +928,54 @@ async def test_plain_text_uses_all_messages_mode_without_command_path(
     assert call.kwargs["allowed_modes"] == {"all_messages"}
 
 
+@pytest.mark.asyncio
+async def test_unbound_group_plain_text_is_silent_but_mention_gets_error(
+    adapter: TelegramAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session() -> AsyncIterator[object]:
+        yield object()
+
+    monkeypatch.setattr(adapter.database, "session", session)
+    monkeypatch.setattr(
+        telegram_module,
+        "resolve_context",
+        AsyncMock(
+            side_effect=telegram_module.ServiceError(
+                "chat_unavailable",
+                "Этот чат не подключён к проекту.",
+            )
+        ),
+    )
+    adapter._reply = AsyncMock()  # type: ignore[method-assign]
+    message = SimpleNamespace(
+        chat=SimpleNamespace(id=-100, type=ChatType.SUPERGROUP),
+        from_user=SimpleNamespace(id=777),
+        message_thread_id=None,
+    )
+
+    await adapter._queue_code_question(
+        message=message,
+        event_update=SimpleNamespace(update_id=19),
+        question="Обычное сообщение без вызова бота",
+        explicit_project_slug=None,
+        prefer_ephemeral=False,
+        allowed_modes={"all_messages"},
+    )
+
+    adapter._reply.assert_not_awaited()  # type: ignore[attr-defined]
+    await adapter._queue_code_question(
+        message=message,
+        event_update=SimpleNamespace(update_id=20),
+        question="Братулец, помоги",
+        explicit_project_slug=None,
+        prefer_ephemeral=False,
+        allowed_modes={"mentions", "all_messages"},
+    )
+    adapter._reply.assert_awaited_once()  # type: ignore[attr-defined]
+
+
 @pytest.mark.parametrize(
     "text",
     [

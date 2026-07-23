@@ -945,6 +945,12 @@ class TelegramAdapter:
                     guard_kinds=guard_kinds,
                 )
         except (ServiceError, ValueError) as exc:
+            if (
+                isinstance(exc, ServiceError)
+                and exc.code == "chat_unavailable"
+                and allowed_modes == {"all_messages"}
+            ):
+                return
             await self._reply(message, str(exc), prefer_ephemeral=prefer_ephemeral)
 
     async def _reply(
